@@ -1,0 +1,46 @@
+{
+  "pylsp": {
+    "plugins": {
+      "pycodestyle": {
+        "enabled": true,
+        "maxLineLength": 120
+      },
+      "pyflakes": {
+        "enabled": true
+      },
+      "mccabe": {
+        "enabled": true,
+        "minComplexity": 10
+      },
+      "pydocstyle": {
+        "enabled": false
+      },
+      "autopep8": {
+        "enabled": true
+      },
+      "yapf": {
+        "enabled": false
+      },
+      "flake8": {
+        "enabled": true
+      },
+      "pylint": {
+        "enabled": false
+      },
+      "rope": {
+        "enabled": true
+      },
+      "jedi": {
+        "enabled": true,
+        "environment": null,
+        "extra_paths": []
+      }
+    },
+    "configurationSources": [
+      "pycodestyle",
+      "pyflakes"
+    ],
+    "cacheLocation": null,
+    "pluginsDirectory": null
+  }
+}

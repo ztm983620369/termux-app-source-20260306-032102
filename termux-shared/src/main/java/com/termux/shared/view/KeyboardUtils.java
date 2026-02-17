@@ -22,8 +22,10 @@ public class KeyboardUtils {
 
     public static void setSoftKeyboardVisibility(@NonNull final Runnable showSoftKeyboardRunnable, final Activity activity, final View view, final boolean visible) {
         if (visible) {
-            // A Runnable with a delay is used, otherwise soft keyboard may not automatically open
-            // on some devices, but still may fail
+            // Try immediately for responsiveness, but also retry after a delay since some devices/IMEs may
+            // ignore the initial request right after a focus change.
+            view.removeCallbacks(showSoftKeyboardRunnable);
+            view.post(showSoftKeyboardRunnable);
             view.postDelayed(showSoftKeyboardRunnable, 500);
         } else {
             view.removeCallbacks(showSoftKeyboardRunnable);

@@ -1,0 +1,1 @@
+Nützlicher, schlanker, quelloffener Dateiexplorer mit grundlegenden Funktionen.

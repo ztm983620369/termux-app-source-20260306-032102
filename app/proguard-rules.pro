@@ -10,3 +10,8 @@
 -dontobfuscate
 #-renamesourcefileattribute SourceFile
 #-keepattributes SourceFile,LineNumberTable
+
+# Optional static-analysis annotations referenced by some dependencies.
+-dontwarn afu.org.checkerframework.checker.formatter.qual.ConversionCategory
+-dontwarn org.checkerframework.checker.formatter.qual.ConversionCategory
+-dontwarn org.checkerframework.dataflow.qual.Pure

@@ -30,6 +30,8 @@ public class Logger {
     public static final int DEFAULT_LOG_LEVEL = LOG_LEVEL_NORMAL;
     public static final int MAX_LOG_LEVEL = LOG_LEVEL_VERBOSE;
     private static int CURRENT_LOG_LEVEL = DEFAULT_LOG_LEVEL;
+    private static final Object TOAST_LOCK = new Object();
+    private static Toast LAST_TOAST;
 
     /**
      * The maximum size of the log entry payload that can be written to the logger. An attempt to
@@ -398,7 +400,27 @@ public class Logger {
     public static void showToast(final Context context, final String toastText, boolean longDuration) {
         if (context == null || DataUtils.isNullOrEmpty(toastText)) return;
 
-        new Handler(Looper.getMainLooper()).post(() -> Toast.makeText(context, toastText, longDuration ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show());
+        final Context appContext = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                synchronized (TOAST_LOCK) {
+                    if (LAST_TOAST != null) {
+                        try {
+                            LAST_TOAST.cancel();
+                        } catch (Throwable ignored) {
+                        }
+                        LAST_TOAST = null;
+                    }
+                    Toast toast = Toast.makeText(appContext, toastText,
+                        longDuration ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT);
+                    LAST_TOAST = toast;
+                    toast.show();
+                }
+            } catch (Throwable e) {
+                // Guard against OEM/framework toast crashes (e.g. BadToken / duplicated toast window).
+                logWarn(DEFAULT_LOG_TAG, "showToast dropped due to runtime error: " + e.getMessage());
+            }
+        });
     }
 
 

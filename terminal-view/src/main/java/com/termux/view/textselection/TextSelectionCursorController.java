@@ -1,10 +1,14 @@
 package com.termux.view.textselection;
 
+import android.content.ActivityNotFoundException;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Rect;
+import android.net.Uri;
 import android.os.Build;
 import android.text.TextUtils;
+import android.util.Patterns;
 import android.view.ActionMode;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -33,6 +37,7 @@ public class TextSelectionCursorController implements CursorController {
     public final int ACTION_COPY = 1;
     public final int ACTION_PASTE = 2;
     public final int ACTION_MORE = 3;
+    public final int ACTION_OPEN = 4;
 
     public TextSelectionCursorController(TerminalView terminalView) {
         this.terminalView = terminalView;
@@ -111,17 +116,30 @@ public class TextSelectionCursorController implements CursorController {
         final ActionMode.Callback callback = new ActionMode.Callback() {
             @Override
             public boolean onCreateActionMode(ActionMode mode, Menu menu) {
-                int show = MenuItem.SHOW_AS_ACTION_IF_ROOM | MenuItem.SHOW_AS_ACTION_WITH_TEXT;
+                int showPrimary = MenuItem.SHOW_AS_ACTION_IF_ROOM | MenuItem.SHOW_AS_ACTION_WITH_TEXT;
 
                 ClipboardManager clipboard = (ClipboardManager) terminalView.getContext().getSystemService(Context.CLIPBOARD_SERVICE);
-                menu.add(Menu.NONE, ACTION_COPY, Menu.NONE, R.string.copy_text).setShowAsAction(show);
-                menu.add(Menu.NONE, ACTION_PASTE, Menu.NONE, R.string.paste_text).setEnabled(clipboard != null && clipboard.hasPrimaryClip()).setShowAsAction(show);
+                menu.add(Menu.NONE, ACTION_COPY, Menu.NONE, R.string.copy_text).setShowAsAction(showPrimary);
+                menu.add(Menu.NONE, ACTION_OPEN, Menu.NONE, R.string.open_url)
+                    .setVisible(getSelectedTextUrl() != null)
+                    .setShowAsAction(showPrimary);
+                menu.add(Menu.NONE, ACTION_PASTE, Menu.NONE, R.string.paste_text)
+                    .setEnabled(clipboard != null && clipboard.hasPrimaryClip())
+                    .setShowAsAction(showPrimary);
                 menu.add(Menu.NONE, ACTION_MORE, Menu.NONE, R.string.text_selection_more);
                 return true;
             }
 
             @Override
             public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+                MenuItem openItem = menu.findItem(ACTION_OPEN);
+                if (openItem == null) return false;
+
+                boolean shouldShowOpen = getSelectedTextUrl() != null;
+                if (openItem.isVisible() != shouldShowOpen) {
+                    openItem.setVisible(shouldShowOpen);
+                    return true;
+                }
                 return false;
             }
 
@@ -137,6 +155,13 @@ public class TextSelectionCursorController implements CursorController {
                         String selectedText = getSelectedText();
                         terminalView.mTermSession.onCopyTextToClipboard(selectedText);
                         terminalView.stopTextSelectionMode();
+                        break;
+                    case ACTION_OPEN:
+                        String url = getSelectedTextUrl();
+                        if (url != null) {
+                            terminalView.stopTextSelectionMode();
+                            openUrl(url);
+                        }
                         break;
                     case ACTION_PASTE:
                         terminalView.stopTextSelectionMode();
@@ -212,6 +237,44 @@ public class TextSelectionCursorController implements CursorController {
                 outRect.set(x1, top, x2, bottom);
             }
         }, ActionMode.TYPE_FLOATING);
+    }
+
+    @Nullable
+    private String getSelectedTextUrl() {
+        String selectedText = getSelectedText();
+        if (TextUtils.isEmpty(selectedText)) return null;
+
+        String candidate = selectedText.trim();
+        if (candidate.isEmpty()) return null;
+
+        // Remove wrappers often included by terminals or markdown output.
+        if ((candidate.startsWith("<") && candidate.endsWith(">")) ||
+            (candidate.startsWith("\"") && candidate.endsWith("\"")) ||
+            (candidate.startsWith("'") && candidate.endsWith("'"))) {
+            candidate = candidate.substring(1, candidate.length() - 1).trim();
+            if (candidate.isEmpty()) return null;
+        }
+
+        if (!Patterns.WEB_URL.matcher(candidate).matches()) return null;
+
+        if (!hasUrlScheme(candidate)) candidate = "https://" + candidate;
+        return candidate;
+    }
+
+    private boolean hasUrlScheme(String url) {
+        Uri uri = Uri.parse(url);
+        String scheme = uri.getScheme();
+        return !TextUtils.isEmpty(scheme);
+    }
+
+    private void openUrl(String url) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            terminalView.getContext().startActivity(intent);
+        } catch (ActivityNotFoundException ignored) {
+            // No handler for ACTION_VIEW, keep silent to avoid breaking selection flow.
+        }
     }
 
     @Override

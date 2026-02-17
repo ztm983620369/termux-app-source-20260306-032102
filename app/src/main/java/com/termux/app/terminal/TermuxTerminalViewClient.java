@@ -125,6 +125,24 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         }
     }
 
+    public void requestTerminalViewFocus(boolean allowShowSoftKeyboard) {
+        final View terminalView = mActivity.getTerminalView();
+        if (terminalView == null) return;
+
+        // Only ignore the "show keyboard" side-effect if focus will actually change. Otherwise we may
+        // accidentally suppress the next real focus change and require an extra tap.
+        if (!allowShowSoftKeyboard && !terminalView.hasFocus()) mShowSoftKeyboardIgnoreOnce = true;
+        terminalView.requestFocus();
+    }
+
+    public void cancelPendingShowSoftKeyboard() {
+        final View terminalView = mActivity.getTerminalView();
+        if (terminalView == null) return;
+
+        terminalView.removeCallbacks(getShowSoftKeyboardRunnable());
+        mShowSoftKeyboardWithDelayOnce = false;
+    }
+
     /**
      * Should be called when mActivity.onStop() is called
      */
@@ -184,7 +202,9 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     @Override
     public void onSingleTapUp(MotionEvent e) {
-        TerminalEmulator term = mActivity.getCurrentSession().getEmulator();
+        TerminalSession currentSession = mActivity.getCurrentSession();
+        if (currentSession == null) return;
+        TerminalEmulator term = currentSession.getEmulator();
 
         if (mActivity.getProperties().shouldOpenTerminalTranscriptURLOnClick()) {
             int[] columnAndRow = mActivity.getTerminalView().getColumnAndRow(e, true);
@@ -198,7 +218,8 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             }
         }
 
-        if (!term.isMouseTrackingActive() && !e.isFromSource(InputDevice.SOURCE_MOUSE)) {
+        boolean pinnedSshSession = mTermuxTerminalSessionActivityClient.isSshSessionPinned(currentSession);
+        if ((!term.isMouseTrackingActive() || pinnedSshSession) && !e.isFromSource(InputDevice.SOURCE_MOUSE)) {
             if (!KeyboardUtils.areDisableSoftKeyboardFlagsSet(mActivity))
                 KeyboardUtils.showSoftKeyboard(mActivity, mActivity.getTerminalView());
             else
@@ -224,6 +245,16 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     @Override
     public boolean isTerminalViewSelected() {
         return mActivity.getTerminalToolbarViewPager() == null || mActivity.isTerminalViewSelected() || mActivity.getTerminalView().hasFocus();
+    }
+
+    @Override
+    public boolean shouldScrollWithArrowKeysInAlternateBuffer(TerminalSession session) {
+        return !mTermuxTerminalSessionActivityClient.isSshSessionPinned(session);
+    }
+
+    @Override
+    public boolean shouldSendMouseWheelEventsForTouchScroll(TerminalSession session) {
+        return !mTermuxTerminalSessionActivityClient.isSshSessionPinned(session);
     }
 
 
@@ -631,17 +662,17 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             }
         });
 
-        // Do not force show soft keyboard if termux-reload-settings command was run with hardware keyboard
-        // or soft keyboard is to be hidden or is disabled
         if (!isReloadTermuxProperties && !noShowKeyboard) {
-            // Request focus for TerminalView
-            // Also show the keyboard, since onFocusChange will not be called if TerminalView already
-            // had focus on startup to show the keyboard, like when opening url with context menu
-            // "Select URL" long press and returning to Termux app with back button. This
-            // will also show keyboard even if it was closed before opening url. #2111
-            Logger.logVerbose(LOG_TAG, "Requesting TerminalView focus and showing soft keyboard");
-            mActivity.getTerminalView().requestFocus();
-            mActivity.getTerminalView().postDelayed(getShowSoftKeyboardRunnable(), 300);
+            if (mActivity.getTerminalView().getVisibility() == View.VISIBLE) {
+                // Request focus for TerminalView
+                // Also show the keyboard, since onFocusChange will not be called if TerminalView already
+                // had focus on startup to show the keyboard, like when opening url with context menu
+                // "Select URL" long press and returning to Termux app with back button. This
+                // will also show keyboard even if it was closed before opening url. #2111
+                Logger.logVerbose(LOG_TAG, "Requesting TerminalView focus and showing soft keyboard");
+                mActivity.getTerminalView().requestFocus();
+                mActivity.getTerminalView().postDelayed(getShowSoftKeyboardRunnable(), 300);
+            }
         }
     }
 
@@ -706,16 +737,30 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         final CharSequence[] urls = urlSet.toArray(new CharSequence[0]);
         Collections.reverse(Arrays.asList(urls)); // Latest first.
 
-        // Click to copy url to clipboard:
-        final AlertDialog dialog = new AlertDialog.Builder(mActivity).setItems(urls, (di, which) -> {
-            String url = (String) urls[which];
-            ShareUtils.copyTextToClipboard(mActivity, url, mActivity.getString(R.string.msg_select_url_copied_to_clipboard));
-        }).setTitle(R.string.title_select_url_dialog).create();
+        final int[] selectedIndex = {0};
+        final AlertDialog dialog = new AlertDialog.Builder(mActivity)
+            .setSingleChoiceItems(urls, 0, (di, which) -> {
+                selectedIndex[0] = which;
+                String url = (String) urls[which];
+                ShareUtils.copyTextToClipboard(mActivity, url, mActivity.getString(R.string.msg_select_url_copied_to_clipboard));
+            })
+            .setPositiveButton(R.string.action_copy_detected_url, (di, which) -> {
+                String url = (String) urls[selectedIndex[0]];
+                ShareUtils.copyTextToClipboard(mActivity, url, mActivity.getString(R.string.msg_select_url_copied_to_clipboard));
+            })
+            .setNeutralButton(R.string.action_open_detected_url, (di, which) -> {
+                String url = (String) urls[selectedIndex[0]];
+                ShareUtils.openUrl(mActivity, url);
+            })
+            .setNegativeButton(R.string.action_cancel_select_url_dialog, null)
+            .setTitle(R.string.title_select_url_dialog)
+            .create();
 
-        // Long press to open URL:
+        // Keep original shortcut behavior: long press an item to open immediately.
         dialog.setOnShowListener(di -> {
-            ListView lv = dialog.getListView(); // this is a ListView with your "buds" in it
+            ListView lv = dialog.getListView();
             lv.setOnItemLongClickListener((parent, view, position, id) -> {
+                selectedIndex[0] = position;
                 dialog.dismiss();
                 String url = (String) urls[position];
                 ShareUtils.openUrl(mActivity, url);

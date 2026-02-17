@@ -142,7 +142,7 @@ public final class TerminalView extends View {
             @Override
             public boolean onUp(MotionEvent event) {
                 mScrollRemainder = 0.0f;
-                if (mEmulator != null && mEmulator.isMouseTrackingActive() && !event.isFromSource(InputDevice.SOURCE_MOUSE) && !isSelectingText() && !scrolledWithFinger) {
+                if (mEmulator != null && shouldUseMouseTrackingForTouchTap() && !event.isFromSource(InputDevice.SOURCE_MOUSE) && !isSelectingText() && !scrolledWithFinger) {
                     // Quick event processing when mouse tracking is active - do not wait for check of double tapping
                     // for zooming.
                     sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, true);
@@ -199,7 +199,7 @@ public final class TerminalView extends View {
                 // Do not start scrolling until last fling has been taken care of:
                 if (!mScroller.isFinished()) return true;
 
-                final boolean mouseTrackingAtStartOfFling = mEmulator.isMouseTrackingActive();
+                final boolean mouseTrackingAtStartOfFling = shouldUseMouseTrackingForTouchScroll();
                 float SCALE = 0.25f;
                 if (mouseTrackingAtStartOfFling) {
                     mScroller.fling(0, 0, 0, -(int) (velocityY * SCALE), 0, 0, -mEmulator.mRows / 2, mEmulator.mRows / 2);
@@ -212,7 +212,7 @@ public final class TerminalView extends View {
 
                     @Override
                     public void run() {
-                        if (mouseTrackingAtStartOfFling != mEmulator.isMouseTrackingActive()) {
+                        if (mouseTrackingAtStartOfFling != shouldUseMouseTrackingForTouchScroll()) {
                             mScroller.abortAnimation();
                             return;
                         }
@@ -460,25 +460,23 @@ public final class TerminalView extends View {
         int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
         if (mTopRow < -rowsInHistory) mTopRow = -rowsInHistory;
 
-        if (isSelectingText() || mEmulator.isAutoScrollDisabled()) {
-
-            // Do not scroll when selecting text.
+        // Only follow output when we are already at the bottom. If the user has scrolled up (mTopRow != 0),
+        // keep their scroll position stable while new output is appended.
+        final boolean selectingText = isSelectingText();
+        final boolean followOutput = (mTopRow == 0) && !selectingText && !mEmulator.isAutoScrollDisabled();
+        if (!followOutput) {
             int rowShift = mEmulator.getScrollCounter();
-            if (-mTopRow + rowShift > rowsInHistory) {
-                // .. unless we're hitting the end of history transcript, in which
-                // case we abort text selection and scroll to end.
-                if (isSelectingText())
-                    stopTextSelectionMode();
-
-                if (mEmulator.isAutoScrollDisabled()) {
+            if (rowShift != 0) {
+                if (-mTopRow + rowShift > rowsInHistory) {
+                    // We're hitting the end of the history transcript, clamp to the oldest available row.
+                    if (selectingText) stopTextSelectionMode();
                     mTopRow = -rowsInHistory;
-                    skipScrolling = true;
+                } else {
+                    mTopRow -= rowShift;
+                    if (selectingText) decrementYTextSelectionCursors(rowShift);
                 }
-            } else {
-                skipScrolling = true;
-                mTopRow -= rowShift;
-                decrementYTextSelectionCursors(rowShift);
             }
+            skipScrolling = true;
         }
 
         if (!skipScrolling && mTopRow != 0) {
@@ -570,19 +568,44 @@ public final class TerminalView extends View {
         mEmulator.sendMouseEvent(button, x, y, pressed);
     }
 
+    /**
+     * For touch gestures, client may opt out from terminal mouse-tracking behavior
+     * (e.g. pinned ssh/tmux sessions prefer smooth local transcript scrolling).
+     */
+    private boolean shouldUseMouseTrackingForTouchTap() {
+        return mEmulator != null &&
+            mEmulator.isMouseTrackingActive() &&
+            (mClient == null || mClient.shouldSendMouseWheelEventsForTouchScroll(mTermSession));
+    }
+
+    /**
+     * For touch scroll we honor client preference directly. Pinned ssh/tmux sessions disable
+     * remote wheel and rely on local transcript for smooth scrolling.
+     */
+    private boolean shouldUseMouseTrackingForTouchScroll() {
+        if (mEmulator == null || !mEmulator.isMouseTrackingActive()) return false;
+        if (mClient == null || mClient.shouldSendMouseWheelEventsForTouchScroll(mTermSession)) return true;
+        // Keep pinned ssh/tmux smooth-first, but never dead: if no local transcript yet, fallback to remote wheel.
+        return mEmulator.getScreen().getActiveTranscriptRows() <= 0;
+    }
+
     /** Perform a scroll, either from dragging the screen or by scrolling a mouse wheel. */
     void doScroll(MotionEvent event, int rowsDown) {
         boolean up = rowsDown < 0;
         int amount = Math.abs(rowsDown);
+        int activeTranscriptRows = mEmulator.getScreen().getActiveTranscriptRows();
+        boolean useArrowKeysInAltBuffer = mClient != null && mClient.shouldScrollWithArrowKeysInAlternateBuffer(mTermSession);
+        boolean shouldSendMouseWheel = shouldUseMouseTrackingForTouchScroll();
+
         for (int i = 0; i < amount; i++) {
-            if (mEmulator.isMouseTrackingActive()) {
+            if (shouldSendMouseWheel) {
                 sendMouseEventCode(event, up ? TerminalEmulator.MOUSE_WHEELUP_BUTTON : TerminalEmulator.MOUSE_WHEELDOWN_BUTTON, true);
-            } else if (mEmulator.isAlternateBufferActive()) {
+            } else if (mEmulator.isAlternateBufferActive() && useArrowKeysInAltBuffer) {
                 // Send up and down key events for scrolling, which is what some terminals do to make scroll work in
                 // e.g. less, which shifts to the alt screen without mouse handling.
                 handleKeyCode(up ? KeyEvent.KEYCODE_DPAD_UP : KeyEvent.KEYCODE_DPAD_DOWN, 0);
             } else {
-                mTopRow = Math.min(0, Math.max(-(mEmulator.getScreen().getActiveTranscriptRows()), mTopRow + (up ? -1 : 1)));
+                mTopRow = Math.min(0, Math.max(-activeTranscriptRows, mTopRow + (up ? -1 : 1)));
                 if (!awakenScrollBars()) invalidate();
             }
         }
@@ -594,7 +617,7 @@ public final class TerminalView extends View {
         if (mEmulator != null && event.isFromSource(InputDevice.SOURCE_MOUSE) && event.getAction() == MotionEvent.ACTION_SCROLL) {
             // Handle mouse wheel scrolling.
             boolean up = event.getAxisValue(MotionEvent.AXIS_VSCROLL) > 0.0f;
-            doScroll(event, up ? -3 : 3);
+            doScroll(event, up ? -1 : 1);
             return true;
         }
         return false;

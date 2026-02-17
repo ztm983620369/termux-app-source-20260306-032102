@@ -5,7 +5,7 @@ android {
     namespace = "com.termux.shared"
 
     compileSdkVersion project.properties.compileSdkVersion.toInteger()
-    ndkVersion = System.getenv("JITPACK_NDK_VERSION") ?: project.properties.ndkVersion
+    ndkVersion = project.properties.ndkVersion ?: System.getenv("JITPACK_NDK_VERSION")
 
     dependencies {
         implementation "androidx.appcompat:appcompat:1.6.1"
@@ -68,7 +68,7 @@ android {
 dependencies {
     testImplementation "junit:junit:4.13.2"
     androidTestImplementation "androidx.test.ext:junit:1.1.5"
-    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.2"
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
 }
 
 task sourceJar(type: Jar) {

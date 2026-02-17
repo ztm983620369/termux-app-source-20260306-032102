@@ -1,0 +1,6 @@
+python-lsp-server[all]
+python-lsp-black
+python-lsp-ruff
+python-lsp-isort
+pylsp-mypy
+pylsp-flake8

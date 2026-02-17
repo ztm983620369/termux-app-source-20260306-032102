@@ -2,6 +2,15 @@ plugins {
     id "com.android.application"
 }
 
+def packageVariantForBuild = System.getenv("TERMUX_PACKAGE_VARIANT") ?: "apt-android-7"
+def defaultAptRepoUrlForBuild = (System.getenv("TERMUX_DEFAULT_APT_REPO_URL")
+    ?: project.findProperty("termuxDefaultAptRepoUrl")
+    ?: "https://mirrors.bfsu.edu.cn/termux/apt/termux-main").toString().trim()
+
+def escapeJavaString = { String s ->
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+}
+
 ext {
     // The packageVariant defines the bootstrap variant that will be included in the app APK.
     // This must be supported by com.termux.shared.termux.TermuxBootstrap.PackageVariant or app will
@@ -9,14 +18,18 @@ ext {
     // Bootstrap of a different variant must not be manually installed by the user after app installation
     // by replacing $PREFIX since app code is dependant on the variant used to build the APK.
     // Currently supported values are: [ "apt-android-7" "apt-android-5" ]
-    packageVariant = System.getenv("TERMUX_PACKAGE_VARIANT") ?: "apt-android-7" // Default: "apt-android-7"
+    packageVariant = packageVariantForBuild // Default: "apt-android-7"
+}
+
+configurations.all {
+    exclude group: "com.google.code.findbugs", module: "jsr305"
 }
 
 android {
     namespace "com.termux"
 
     compileSdkVersion project.properties.compileSdkVersion.toInteger()
-    ndkVersion = System.getenv("JITPACK_NDK_VERSION") ?: project.properties.ndkVersion
+    ndkVersion = project.properties.ndkVersion ?: System.getenv("JITPACK_NDK_VERSION")
     def appVersionName = System.getenv("TERMUX_APP_VERSION_NAME") ?: ""
     def apkVersionTag = System.getenv("TERMUX_APK_VERSION_TAG") ?: ""
     def splitAPKsForDebugBuilds = System.getenv("TERMUX_SPLIT_APKS_FOR_DEBUG_BUILDS") ?: "1"
@@ -30,6 +43,7 @@ android {
         implementation "androidx.viewpager:viewpager:1.0.0"
         implementation "com.google.android.material:material:1.12.0"
         implementation "com.google.guava:guava:24.1-jre"
+        implementation "io.coil-kt:coil:2.6.0"
         implementation "io.noties.markwon:core:$markwonVersion"
         implementation "io.noties.markwon:ext-strikethrough:$markwonVersion"
         implementation "io.noties.markwon:linkify:$markwonVersion"
@@ -38,6 +52,12 @@ android {
 
         implementation project(":terminal-view")
         implementation project(":termux-shared")
+        implementation project(":terminal-tabs")
+        implementation project(":ui-shell")
+        implementation project(":sora-demo")
+        implementation project(":file-bridge")
+        implementation project(":file-manager")
+        implementation project(":fossify-commons")
     }
 
     defaultConfig {
@@ -49,7 +69,8 @@ android {
         if (appVersionName) versionName = appVersionName
         validateVersionName(versionName)
 
-        buildConfigField "String", "TERMUX_PACKAGE_VARIANT", "\"" + project.ext.packageVariant + "\"" // Used by TermuxApplication class
+        buildConfigField "String", "TERMUX_PACKAGE_VARIANT", "\"" + packageVariantForBuild + "\"" // Used by TermuxApplication class
+        buildConfigField "String", "TERMUX_DEFAULT_APT_REPO_URL", "\"" + escapeJavaString(defaultAptRepoUrlForBuild) + "\""
 
         manifestPlaceholders.TERMUX_PACKAGE_NAME = "com.termux"
         manifestPlaceholders.TERMUX_APP_NAME = "Termux"
@@ -93,6 +114,17 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
 
+        /**
+         * Extreme shrink/obfuscation build (non-reproducible by default due to resource shrinking).
+         * Use `assembleReleaseOptimized` / `bundleReleaseOptimized`.
+         */
+        releaseOptimized {
+            initWith release
+            matchingFallbacks = ["release"]
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules-optimized.pro'
+        }
+
         debug {
             signingConfig signingConfigs.debug
         }
@@ -124,7 +156,8 @@ android {
 
     packagingOptions {
         jniLibs {
-            useLegacyPackaging true
+            // Avoid extracting native libraries at install time (reduces install size and file I/O).
+            useLegacyPackaging false
         }
     }
 
@@ -132,10 +165,13 @@ android {
         variant.outputs.all { output ->
             if (variant.buildType.name == "debug") {
                 def abi = output.getFilter(com.android.build.OutputFile.ABI)
-                outputFileName = new File("termux-app_" + (apkVersionTag ? apkVersionTag : project.ext.packageVariant + "-" + "debug") + "_" + (abi ? abi : "universal") + ".apk")
+                outputFileName = new File("termux-app_" + (apkVersionTag ? apkVersionTag : packageVariantForBuild + "-" + "debug") + "_" + (abi ? abi : "universal") + ".apk")
             } else if (variant.buildType.name == "release") {
                 def abi = output.getFilter(com.android.build.OutputFile.ABI)
-                outputFileName = new File("termux-app_" + (apkVersionTag ? apkVersionTag : project.ext.packageVariant + "-" + "release") + "_" + (abi ? abi : "universal") + ".apk")
+                outputFileName = new File("termux-app_" + (apkVersionTag ? apkVersionTag : packageVariantForBuild + "-" + "release") + "_" + (abi ? abi : "universal") + ".apk")
+            } else if (variant.buildType.name == "releaseOptimized") {
+                def abi = output.getFilter(com.android.build.OutputFile.ABI)
+                outputFileName = new File("termux-app_" + (apkVersionTag ? apkVersionTag : packageVariantForBuild + "-" + "release-optimized") + "_" + (abi ? abi : "universal") + ".apk")
             }
         }
     }
@@ -148,7 +184,7 @@ android {
 dependencies {
     testImplementation "junit:junit:4.13.2"
     testImplementation "org.robolectric:robolectric:4.10"
-    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.2"
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
 }
 
 task versionName {
@@ -164,80 +200,167 @@ def validateVersionName(String versionName) {
         throw new GradleException("The versionName '"  + versionName + "' is not a valid version as per semantic version '2.0.0' spec in the format 'major.minor.patch(-prerelease)(+buildmetadata)'. https://semver.org/spec/v2.0.0.html.")
 }
 
-def downloadBootstrap(String arch, String expectedChecksum, String version) {
-    def digest = java.security.MessageDigest.getInstance("SHA-256")
-
-    def localUrl = "src/main/cpp/bootstrap-" + arch + ".zip"
-    def file = new File(projectDir, localUrl)
-    if (file.exists()) {
-        def buffer = new byte[8192]
-        def input = new FileInputStream(file)
-        while (true) {
-            def readBytes = input.read(buffer)
-            if (readBytes < 0) break
-            digest.update(buffer, 0, readBytes)
-        }
-        def checksum = new BigInteger(1, digest.digest()).toString(16)
-        while (checksum.length() < 64) { checksum = "0" + checksum }
-        if (checksum == expectedChecksum) {
-            return
-        } else {
-            logger.quiet("Deleting old local file with wrong hash: " + localUrl + ": expected: " + expectedChecksum + ", actual: " + checksum)
-            file.delete()
-        }
-    }
-
-    def remoteUrl = "https://github.com/termux/termux-packages/releases/download/bootstrap-" + version + "/bootstrap-" + arch + ".zip"
-    logger.quiet("Downloading " + remoteUrl + " ...")
-
-    file.parentFile.mkdirs()
-    def out = new BufferedOutputStream(new FileOutputStream(file))
-
-    def connection = new URL(remoteUrl).openConnection()
-    connection.setInstanceFollowRedirects(true)
-    def digestStream = new java.security.DigestInputStream(connection.inputStream, digest)
-    out << digestStream
-    out.close()
-
-    def checksum = new BigInteger(1, digest.digest()).toString(16)
-    while (checksum.length() < 64) { checksum = "0" + checksum }
-    if (checksum != expectedChecksum) {
-        file.delete()
-        throw new GradleException("Wrong checksum for " + remoteUrl + ": expected: " + expectedChecksum + ", actual: " + checksum)
-    }
-}
-
 clean {
-    doLast {
-        def tree = fileTree(new File(projectDir, 'src/main/cpp'))
-        tree.include 'bootstrap-*.zip'
-        tree.each { it.delete() }
-    }
+    // Delete downloaded bootstrap archives.
+    delete fileTree("src/main/cpp") { include "bootstrap-*.zip" }
 }
 
-task downloadBootstraps() {
-    doLast {
-        def packageVariant = project.ext.packageVariant
+abstract class DownloadBootstrapsTask extends org.gradle.api.DefaultTask {
+    @org.gradle.api.tasks.Input
+    abstract org.gradle.api.provider.Property<String> getPackageVariant()
+
+    @org.gradle.api.tasks.Input
+    abstract org.gradle.api.provider.Property<String> getBootstrapBaseUrl()
+
+    @org.gradle.api.tasks.Internal
+    abstract org.gradle.api.file.DirectoryProperty getAppProjectDir()
+
+    @org.gradle.api.tasks.OutputFiles
+    abstract org.gradle.api.file.ConfigurableFileCollection getBootstrapArchives()
+
+    @org.gradle.api.tasks.TaskAction
+    void runTask() {
+        def packageVariant = packageVariant.get()
+
+        def version
+        def checksums
         if (packageVariant == "apt-android-7") {
-            def version = "2022.04.28-r5" + "+" + packageVariant
-            downloadBootstrap("aarch64", "4a51a7eb209fe82efc24d52e3cccc13165f27377290687cb82038cbd8e948430", version)
-            downloadBootstrap("arm", "6459a786acbae50d4c8a36fa1c3de6a4dd2d482572f6d54f73274709bd627325", version)
-            downloadBootstrap("i686", "919d212b2f19e08600938db4079e794e947365022dbfd50ac342c50fcedcd7be", version)
-            downloadBootstrap("x86_64", "61b02fdc03ea4f5d9da8d8cf018013fdc6659e6da6cbf44e9b24d1c623580b89", version)
+            version = "2022.04.28-r5" + "+" + packageVariant
+            checksums = [
+                aarch64: "4a51a7eb209fe82efc24d52e3cccc13165f27377290687cb82038cbd8e948430",
+                arm    : "6459a786acbae50d4c8a36fa1c3de6a4dd2d482572f6d54f73274709bd627325",
+                i686   : "919d212b2f19e08600938db4079e794e947365022dbfd50ac342c50fcedcd7be",
+                x86_64 : "61b02fdc03ea4f5d9da8d8cf018013fdc6659e6da6cbf44e9b24d1c623580b89",
+            ]
         } else if (packageVariant == "apt-android-5") {
-            def version = "2022.04.28-r6" + "+" + packageVariant
-            downloadBootstrap("aarch64", "913609d439415c828c5640be1b0561467e539cb1c7080662decaaca2fb4820e7", version)
-            downloadBootstrap("arm", "26bfb45304c946170db69108e5eb6e3641aad751406ce106c80df80cad2eccf8", version)
-            downloadBootstrap("i686", "46dcfeb5eef67ba765498db9fe4c50dc4690805139aa0dd141a9d8ee0693cd27", version)
-            downloadBootstrap("x86_64", "615b590679ee6cd885b7fd2ff9473c845e920f9b422f790bb158c63fe42b8481", version)
+            version = "2022.04.28-r6" + "+" + packageVariant
+            checksums = [
+                aarch64: "913609d439415c828c5640be1b0561467e539cb1c7080662decaaca2fb4820e7",
+                arm    : "26bfb45304c946170db69108e5eb6e3641aad751406ce106c80df80cad2eccf8",
+                i686   : "46dcfeb5eef67ba765498db9fe4c50dc4690805139aa0dd141a9d8ee0693cd27",
+                x86_64 : "615b590679ee6cd885b7fd2ff9473c845e920f9b422f790bb158c63fe42b8481",
+            ]
         } else {
             throw new GradleException("Unsupported TERMUX_PACKAGE_VARIANT \"" + packageVariant + "\"")
         }
+
+        def baseUrl = bootstrapBaseUrl.get().toString().trim().replaceAll("/+\$", "")
+
+        def getProxyForUrl = { URL url ->
+            def envKeys = []
+            if (url.protocol == "https") {
+                envKeys = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+            } else if (url.protocol == "http") {
+                envKeys = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+            } else {
+                envKeys = ["ALL_PROXY", "all_proxy"]
+            }
+
+            def proxySpec = null
+            for (def key : envKeys) {
+                proxySpec = System.getenv(key)
+                if (proxySpec != null && proxySpec.toString().trim()) break
+            }
+            if (proxySpec == null || !proxySpec.toString().trim()) return null
+
+            def proxyUrl
+            try {
+                proxyUrl = new URI(proxySpec.toString().trim())
+            } catch (Exception ignored) {
+                try {
+                    proxyUrl = new URI("http://" + proxySpec.toString().trim())
+                } catch (Exception ignored2) {
+                    return null
+                }
+            }
+
+            if (proxyUrl.host == null || proxyUrl.port <= 0) return null
+
+            def proxyType = java.net.Proxy.Type.HTTP
+            if (proxyUrl.scheme != null && proxyUrl.scheme.toLowerCase().startsWith("socks")) {
+                proxyType = java.net.Proxy.Type.SOCKS
+            }
+
+            return new java.net.Proxy(proxyType, new java.net.InetSocketAddress(proxyUrl.host, proxyUrl.port))
+        }
+
+        def appProjectDir = appProjectDir.get().asFile
+
+        def downloadBootstrap = { String arch, String expectedChecksum ->
+            def digest = java.security.MessageDigest.getInstance("SHA-256")
+
+            def localUrl = "src/main/cpp/bootstrap-" + arch + ".zip"
+            def file = new File(appProjectDir, localUrl)
+            if (file.exists()) {
+                def buffer = new byte[8192]
+                file.withInputStream { input ->
+                    while (true) {
+                        def readBytes = input.read(buffer)
+                        if (readBytes < 0) break
+                        digest.update(buffer, 0, readBytes)
+                    }
+                }
+                def checksum = new BigInteger(1, digest.digest()).toString(16)
+                while (checksum.length() < 64) { checksum = "0" + checksum }
+                if (checksum == expectedChecksum) {
+                    return
+                } else {
+                    logger.quiet("Deleting old local file with wrong hash: " + localUrl + ": expected: " + expectedChecksum + ", actual: " + checksum)
+                    file.delete()
+                }
+            }
+
+            def remoteUrl = baseUrl + "/bootstrap-" + version + "/bootstrap-" + arch + ".zip"
+            logger.quiet("Downloading " + remoteUrl + " ...")
+
+            file.parentFile.mkdirs()
+            def out = new BufferedOutputStream(new FileOutputStream(file))
+
+            def url = new URL(remoteUrl)
+            def proxy = getProxyForUrl(url)
+            def connection = proxy != null ? url.openConnection(proxy) : url.openConnection()
+            connection.setInstanceFollowRedirects(true)
+            def digestStream = new java.security.DigestInputStream(connection.inputStream, digest)
+            out << digestStream
+            out.close()
+
+            def checksum = new BigInteger(1, digest.digest()).toString(16)
+            while (checksum.length() < 64) { checksum = "0" + checksum }
+            if (checksum != expectedChecksum) {
+                file.delete()
+                throw new GradleException("Wrong checksum for " + remoteUrl + ": expected: " + expectedChecksum + ", actual: " + checksum)
+            }
+        }
+
+        downloadBootstrap("aarch64", checksums.aarch64)
+        downloadBootstrap("arm", checksums.arm)
+        downloadBootstrap("i686", checksums.i686)
+        downloadBootstrap("x86_64", checksums.x86_64)
     }
+}
+
+def bootstrapBaseUrlForTask = project.findProperty("termuxBootstrapBaseUrl")
+if (bootstrapBaseUrlForTask == null || !bootstrapBaseUrlForTask.toString().trim()) {
+    bootstrapBaseUrlForTask = System.getenv("TERMUX_BOOTSTRAP_BASE_URL")
+}
+if (bootstrapBaseUrlForTask == null || !bootstrapBaseUrlForTask.toString().trim()) {
+    bootstrapBaseUrlForTask = "https://github.com/termux/termux-packages/releases/download"
+}
+
+def downloadBootstrapsTaskProvider = tasks.register("downloadBootstraps", DownloadBootstrapsTask) { task ->
+    task.packageVariant.set(packageVariantForBuild)
+    task.bootstrapBaseUrl.set(bootstrapBaseUrlForTask.toString())
+    task.appProjectDir.set(layout.projectDirectory)
+    task.bootstrapArchives.from(
+        layout.projectDirectory.file("src/main/cpp/bootstrap-aarch64.zip"),
+        layout.projectDirectory.file("src/main/cpp/bootstrap-arm.zip"),
+        layout.projectDirectory.file("src/main/cpp/bootstrap-i686.zip"),
+        layout.projectDirectory.file("src/main/cpp/bootstrap-x86_64.zip"),
+    )
 }
 
 afterEvaluate {
     android.applicationVariants.all { variant ->
-        variant.javaCompileProvider.get().dependsOn(downloadBootstraps)
+        variant.javaCompileProvider.get().dependsOn(downloadBootstrapsTaskProvider)
     }
 }

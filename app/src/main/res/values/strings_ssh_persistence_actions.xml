@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="title_ssh_persistence_session_actions">持久化会话</string>
+    <string name="msg_ssh_persistence_session_target">会话：%1$s</string>
+    <string name="action_ssh_persistence_close_front">关闭前台</string>
+    <string name="action_ssh_persistence_close_back">关闭后台</string>
+    <string name="msg_ssh_persistence_closed_front">已关闭前台会话。</string>
+    <string name="msg_ssh_persistence_closing_background">正在销毁后台会话：%1$s</string>
+</resources>

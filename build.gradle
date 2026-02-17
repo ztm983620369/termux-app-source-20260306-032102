@@ -1,10 +1,15 @@
 buildscript {
     repositories {
-        mavenCentral()
         google()
+        mavenCentral()
+        maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/android-googles/' }
+        maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
     }
     dependencies {
-        classpath "com.android.tools.build:gradle:8.13.2"
+        classpath "com.android.tools.build:gradle:8.12.0"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.0"
+        classpath "org.jetbrains.kotlin:kotlin-serialization:2.2.0"
+        classpath "org.jetbrains.kotlin.plugin.compose:org.jetbrains.kotlin.plugin.compose.gradle.plugin:2.2.0"
     }
 }
 
@@ -12,6 +17,24 @@ allprojects {
     repositories {
         google()
         mavenCentral()
-        maven { url "https://jitpack.io" }
+        maven { url 'https://www.jitpack.io' }
+        maven { url 'https://maven.scijava.org/content/repositories/public/' }
+        maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/android-googles/' }
+        maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+    }
+
+    configurations.configureEach {
+        resolutionStrategy.eachDependency { details ->
+            if (details.requested.group == "org.jetbrains.kotlin" &&
+                (details.requested.name == "kotlin-stdlib" ||
+                    details.requested.name == "kotlin-stdlib-jdk7" ||
+                    details.requested.name == "kotlin-stdlib-jdk8")) {
+                details.useVersion("2.2.0")
+            }
+
+            if (details.requested.group == "androidx.activity") {
+                details.useVersion("1.9.3")
+            }
+        }
     }
 }

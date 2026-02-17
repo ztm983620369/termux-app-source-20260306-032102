@@ -1,0 +1,5 @@
+﻿<resources>
+  <string name="paste_text">绮樿创</string>
+  <string name="copy_text">澶嶅埗</string>
+  <string name="text_selection_more">鎿嶄綔</string>
+</resources>

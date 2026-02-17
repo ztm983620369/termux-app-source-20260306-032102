@@ -41,6 +41,11 @@ final class GestureAndScaleRecognizer {
             }
 
             @Override
+            public boolean onSingleTapUp(MotionEvent e) {
+                return mListener.onSingleTapUp(e);
+            }
+
+            @Override
             public boolean onFling(MotionEvent e1, MotionEvent e2, float velocityX, float velocityY) {
                 return mListener.onFling(e2, velocityX, velocityY);
             }
@@ -60,7 +65,7 @@ final class GestureAndScaleRecognizer {
         mGestureDetector.setOnDoubleTapListener(new GestureDetector.OnDoubleTapListener() {
             @Override
             public boolean onSingleTapConfirmed(MotionEvent e) {
-                return mListener.onSingleTapUp(e);
+                return false;
             }
 
             @Override

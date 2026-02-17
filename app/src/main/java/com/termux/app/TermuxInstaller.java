@@ -11,6 +11,7 @@ import android.util.Pair;
 import android.view.WindowManager;
 
 import com.termux.R;
+import com.termux.BuildConfig;
 import com.termux.shared.file.FileUtils;
 import com.termux.shared.termux.crash.TermuxCrashUtils;
 import com.termux.shared.termux.file.TermuxFileUtils;
@@ -19,15 +20,18 @@ import com.termux.shared.logger.Logger;
 import com.termux.shared.markdown.MarkdownUtils;
 import com.termux.shared.errors.Error;
 import com.termux.shared.android.PackageUtils;
+import com.termux.shared.termux.TermuxBootstrap;
 import com.termux.shared.termux.TermuxConstants;
 import com.termux.shared.termux.TermuxUtils;
 import com.termux.shared.termux.shell.command.environment.TermuxShellEnvironment;
 
 import java.io.BufferedReader;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.zip.ZipEntry;
@@ -60,6 +64,7 @@ import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR
 final class TermuxInstaller {
 
     private static final String LOG_TAG = "TermuxInstaller";
+    private static final String OPEN_FILES_HERE_LAUNCHER_BASENAME = "wjj";
 
     /** Performs bootstrap setup if necessary. */
     static void setupBootstrapIfNeeded(final Activity activity, final Runnable whenDone) {
@@ -153,7 +158,8 @@ final class TermuxInstaller {
 
                     Logger.logInfo(LOG_TAG, "Extracting bootstrap zip to prefix staging directory \"" + TERMUX_STAGING_PREFIX_DIR_PATH + "\".");
 
-                    final byte[] buffer = new byte[8096];
+                    final int ioBufferSize = 64 * 1024;
+                    final byte[] buffer = new byte[ioBufferSize];
                     final List<Pair<String, String>> symlinks = new ArrayList<>(50);
 
                     final byte[] zipBytes = loadZipBytes();
@@ -161,14 +167,15 @@ final class TermuxInstaller {
                         ZipEntry zipEntry;
                         while ((zipEntry = zipInput.getNextEntry()) != null) {
                             if (zipEntry.getName().equals("SYMLINKS.txt")) {
-                                BufferedReader symlinksReader = new BufferedReader(new InputStreamReader(zipInput));
+                                // Don't close this reader, it would close the underlying ZipInputStream too.
+                                BufferedReader symlinksReader = new BufferedReader(new InputStreamReader(zipInput, StandardCharsets.UTF_8), 16 * 1024);
                                 String line;
                                 while ((line = symlinksReader.readLine()) != null) {
-                                    String[] parts = line.split("←");
-                                    if (parts.length != 2)
+                                    int arrowIndex = line.indexOf('←');
+                                    if (arrowIndex <= 0 || arrowIndex >= line.length() - 1)
                                         throw new RuntimeException("Malformed symlink line: " + line);
-                                    String oldPath = parts[0];
-                                    String newPath = TERMUX_STAGING_PREFIX_DIR_PATH + "/" + parts[1];
+                                    String oldPath = line.substring(0, arrowIndex);
+                                    String newPath = TERMUX_STAGING_PREFIX_DIR_PATH + "/" + line.substring(arrowIndex + 1);
                                     symlinks.add(Pair.create(oldPath, newPath));
 
                                     error = ensureDirectoryExists(new File(newPath).getParentFile());
@@ -189,7 +196,7 @@ final class TermuxInstaller {
                                 }
 
                                 if (!isDirectory) {
-                                    try (FileOutputStream outStream = new FileOutputStream(targetFile)) {
+                                    try (BufferedOutputStream outStream = new BufferedOutputStream(new FileOutputStream(targetFile), ioBufferSize)) {
                                         int readBytes;
                                         while ((readBytes = zipInput.read(buffer)) != -1)
                                             outStream.write(buffer, 0, readBytes);
@@ -216,10 +223,14 @@ final class TermuxInstaller {
                         throw new RuntimeException("Moving termux prefix staging to prefix directory failed");
                     }
 
+                    configureAptSourcesListToDefaultMirrorIfNeeded();
+
                     Logger.logInfo(LOG_TAG, "Bootstrap packages installed successfully.");
 
                     // Recreate env file since termux prefix was wiped earlier
                     TermuxShellEnvironment.writeEnvironmentToFile(activity);
+
+                    installPostBootstrapLaunchersIfPossible();
 
                     activity.runOnUiThread(whenDone);
 
@@ -373,6 +384,141 @@ final class TermuxInstaller {
 
     private static Error ensureDirectoryExists(File directory) {
         return FileUtils.createDirectoryFile(directory.getAbsolutePath());
+    }
+
+    private static void configureAptSourcesListToDefaultMirrorIfNeeded() {
+        if (!TermuxBootstrap.isAppPackageManagerAPT()) return;
+
+        String defaultRepoUrl = BuildConfig.TERMUX_DEFAULT_APT_REPO_URL;
+        if (defaultRepoUrl == null) return;
+
+        defaultRepoUrl = defaultRepoUrl.trim();
+        if (defaultRepoUrl.isEmpty()) return;
+        defaultRepoUrl = defaultRepoUrl.replaceAll("/+$", "");
+
+        File sourcesListFile = new File(TERMUX_PREFIX_DIR, "etc/apt/sources.list");
+
+        StringBuilder existingSourcesList = new StringBuilder();
+        Error error = FileUtils.readTextFromFile("apt sources.list", sourcesListFile.getAbsolutePath(), StandardCharsets.UTF_8, existingSourcesList, true);
+        if (error != null) {
+            Logger.logErrorExtended(LOG_TAG, "Failed to read apt sources.list at \"" + sourcesListFile.getAbsolutePath() + "\"\n" + error);
+            return;
+        }
+
+        String existingSourcesListString = existingSourcesList.toString();
+        if (existingSourcesListString.contains(defaultRepoUrl) && existingSourcesListString.contains("deb ")) {
+            return;
+        }
+
+        // Only auto-replace if it looks like a default (fresh install) file. Don't overwrite user customizations.
+        boolean looksLikeDefaultSourcesList = existingSourcesListString.trim().isEmpty() ||
+            existingSourcesListString.contains("packages-cf.termux.org") ||
+            existingSourcesListString.contains("packages.termux.org") ||
+            existingSourcesListString.contains("packages.termux.dev");
+        if (!looksLikeDefaultSourcesList) {
+            Logger.logInfo(LOG_TAG, "Skipping apt sources.list override since it appears to be customized.");
+            return;
+        }
+
+        String sourcesListString =
+            "# The main termux repository (mirror):\n" +
+            "deb " + defaultRepoUrl + " stable main\n" +
+            "# Original default:\n" +
+            "# deb https://packages-cf.termux.org/apt/termux-main/ stable main\n";
+
+        error = FileUtils.writeTextToFile("apt sources.list", sourcesListFile.getAbsolutePath(), StandardCharsets.UTF_8, sourcesListString, false);
+        if (error != null) {
+            Logger.logErrorExtended(LOG_TAG, "Failed to write apt sources.list at \"" + sourcesListFile.getAbsolutePath() + "\"\n" + error);
+            return;
+        }
+
+        Logger.logInfo(LOG_TAG, "Set apt repository mirror to \"" + defaultRepoUrl + "\".");
+    }
+
+    static void installPostBootstrapLaunchersIfPossible() {
+        installOpenFilesHereLauncherIfPossible();
+    }
+
+    /**
+     * Install `wjj` command to open file manager at current shell directory.
+     * <p/>
+     * Important: Do not create $PREFIX if bootstrap is not installed.
+     */
+    private static void installOpenFilesHereLauncherIfPossible() {
+        File binDir = new File(TERMUX_PREFIX_DIR, "bin");
+        File sh = new File(binDir, "sh");
+        if (!sh.exists() || !binDir.isDirectory()) return;
+
+        File launcher = new File(binDir, OPEN_FILES_HERE_LAUNCHER_BASENAME);
+        String script = buildOpenFilesHereLauncherScript();
+        if (writeExecutableScript(launcher, script)) {
+            Logger.logInfo(LOG_TAG, "Installed open-files launcher: " + launcher.getAbsolutePath());
+        }
+    }
+
+    private static String buildOpenFilesHereLauncherScript() {
+        String component = TermuxConstants.TERMUX_PACKAGE_NAME + "/.app.TermuxActivity";
+        return "#!/data/data/com.termux/files/usr/bin/sh\n" +
+            "# Termux open-files launcher\n" +
+            "TARGET_PATH=\"${1:-$PWD}\"\n" +
+            "if [ -z \"$TARGET_PATH\" ]; then\n" +
+            "  TARGET_PATH=\"$PWD\"\n" +
+            "fi\n" +
+            "if [ ! -e \"$TARGET_PATH\" ]; then\n" +
+            "  printf 'wjj: path does not exist: %s\\n' \"$TARGET_PATH\" >&2\n" +
+            "  exit 1\n" +
+            "fi\n" +
+            "if [ ! -d \"$TARGET_PATH\" ]; then\n" +
+            "  TARGET_PATH=\"$(dirname \"$TARGET_PATH\")\"\n" +
+            "fi\n" +
+            "if command -v realpath >/dev/null 2>&1; then\n" +
+            "  TARGET_PATH=\"$(realpath \"$TARGET_PATH\" 2>/dev/null || printf '%s' \"$TARGET_PATH\")\"\n" +
+            "elif command -v readlink >/dev/null 2>&1; then\n" +
+            "  TARGET_PATH=\"$(readlink -f \"$TARGET_PATH\" 2>/dev/null || printf '%s' \"$TARGET_PATH\")\"\n" +
+            "fi\n" +
+            "REQUEST_FILE=\"" + TermuxActivityUiReceiver.OPEN_FILES_AT_REQUEST_FILE_PATH + "\"\n" +
+            "REQUEST_DIR=\"$(dirname \"$REQUEST_FILE\")\"\n" +
+            "mkdir -p \"$REQUEST_DIR\" || {\n" +
+            "  echo 'wjj: cannot create request dir' >&2\n" +
+            "  exit 1\n" +
+            "}\n" +
+            "printf '%s\\n' \"$TARGET_PATH\" > \"$REQUEST_FILE\" || {\n" +
+            "  echo 'wjj: cannot write request file' >&2\n" +
+            "  exit 1\n" +
+            "}\n" +
+            "bring_to_foreground() {\n" +
+            "  AM_CMD=\"$1\"\n" +
+            "  ( \"$AM_CMD\" start -n \"" + component + "\" >/dev/null 2>&1 ) &\n" +
+            "}\n" +
+            "if command -v termux-am >/dev/null 2>&1; then\n" +
+            "  bring_to_foreground termux-am\n" +
+            "  exit 0\n" +
+            "fi\n" +
+            "if [ -x /system/bin/am ]; then\n" +
+            "  bring_to_foreground /system/bin/am\n" +
+            "  exit 0\n" +
+            "fi\n" +
+            "if command -v am >/dev/null 2>&1; then\n" +
+            "  bring_to_foreground am\n" +
+            "  exit 0\n" +
+            "fi\n" +
+            "if [ -x /system/bin/cmd ]; then\n" +
+            "  ( /system/bin/cmd activity start-activity -n \"" + component + "\" >/dev/null 2>&1 ) &\n" +
+            "  exit 0\n" +
+            "fi\n" +
+            "exit 0\n";
+    }
+
+    private static boolean writeExecutableScript(File file, String content) {
+        try (FileOutputStream out = new FileOutputStream(file)) {
+            out.write(content.getBytes(StandardCharsets.UTF_8));
+            //noinspection OctalInteger
+            Os.chmod(file.getAbsolutePath(), 0700);
+            return true;
+        } catch (Exception e) {
+            Logger.logErrorExtended(LOG_TAG, "Failed to write script " + file.getAbsolutePath() + "\n" + e);
+            return false;
+        }
     }
 
     public static byte[] loadZipBytes() {

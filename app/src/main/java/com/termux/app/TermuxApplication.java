@@ -71,6 +71,12 @@ public class TermuxApplication extends Application {
         if (isTermuxFilesDirectoryAccessible) {
             TermuxShellEnvironment.writeEnvironmentToFile(this);
         }
+
+        if (isTermuxFilesDirectoryAccessible) {
+            new Thread(TermuxInstaller::installPostBootstrapLaunchersIfPossible).start();
+        }
+
+        tuneLeakCanaryIfPresent();
     }
 
     public static void setLogConfig(Context context) {
@@ -80,6 +86,29 @@ public class TermuxApplication extends Application {
         TermuxAppSharedPreferences preferences = TermuxAppSharedPreferences.build(context);
         if (preferences == null) return;
         preferences.setLogLevel(null, preferences.getLogLevel());
+    }
+
+    private static void tuneLeakCanaryIfPresent() {
+        if (!BuildConfig.DEBUG) return;
+        try {
+            Class<?> leakCanaryClass = Class.forName("leakcanary.LeakCanary");
+            Object leakCanary = leakCanaryClass.getField("INSTANCE").get(null);
+            Object config = leakCanaryClass.getMethod("getConfig").invoke(leakCanary);
+            Object builder = config.getClass().getMethod("newBuilder").invoke(config);
+            callIfExists(builder, "retainedVisibleThreshold", new Class<?>[]{int.class}, new Object[]{50});
+            callIfExists(builder, "computeRetainedHeapSize", new Class<?>[]{boolean.class}, new Object[]{false});
+            callIfExists(builder, "maxStoredHeapDumps", new Class<?>[]{int.class}, new Object[]{1});
+            Object newConfig = builder.getClass().getMethod("build").invoke(builder);
+            leakCanaryClass.getMethod("setConfig", newConfig.getClass()).invoke(leakCanary, newConfig);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void callIfExists(Object target, String method, Class<?>[] types, Object[] args) {
+        try {
+            target.getClass().getMethod(method, types).invoke(target, args);
+        } catch (Throwable ignored) {
+        }
     }
 
 }

@@ -1,1 +1,19 @@
-include ':app', ':termux-shared', ':terminal-emulator', ':terminal-view'
+include ':app', ':termux-shared', ':terminal-emulator', ':terminal-view', ':ui-shell',
+        ':sora-editor', ':sora-demo',
+        ':sora-language-java', ':sora-language-textmate', ':sora-language-monarch',
+        ':sora-editor-lsp', ':sora-language-treesitter', ':sora-oniguruma-native',
+        ':terminal-tabs',
+        ':file-bridge',
+        ':file-manager',
+        ':fossify-commons'
+
+project(':sora-editor').projectDir = new File(rootDir, 'sora-editor-0.24.3/editor')
+project(':sora-demo').projectDir = new File(rootDir, 'sora-editor-0.24.3/app')
+project(':sora-language-java').projectDir = new File(rootDir, 'sora-editor-0.24.3/language-java')
+project(':sora-language-textmate').projectDir = new File(rootDir, 'sora-editor-0.24.3/language-textmate')
+project(':sora-language-monarch').projectDir = new File(rootDir, 'sora-editor-0.24.3/language-monarch')
+project(':sora-editor-lsp').projectDir = new File(rootDir, 'sora-editor-0.24.3/editor-lsp')
+project(':sora-language-treesitter').projectDir = new File(rootDir, 'sora-editor-0.24.3/language-treesitter')
+project(':sora-oniguruma-native').projectDir = new File(rootDir, 'sora-editor-0.24.3/oniguruma-native')
+project(':file-manager').projectDir = new File(rootDir, 'File-Manager-1.5.0/File-Manager-1.5.0/app')
+project(':fossify-commons').projectDir = new File(rootDir, 'fossify-commons')

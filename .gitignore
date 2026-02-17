@@ -10,15 +10,26 @@ release/
 .externalNativeBuild
 .cxx
 *.zip
+!app/src/main/assets/aider-src.zip
 
 # Local configuration file (sdk path, etc)
 local.properties
 
 # Gradle generated files
 .gradle/
+.gradle-user-home/
+.java-user-home/
+.kotlin/
+.tmp/
+.trae/
 
 # Signing files
 .signing/
+
+# Android Studio / tooling
+.android/
+analytics.settings
+.vscode/
 
 # Intellij
 .idea/

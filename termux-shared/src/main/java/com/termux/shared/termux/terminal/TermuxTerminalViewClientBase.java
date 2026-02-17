@@ -39,6 +39,16 @@ public class TermuxTerminalViewClientBase implements TerminalViewClient {
     }
 
     @Override
+    public boolean shouldScrollWithArrowKeysInAlternateBuffer(TerminalSession session) {
+        return true;
+    }
+
+    @Override
+    public boolean shouldSendMouseWheelEventsForTouchScroll(TerminalSession session) {
+        return true;
+    }
+
+    @Override
     public void copyModeChanged(boolean copyMode) {
     }
 

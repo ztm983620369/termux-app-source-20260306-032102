@@ -15,6 +15,7 @@ import android.widget.LinearLayout;
 import androidx.annotation.Nullable;
 import androidx.core.view.WindowInsetsCompat;
 
+import com.termux.R;
 import com.termux.app.TermuxActivity;
 import com.termux.shared.logger.Logger;
 import com.termux.shared.view.ViewUtils;
@@ -69,6 +70,10 @@ public class TermuxActivityRootView extends LinearLayout implements ViewTreeObse
     public long lastMarginBottomTime;
     public long lastMarginBottomExtraTime;
 
+    private boolean mIsBottomNavigationFixedOnImeEnabled = true;
+    private int mLastImeBottomInset = 0;
+    private int mBottomNavOriginalHeight = -1;
+
     /** Log root view events. */
     private boolean ROOT_VIEW_LOGGING_ENABLED = false;
 
@@ -99,6 +104,59 @@ public class TermuxActivityRootView extends LinearLayout implements ViewTreeObse
      */
     public void setIsRootViewLoggingEnabled(boolean value) {
         ROOT_VIEW_LOGGING_ENABLED = value;
+    }
+
+    public void setBottomNavigationFixedOnImeEnabled(boolean enabled) {
+        mIsBottomNavigationFixedOnImeEnabled = enabled;
+        applyBottomNavigationImeFix();
+    }
+
+    public boolean isBottomNavigationFixedOnImeEnabled() {
+        return mIsBottomNavigationFixedOnImeEnabled;
+    }
+
+    private void onWindowInsetsApplied(WindowInsetsCompat insets) {
+        mLastImeBottomInset = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
+        applyBottomNavigationImeFix();
+    }
+
+    private void applyBottomNavigationImeFix() {
+        if (mActivity == null) return;
+
+        View bottomNavigationView = mActivity.findViewById(R.id.bottom_navigation);
+        if (bottomNavigationView == null) return;
+
+        View terminalToolbarViewPager = mActivity.findViewById(R.id.terminal_toolbar_view_pager);
+
+        bottomNavigationView.setTranslationY(0f);
+        if (terminalToolbarViewPager != null) terminalToolbarViewPager.setTranslationY(0f);
+
+        boolean imeVisible = mLastImeBottomInset > 0;
+        ViewGroup.LayoutParams bottomNavLayoutParams = bottomNavigationView.getLayoutParams();
+        if (bottomNavLayoutParams != null) {
+            if (mBottomNavOriginalHeight <= 0) {
+                mBottomNavOriginalHeight = bottomNavLayoutParams.height;
+                if (mBottomNavOriginalHeight <= 0) {
+                    int measuredHeight = bottomNavigationView.getHeight();
+                    if (measuredHeight > 0) mBottomNavOriginalHeight = measuredHeight;
+                }
+                if (mBottomNavOriginalHeight <= 0) {
+                    mBottomNavOriginalHeight = Math.round(56f * getResources().getDisplayMetrics().density);
+                }
+            }
+
+            if (mIsBottomNavigationFixedOnImeEnabled && imeVisible) {
+                if (bottomNavLayoutParams.height != 0) {
+                    bottomNavLayoutParams.height = 0;
+                    bottomNavigationView.setLayoutParams(bottomNavLayoutParams);
+                }
+            } else {
+                if (bottomNavLayoutParams.height != mBottomNavOriginalHeight) {
+                    bottomNavLayoutParams.height = mBottomNavOriginalHeight;
+                    bottomNavigationView.setLayoutParams(bottomNavLayoutParams);
+                }
+            }
+        }
     }
 
     @Override
@@ -275,7 +333,11 @@ public class TermuxActivityRootView extends LinearLayout implements ViewTreeObse
     public static class WindowInsetsListener implements View.OnApplyWindowInsetsListener {
         @Override
         public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
-            mStatusBarHeight =  WindowInsetsCompat.toWindowInsetsCompat(insets).getInsets(WindowInsetsCompat.Type.statusBars()).top;
+            WindowInsetsCompat insetsCompat = WindowInsetsCompat.toWindowInsetsCompat(insets);
+            mStatusBarHeight = insetsCompat.getInsets(WindowInsetsCompat.Type.statusBars()).top;
+            if (v instanceof TermuxActivityRootView) {
+                ((TermuxActivityRootView) v).onWindowInsetsApplied(insetsCompat);
+            }
             // Let view window handle insets however it wants
             return v.onApplyWindowInsets(insets);
         }

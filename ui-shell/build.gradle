@@ -1,0 +1,76 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+apply plugin: 'org.jetbrains.kotlin.plugin.compose'
+
+android {
+    namespace "com.termux.ui"
+
+    compileSdkVersion project.properties.compileSdkVersion.toInteger()
+
+    defaultConfig {
+        minSdkVersion project.properties.minSdkVersion.toInteger()
+        targetSdkVersion project.properties.targetSdkVersion.toInteger()
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildFeatures {
+        compose true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+
+    sourceSets {
+        main {
+            assets.srcDirs += [
+                "${project.rootDir}/icons",
+                "${project.rootDir}/sora-editor-0.24.3/extensions/theme-seti/icons"
+            ]
+            assets.srcDir("${buildDir}/generated/ui-shell-assets")
+        }
+    }
+}
+
+tasks.register("generateUiShellAssets") {
+    def outDir = file("${buildDir}/generated/ui-shell-assets")
+    inputs.file("${project.rootDir}/material-icons.json")
+    outputs.file(file("${buildDir}/generated/ui-shell-assets/material-icons.json"))
+    doLast {
+        if (outDir.exists()) outDir.deleteDir()
+        outDir.mkdirs()
+        copy {
+            from("${project.rootDir}/material-icons.json")
+            into(outDir)
+            rename { "material-icons.json" }
+        }
+    }
+}
+
+preBuild.dependsOn(tasks.named("generateUiShellAssets"))
+
+dependencies {
+    implementation platform("androidx.compose:compose-bom:2024.06.00")
+    implementation "androidx.activity:activity-compose:1.9.3"
+    implementation "androidx.compose.ui:ui"
+    implementation "androidx.compose.ui:ui-tooling-preview"
+    implementation "androidx.compose.material3:material3"
+    implementation "androidx.compose.material:material-icons-core"
+    implementation "androidx.compose.material:material-icons-extended"
+    implementation "androidx.compose.runtime:runtime-saveable"
+    debugImplementation "androidx.compose.ui:ui-tooling"
+
+    implementation "androidx.core:core-ktx:1.13.1"
+
+    implementation "io.coil-kt:coil-compose:2.6.0"
+    implementation "io.coil-kt:coil-svg:2.6.0"
+
+    implementation project(":termux-shared")
+    implementation project(":terminal-view")
+    implementation project(":file-bridge")
+}

@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="utf-8"?>
+<org.fossify.filemanager.fragments.ItemsFragment xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/items_fragment"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <androidx.coordinatorlayout.widget.CoordinatorLayout
+        android:id="@+id/items_coordinator"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <RelativeLayout
+            android:id="@+id/items_wrapper"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <androidx.constraintlayout.widget.ConstraintLayout
+                android:id="@+id/path_bar_holder"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_alignParentTop="true"
+                android:background="?attr/selectableItemBackground"
+                android:paddingStart="@dimen/small_margin"
+                android:paddingTop="@dimen/tiny_margin"
+                android:paddingEnd="@dimen/bigger_margin"
+                android:paddingBottom="@dimen/tiny_margin">
+
+                <androidx.appcompat.widget.AppCompatImageView
+                    android:id="@+id/path_bar_up"
+                    android:layout_width="@dimen/file_picker_icon_size"
+                    android:layout_height="@dimen/file_picker_icon_size"
+                    android:padding="@dimen/medium_margin"
+                    android:src="@drawable/ic_folder_vector"
+                    app:layout_constraintBottom_toBottomOf="parent"
+                    app:layout_constraintStart_toStartOf="parent"
+                    app:layout_constraintTop_toTopOf="parent" />
+
+                <org.fossify.commons.views.MyTextView
+                    android:id="@+id/path_bar_text"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:alpha="0.6"
+                    android:ellipsize="middle"
+                    android:maxLines="1"
+                    android:paddingStart="@dimen/tiny_margin"
+                    android:textSize="@dimen/smaller_text_size"
+                    app:layout_constraintBottom_toBottomOf="parent"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintStart_toEndOf="@+id/path_bar_up"
+                    app:layout_constraintTop_toTopOf="parent"
+                    app:layout_constraintVertical_bias="0.5" />
+            </androidx.constraintlayout.widget.ConstraintLayout>
+
+            <com.google.android.material.progressindicator.LinearProgressIndicator
+                android:id="@+id/progress_bar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_alignParentTop="true"
+                android:indeterminate="true"
+                android:visibility="gone"
+                app:hideAnimationBehavior="outward"
+                app:showAnimationBehavior="inward"
+                app:showDelay="250"
+                tools:visibility="visible" />
+
+            <org.fossify.commons.views.MyTextView
+                android:id="@+id/items_placeholder"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@+id/path_bar_holder"
+                android:layout_centerHorizontal="true"
+                android:alpha="0.8"
+                android:gravity="center"
+                android:paddingStart="@dimen/activity_margin"
+                android:paddingEnd="@dimen/activity_margin"
+                android:text="@string/no_items_found"
+                android:textSize="@dimen/bigger_text_size"
+                android:textStyle="italic"
+                android:visibility="gone" />
+
+            <org.fossify.commons.views.MyTextView
+                android:id="@+id/items_placeholder_2"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_below="@+id/items_placeholder"
+                android:layout_centerHorizontal="true"
+                android:alpha="0.8"
+                android:background="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:padding="@dimen/activity_margin"
+                android:text="@string/type_2_characters"
+                android:textSize="@dimen/bigger_text_size"
+                android:textStyle="italic"
+                android:visibility="gone" />
+
+            <org.fossify.filemanager.views.MySwipeRefreshLayout
+                android:id="@+id/items_swipe_refresh"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@+id/path_bar_holder">
+
+                <com.qtalk.recyclerviewfastscroller.RecyclerViewFastScroller
+                    android:id="@+id/items_fastscroller"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    app:supportSwipeToRefresh="true">
+
+                    <org.fossify.commons.views.MyRecyclerView
+                        android:id="@+id/items_list"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:clipToPadding="false"
+                        android:layoutAnimation="@anim/layout_animation"
+                        android:scrollbars="none"
+                        app:layoutManager="org.fossify.commons.views.MyGridLayoutManager" />
+
+                </com.qtalk.recyclerviewfastscroller.RecyclerViewFastScroller>
+            </org.fossify.filemanager.views.MySwipeRefreshLayout>
+        </RelativeLayout>
+
+        <org.fossify.commons.views.MyFloatingActionButton
+            android:id="@+id/items_fab"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|end"
+            android:layout_margin="@dimen/activity_margin"
+            android:src="@drawable/ic_plus_vector" />
+
+    </androidx.coordinatorlayout.widget.CoordinatorLayout>
+</org.fossify.filemanager.fragments.ItemsFragment>

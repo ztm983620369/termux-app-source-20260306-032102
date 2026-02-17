@@ -1,0 +1,88 @@
+## 2025-12-28
+
+- `app/build.gradle.kts`：把仓库根目录的 `extensions/` 加入 app 的 assets 打包范围，供运行时扫描
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：VS Code 语言列表合并 `assets/textmate/languages.json` + assets 中的 `extensions/*/package.json`；首次进入会预加载所有扩展 grammar；点击切换时成功 toast，失败弹出可复制的中文错误信息对话框（避免 C++ 等多 grammar 语言加载异常）；修复 embeddedLanguages 预加载时的 Kotlin 编译问题；修复内置 TextMate Python 的 scopeName 映射
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：新增“VS Code主题/配色”入口；从内置 `assets/textmate/*.json` 与 `extensions/*/package.json(contributes.themes)` 读取主题列表并支持搜索；切换主题时同样提供成功 toast / 失败可复制中文错误信息；支持读取 `package.nls.json` 并替换主题 label 中的 `%xxx%` 占位符
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：新增“VS Code字体”入口；扫描 app assets 与 `extensions/*` 中常见目录的字体文件（ttf/otf/ttc）并支持搜索；若扩展目录未包含字体则提示并提供系统字体选项；切换字体成功 toast，失败弹出可复制中文错误信息
+- `language-textmate/src/main/java/io/github/rosemoe/sora/langs/textmate/registry/GrammarRegistry.java`：修复 embeddedLanguages 传递逻辑，提升 HTML 内嵌语言（如 CSS/JS）等场景的高亮兼容性
+- `language-textmate/src/main/java/org/eclipse/tm4e/core/internal/theme/Theme.java`：容错处理主题规则里为 null 的 scope，避免切换部分主题时 NPE 崩溃
+- `language-textmate/src/main/java/org/eclipse/tm4e/core/internal/parser/TMParserJSON.java`：增强 JSONC 容错（注释、尾随逗号等），避免部分 VS Code 主题 JSON 解析失败
+- `app/src/main/res/menu/menu_main.xml`：在右上角菜单新增菜单项 `vscode_syntax_highlight`、`vscode_theme`
+- `app/src/main/res/menu/menu_main.xml`：新增菜单项 `vscode_typeface`（VS Code字体）
+- `app/src/main/res/values/strings.xml`：新增菜单标题字符串 `vscode_syntax_highlight`
+- `app/src/main/res/values-zh/strings.xml`：新增菜单标题字符串 `vscode_syntax_highlight`（中文）
+- `app/src/main/res/values/strings.xml`：新增菜单标题字符串 `vscode_theme`
+- `app/src/main/res/values-zh/strings.xml`：新增菜单标题字符串 `vscode_theme`（中文）
+- `app/src/main/res/values/strings.xml`：新增菜单标题字符串 `vscode_typeface`
+- `app/src/main/res/values-zh/strings.xml`：新增菜单标题字符串 `vscode_typeface`（中文）
+- `language-textmate/src/main/java/org/eclipse/tm4e/core/internal/oniguruma/impl/joni/JoniOnigSearcher.java`：Joni 正则引擎兼容处理（清理 `++/*+/?+/{..}+` 等量词），避免 YAML 等 grammar 在 Joni 下大量规则失效导致“无高亮”
+- `language-textmate/src/main/java/io/github/rosemoe/sora/langs/textmate/TextMateAnalyzer.java`：Joni 模式下放宽每行 tokenize 超时（从 2s 调整到 5s），减少复杂 grammar（如 YAML）被提前中断导致的高亮缺失
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：VS Code语法切换后增加高亮自检；若检测到疑似“无高亮”，弹出可复制中文信息便于排查
+- `language-textmate/src/main/java/org/eclipse/tm4e/core/internal/parser/TMParserJSON.java`：解析 JSON grammar 时，忽略 `repository`/`captures` 下的非对象值（如 `//` 注释键对应的字符串），修复 YAML(dockercompose) 切换时 `ClassCastException`
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：语法切换失败时对 `ClassCastException(IrawRule)` 提供中文提示与可能原因
+- `editor-lsp/src/main/java/io/github/rosemoe/sora/lsp/editor/LspEditor.kt`：新增 `languageId`，用于从 `LanguageServerDefinition.languageIdFor()` 生成 LSP 语言标识
+- `editor-lsp/src/main/java/io/github/rosemoe/sora/lsp/utils/LspUtils.kt`：`didOpen` 发送的 `TextDocumentItem.languageId` 改为使用 `LspEditor.languageId`，避免 `py`/`python` 等不匹配导致服务端能力异常
+- `editor-lsp/src/main/java/io/github/rosemoe/sora/lsp/client/connection/SocketStreamConnectionProvider.kt`：将 TCP 连接超时从 20ms 调整为 20s，提升连接外部（电脑）LSP 服务的成功率
+- `lsp/server.js`：新增 Node TCP 代理服务，监听 `LSP_HOST:LSP_PORT(默认 0.0.0.0:4389)`，为每个连接启动 `pylsp --stdio` 并转发 LSP 流量（支持 `PYLSP_CONFIG`/`PYLSP_COMMAND`/`PYLSP_ARGS` 配置）
+- `app/src/main/java/io/github/rosemoe/sora/app/lsp/PythonLspTestActivity.kt`：修复 `runCheckDiagnostics()` 中 `withTimeout` 返回类型推断为 `Any` 导致的 Kotlin 编译失败
+
+## 2026-01-11
+
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：打开文件后按文件名/后缀自动匹配并应用“VS Code语法高亮”(TextMate)；同时扩展右上角“自测”输出（包含自动匹配结果、grammar 加载状态、主题/引擎/内存等）
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：自测与自动高亮增加全链路容错，避免异常导致主线程崩溃；自测追加读取 Termux 崩溃日志 tail（crash_log.md）便于直接定位堆栈
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：修复自测读取 `EditorSearcher.matchedPositionCount` 在未设置 pattern 时抛异常导致崩溃
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：在“VS Code语法高亮”界面增加“自动按后缀匹配”开关；仅在开关开启时，主页打开文件会自动匹配并应用高亮
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：监听 IME(键盘) 可见性（WindowInsets + 布局变化双保险），键盘弹出时显示底部辅助输入栏，收起时隐藏
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：底部辅助输入栏显示/隐藏改为高度动画，视觉上更像被键盘“顶出来/推回去”
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：底部辅助输入栏动画逻辑重构为属性动画（alpha/translationY）并合并两种键盘检测结果，减少闪现与残留重影
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：底部辅助输入栏改为跟随 IME 动画进出（WindowInsetsAnimationCompat），避免闪现与残留
+- `app/src/main/res/layout/activity_main.xml`：底部辅助输入栏改为悬浮覆盖模式，不再挤压编辑器布局，避免“下面还留一块”的视觉问题
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：修正 IME 动画 bounds 读取方式，解决 Kotlin 编译错误
+- `app/src/main/res/layout/activity_main.xml`：移除底部定位数字显示区域 `position_display`，避免产生大块空白
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：移除与 `position_display` 关联的更新逻辑与事件订阅
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：清理残留的 `positionDisplay` 引用，修复 Kotlin 编译失败
+- `app/src/main/res/layout/activity_main.xml`：底部辅助输入栏默认隐藏，由键盘状态控制显示
+- `app/src/main/java/io/github/rosemoe/sora/app/LinuxAutoSaveManager.kt`：新增面向 Termux/Linux 文件路径的自动保存/手动保存核心（原子写入、fsync、去重、防抖）
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：接入自动保存（内容变更触发防抖保存）、提供手动保存入口与自动保存自测对话框
+- `app/src/main/res/menu/menu_main.xml`：新增自动保存开关、手动保存与自动保存自测菜单项
+- `app/src/main/res/values/strings.xml`：新增自动保存/保存/自动保存自测字符串
+- `app/src/main/res/values-zh/strings.xml`：新增自动保存/保存/自动保存自测中文字符串
+- `app/src/main/java/io/github/rosemoe/sora/app/LinuxAutoSaveManager.kt`：自动保存关闭时清理状态；自测增强为随机字节、多尺寸、压力写入并验证无 tmp/bak 残留
+- `app/src/main/java/io/github/rosemoe/sora/app/MainActivity.kt`：自动保存自测恢复“复制”按钮（自定义资源避免系统字符串缺失）
+- `app/src/main/java/io/github/rosemoe/sora/app/VSCodeIntegration.kt`：改进“疑似无高亮”检测（检查非根 scope），并为 YAML 使用更贴近 docker-compose 的样例，减少误报
+- `app/src/main/java/io/github/rosemoe/sora/app/VSCodeIntegration.kt`：补齐 IStateStack import，修复 Kotlin 编译失败
+- `ui-shell/src/main/java/com/termux/ui/panel/TermuxCommandRunner.kt`：新增可复用的 Termux 命令执行器（bash -lc + AppShell），支持实时输出
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：新增 Termux 工业级管理面板雏形（环境/进程/端口/镜像），所有操作带实时日志与错误弹窗
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：新增多语言多版本管理核心（mise 安装、远程版本列表、安装/切换、智能错误建议）
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：增强 proot-distro 安装失败诊断，清理 ANSI 控制字符并给出更精确的网络/TLS/403-404 建议
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：环境页升级为“版本管理”交互（拉取可用版本、一键安装并切换），结果弹窗增加“建议/错误原因”提示
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：检测逻辑增强（解析实际可执行路径、识别来源 termux/mise/proot、dpkg-query 兜底判断已安装但 PATH 不生效）
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：mise 检测改为绝对路径多位置兜底（不依赖 $HOME）；工具检测增加 $PREFIX/bin 与 mise shims 兜底，解决“已安装但面板显示没有”
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：环境页增加“宿主/PRoot 同步检测”开关，避免“终端装了但面板显示没有”的错觉
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：修复脚本字符串中的 `$` 转义导致的 Kotlin 编译失败
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：修复详情脚本中的 `$` 转义导致的 Kotlin 编译失败
+- `ui-shell/src/main/java/com/termux/ui/panel/ProotDistroManager.kt`：新增 proot-distro 状态/发行版解析与持久化开关（默认 Ubuntu）
+- `ui-shell/src/main/java/com/termux/ui/panel/ProotDistroManager.kt`：发行版检测增强（解析命令输出失败时扫描 installed-rootfs 目录），避免 Ubuntu 已装但面板不显示
+- `app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java`：终端会话创建支持“默认进入 PRoot”，开启后新建/恢复会话优先进入 `proot-distro login <distro>`（除非手动关闭）
+- `app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java`：PRoot 终端会话启动补齐 mise shims PATH，确保终端与面板版本一致
+- `ui-shell/src/main/java/com/termux/ui/panel/ExecTarget.kt`：新增执行目标抽象（宿主/PRoot），用于全局隔离与切换
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：支持按执行目标检测/安装（宿主用 pkg，PRoot 用 apt；mise 检测/版本列表随目标切换）
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：修复 mise 安装脚本误用 `$$`（PID）导致 $HOME/$PATH 失效
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：面板全局按 PRoot 开关切换执行环境（环境/进程/端口/镜像全部隔离），并在执行标题中标注当前环境
+- `ui-shell/src/main/java/com/termux/ui/panel/ProotDistroManager.kt`：修复 PRoot 命令执行仍命中宿主 PATH（强制使用 /usr/bin/bash 并重置 PATH 到 Ubuntu 标准路径）
+- `ui-shell/src/main/java/com/termux/ui/panel/ProotDistroManager.kt`：PRoot 执行环境补齐 mise shims/bin 到 PATH，保证 `mise use` 后 node/python 等可直接命中
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：miseEnvExportLine 补齐 shims/bin，避免安装/切换后命令仍找不到
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：版本切换后执行 `mise reshim`，确保 shim 立即生效
+- `ui-shell/src/main/java/com/termux/ui/panel/EnvironmentManager.kt`：mise 版本列表支持插件名回退与合理性校验，避免 Node 显示 0.1.x 等异常版本
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：版本管理弹窗显示实际使用的 mise 插件名
+- `ui-shell/src/main/java/com/termux/ui/panel/PanelSelfTest.kt`：新增“面板一键自检”脚本生成与执行，快速捕获环境/版本/插件异常
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：顶部新增“自检”按钮，一键输出全功能诊断日志
+- `ui-shell/src/main/java/com/termux/ui/panel/ProotDistroManager.kt`：Ubuntu 安装增加前置依赖（ca-certificates/openssl/curl）自动修复
+- `ui-shell/src/main/java/com/termux/ui/panel/TermuxTerminalLauncher.kt`：新增通过 TermuxService 创建前台会话的启动器（用于“自动登录 Ubuntu”）
+- `ui-shell/src/main/java/com/termux/ui/panel/SystemDashboardActivity.kt`：新增 PRoot 管理页（安装 proot-distro/安装 Ubuntu/设默认/进入），并提供一键启用“终端默认 Ubuntu”
+- `ui-shell/src/main/java/com/termux/ui/TermuxUiApp.kt`：终端入口支持 PRoot 模式，启用后直接启动 `proot-distro login <distro>` 会话
+- `ui-shell/src/main/java/com/termux/ui/TermuxUiApp.kt`：PRoot 模式终端入口改为启动“带 shims PATH 的交互 shell”，确保与面板一致
+- `ui-shell/src/main/java/com/termux/ui/TermuxUiApp.kt`：项目页增加“管理面板”入口按钮
+- `ui-shell/src/main/AndroidManifest.xml`：注册 SystemDashboardActivity（Theme.TermuxUi）
+- `app/src/main/res/values/strings.xml`：新增 copy_text
+- `app/src/main/res/values-zh/strings.xml`：新增 copy_text

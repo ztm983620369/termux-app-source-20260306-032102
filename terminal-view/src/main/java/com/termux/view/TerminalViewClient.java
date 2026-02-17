@@ -36,6 +36,10 @@ public interface TerminalViewClient {
 
     boolean isTerminalViewSelected();
 
+    boolean shouldScrollWithArrowKeysInAlternateBuffer(TerminalSession session);
+
+    boolean shouldSendMouseWheelEventsForTouchScroll(TerminalSession session);
+
 
 
     void copyModeChanged(boolean copyMode);
