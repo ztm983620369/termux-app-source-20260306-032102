@@ -399,6 +399,7 @@ class MainActivity : SimpleActivity(), FileManagerHost {
                     getAllFragments().forEach {
                         (it as? ItemOperationsListener)?.finishActMode()
                     }
+                    (getCurrentFragment() as? RecentsFragment)?.refreshFragment()
                     refreshMenuItems()
                 }
             })
@@ -463,6 +464,10 @@ class MainActivity : SimpleActivity(), FileManagerHost {
         }
 
         showMainFabMenu()
+    }
+
+    override fun showSessionSwitcher() {
+        // Reserved for Termux integrated host. Standalone file manager keeps current behavior.
     }
 
     private fun showMainFabMenu() {
@@ -732,9 +737,19 @@ class MainActivity : SimpleActivity(), FileManagerHost {
 
     private fun checkInvalidFavorites() {
         ensureBackgroundThread {
-            config.favorites.forEach {
-                if (!isPathOnOTG(it) && !isPathOnSD(it) && !File(it).exists()) {
-                    config.removeFavorite(it)
+            val snapshot = config.favorites.toList()
+            val termuxRoot = filesDir.absolutePath.trimEnd('/')
+            val virtualPrefix = "$termuxRoot/.termux/sftp-virtual/"
+            val mountPrefix = "$termuxRoot/.termux/sftp-mounts/"
+            snapshot.forEach { favoritePath ->
+                val normalized = favoritePath.trim().trimEnd('/')
+                val isRemoteWorkspacePath = normalized.startsWith(virtualPrefix) || normalized.startsWith(mountPrefix)
+                if (isRemoteWorkspacePath) {
+                    return@forEach
+                }
+
+                if (!isPathOnOTG(normalized) && !isPathOnSD(normalized) && !File(normalized).exists()) {
+                    config.removeFavorite(favoritePath)
                 }
             }
         }

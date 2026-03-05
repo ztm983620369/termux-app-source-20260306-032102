@@ -2,7 +2,9 @@ package org.fossify.filemanager.dialogs
 
 import android.view.View
 import androidx.appcompat.app.AlertDialog
+import com.termux.sessionsync.SessionFileCoordinator
 import org.fossify.commons.extensions.*
+import org.fossify.commons.helpers.ensureBackgroundThread
 import org.fossify.commons.helpers.isRPlus
 import org.fossify.filemanager.R
 import org.fossify.filemanager.activities.SimpleActivity
@@ -12,8 +14,13 @@ import org.fossify.filemanager.helpers.RootHelpers
 import java.io.File
 import java.io.IOException
 
-class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val callback: (success: Boolean) -> Unit) {
+class CreateNewItemDialog(
+    val activity: SimpleActivity,
+    val path: String,
+    val callback: (success: Boolean, createdPath: String?) -> Unit
+) {
     private val binding = DialogCreateNewBinding.inflate(activity.layoutInflater)
+    private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
 
     init {
         activity.getAlertDialogBuilder()
@@ -27,19 +34,34 @@ class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val ca
                         if (name.isEmpty()) {
                             activity.toast(R.string.empty_name)
                         } else if (name.isAValidFilename()) {
-                            val newPath = "$path/$name"
-                            if (activity.getDoesFilePathExist(newPath)) {
+                            val isDirectory = binding.dialogRadioGroup.checkedRadioButtonId == R.id.dialog_radio_directory
+                            val newPath = buildChildPath(path, name)
+                            val isVirtualPath = sessionFileCoordinator.isVirtualPath(activity, path)
+                            val isStaleVirtualPath = sessionFileCoordinator.isStaleVirtualPath(activity, path)
+                            if (isStaleVirtualPath) {
+                                activity.showErrorToast("SFTP \u4f1a\u8bdd\u5df2\u53d8\u5316\uff0c\u8bf7\u91cd\u65b0\u9009\u62e9\u4f1a\u8bdd\u3002")
+                                callback(false, null)
+                                return@OnClickListener
+                            }
+                            if (!isVirtualPath && activity.getDoesFilePathExist(newPath)) {
                                 activity.toast(R.string.name_taken)
                                 return@OnClickListener
                             }
 
-                            if (binding.dialogRadioGroup.checkedRadioButtonId == R.id.dialog_radio_directory) {
+                            if (isVirtualPath) {
+                                createVirtualItem(path, newPath, name, isDirectory, alertDialog) {
+                                    callback(it, null)
+                                }
+                                return@OnClickListener
+                            }
+
+                            if (isDirectory) {
                                 createDirectory(newPath, alertDialog) {
-                                    callback(it)
+                                    callback(it, null)
                                 }
                             } else {
                                 createFile(newPath, alertDialog) {
-                                    callback(it)
+                                    callback(it, null)
                                 }
                             }
                         } else {
@@ -54,18 +76,22 @@ class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val ca
         when {
             activity.needsStupidWritePermissions(path) -> activity.handleSAFDialog(path) {
                 if (!it) {
+                    callback(false)
                     return@handleSAFDialog
                 }
 
                 val documentFile = activity.getDocumentFile(path.getParentPath())
                 if (documentFile == null) {
-                    val error = String.format(activity.getString(R.string.could_not_create_folder), path)
-                    activity.showErrorToast(error)
+                    showCreateError(path, true, "")
                     callback(false)
                     return@handleSAFDialog
                 }
-                documentFile.createDirectory(path.getFilenameFromPath())
-                success(alertDialog)
+                if (documentFile.createDirectory(path.getFilenameFromPath()) != null) {
+                    success(alertDialog, path)
+                } else {
+                    showCreateError(path, true, "")
+                    callback(false)
+                }
             }
 
             isRPlus() || !activity.isPathOnRoot(path) -> {
@@ -76,16 +102,18 @@ class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val ca
                             return@handleAndroidSAFDialog
                         }
                         if (activity.createAndroidSAFDirectory(path)) {
-                            success(alertDialog)
+                            success(alertDialog, path)
                         } else {
-                            val error = String.format(activity.getString(R.string.could_not_create_folder), path)
-                            activity.showErrorToast(error)
+                            showCreateError(path, true, "")
                             callback(false)
                         }
                     }
                 } else {
                     if (File(path).mkdirs()) {
-                        success(alertDialog)
+                        success(alertDialog, path)
+                    } else {
+                        showCreateError(path, true, "")
+                        callback(false)
                     }
                 }
             }
@@ -93,7 +121,7 @@ class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val ca
             else -> {
                 RootHelpers(activity).createFileFolder(path, false) {
                     if (it) {
-                        success(alertDialog)
+                        success(alertDialog, path)
                     } else {
                         callback(false)
                     }
@@ -112,10 +140,9 @@ class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val ca
                             return@handleAndroidSAFDialog
                         }
                         if (activity.createAndroidSAFFile(path)) {
-                            success(alertDialog)
+                            success(alertDialog, path)
                         } else {
-                            val error = String.format(activity.getString(R.string.could_not_create_file), path)
-                            activity.showErrorToast(error)
+                            showCreateError(path, false, "")
                             callback(false)
                         }
                     }
@@ -124,31 +151,38 @@ class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val ca
                 activity.needsStupidWritePermissions(path) -> {
                     activity.handleSAFDialog(path) {
                         if (!it) {
+                            callback(false)
                             return@handleSAFDialog
                         }
 
                         val documentFile = activity.getDocumentFile(path.getParentPath())
                         if (documentFile == null) {
-                            val error = String.format(activity.getString(R.string.could_not_create_file), path)
-                            activity.showErrorToast(error)
+                            showCreateError(path, false, "")
                             callback(false)
                             return@handleSAFDialog
                         }
-                        documentFile.createFile(path.getMimeType(), path.getFilenameFromPath())
-                        success(alertDialog)
+                        if (documentFile.createFile(path.getMimeType(), path.getFilenameFromPath()) != null) {
+                            success(alertDialog, path)
+                        } else {
+                            showCreateError(path, false, "")
+                            callback(false)
+                        }
                     }
                 }
 
                 isRPlus() || !activity.isPathOnRoot(path) -> {
                     if (File(path).createNewFile()) {
-                        success(alertDialog)
+                        success(alertDialog, path)
+                    } else {
+                        showCreateError(path, false, "")
+                        callback(false)
                     }
                 }
 
                 else -> {
                     RootHelpers(activity).createFileFolder(path, true) {
                         if (it) {
-                            success(alertDialog)
+                            success(alertDialog, path)
                         } else {
                             callback(false)
                         }
@@ -161,8 +195,46 @@ class CreateNewItemDialog(val activity: SimpleActivity, val path: String, val ca
         }
     }
 
-    private fun success(alertDialog: AlertDialog) {
+    private fun createVirtualItem(
+        parentPath: String,
+        newPath: String,
+        name: String,
+        isDirectory: Boolean,
+        alertDialog: AlertDialog,
+        callback: (Boolean) -> Unit
+    ) {
+        ensureBackgroundThread {
+            val result = sessionFileCoordinator.createVirtualItem(activity.applicationContext, parentPath, name, isDirectory)
+            activity.runOnUiThread {
+                if (result.success) {
+                    success(alertDialog, newPath)
+                } else {
+                    showCreateError(newPath, isDirectory, result.messageCn)
+                    callback(false)
+                }
+            }
+        }
+    }
+
+    private fun buildChildPath(parentPath: String, name: String): String {
+        val normalizedParent = parentPath.trimEnd('/')
+        return if (normalizedParent.isEmpty() || normalizedParent == "/") {
+            "/$name"
+        } else {
+            "$normalizedParent/$name"
+        }
+    }
+
+    private fun showCreateError(path: String, isDirectory: Boolean, detail: String) {
+        val message = detail.trim().ifEmpty {
+            val errorRes = if (isDirectory) R.string.could_not_create_folder else R.string.could_not_create_file
+            String.format(activity.getString(errorRes), path)
+        }
+        activity.showErrorToast(message)
+    }
+
+    private fun success(alertDialog: AlertDialog, createdPath: String) {
         alertDialog.dismiss()
-        callback(true)
+        callback(true, createdPath)
     }
 }

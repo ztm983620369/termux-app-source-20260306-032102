@@ -584,6 +584,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
         executionCommand.setShellCommandShellEnvironment = true;
         executionCommand.terminalTranscriptRows = mProperties.getTerminalTranscriptRows();
+        if (shouldForceMaxTranscriptForSshPersist(executionCommand)) {
+            executionCommand.terminalTranscriptRows = TerminalEmulator.TERMINAL_TRANSCRIPT_ROWS_MAX;
+        }
 
         if (Logger.getLogLevel() >= Logger.LOG_LEVEL_VERBOSE)
             Logger.logVerboseExtended(LOG_TAG, executionCommand.toString());
@@ -623,6 +626,22 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         TermuxActivity.updateTermuxActivityStyling(this, false);
 
         return newTermuxSession;
+    }
+
+    private boolean shouldForceMaxTranscriptForSshPersist(@NonNull ExecutionCommand executionCommand) {
+        String shellName = executionCommand.shellName;
+        if (shellName != null) {
+            String normalized = shellName.trim().toLowerCase();
+            if (normalized.equals("ssh-persistent") || normalized.startsWith("ssh-persistent-")) return true;
+        }
+
+        String[] args = executionCommand.arguments;
+        if (args == null) return false;
+        for (String arg : args) {
+            if (arg == null) continue;
+            if (arg.contains("[ssh-persist]")) return true;
+        }
+        return false;
     }
 
     /** Remove a TermuxSession. */

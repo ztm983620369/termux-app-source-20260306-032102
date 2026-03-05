@@ -8,6 +8,9 @@ import androidx.appcompat.app.AlertDialog
 import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.documentfile.provider.DocumentFile
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.termux.sessionsync.FileRootResolver
+import com.termux.sessionsync.SessionFileCoordinator
+import com.termux.sessionsync.SessionTransport
 import org.fossify.commons.R
 import org.fossify.commons.activities.BaseSimpleActivity
 import org.fossify.commons.adapters.FilepickerFavoritesAdapter
@@ -38,6 +41,7 @@ import org.fossify.commons.extensions.getTextSize
 import org.fossify.commons.extensions.handleHiddenFolderPasswordProtection
 import org.fossify.commons.extensions.handleLockedFolderOpening
 import org.fossify.commons.extensions.internalStoragePath
+import org.fossify.commons.extensions.getStorageDirectories
 import org.fossify.commons.extensions.isAccessibleWithSAFSdk30
 import org.fossify.commons.extensions.isInDownloadDir
 import org.fossify.commons.extensions.isPathOnOTG
@@ -76,6 +80,9 @@ class FilePickerDialog(
     private val callback: (pickedPath: String) -> Unit
 ) : Breadcrumbs.BreadcrumbsListener {
 
+    private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
+    private val termuxRootPath = activity.filesDir.absolutePath.trimEnd('/')
+    private var showWorkspaceRoot = true
     private var mFirstUpdate = true
     private var mPrevPath = ""
     private var mScrollStates = HashMap<String, Parcelable>()
@@ -84,18 +91,8 @@ class FilePickerDialog(
     private var mDialogView = DialogFilepickerBinding.inflate(activity.layoutInflater, null, false)
 
     init {
-        if (!activity.getDoesFilePathExist(currPath)) {
-            currPath = activity.internalStoragePath
-        }
-
-        if (!activity.getIsPathDirectory(currPath)) {
-            currPath = currPath.getParentPath()
-        }
-
-        // do not allow copying files in the recycle bin manually
-        if (currPath.startsWith(activity.recycleBinPath)) {
-            currPath = activity.internalStoragePath
-        }
+        sessionFileCoordinator.initialize(activity)
+        currPath = normalizeInitialPath(currPath)
 
         mDialogView.filepickerBreadcrumbs.apply {
             listener = this@FilePickerDialog
@@ -104,11 +101,10 @@ class FilePickerDialog(
         }
 
         mDialogView.filepickerToggleStorage.setOnClickListener {
-            val termuxRoot = activity.filesDir.absolutePath.trimEnd('/')
-            val normalized = currPath.trimEnd('/')
-            val isInTermux = normalized == termuxRoot || normalized.startsWith("$termuxRoot/")
-            currPath = if (isInTermux) activity.internalStoragePath else termuxRoot
-            tryUpdateItems()
+            if (!showWorkspaceRoot) {
+                showWorkspaceRoot = true
+                tryUpdateItems()
+            }
         }
 
         tryUpdateItems()
@@ -193,6 +189,14 @@ class FilePickerDialog(
 
     private fun tryUpdateItems() {
         ensureBackgroundThread {
+            if (showWorkspaceRoot) {
+                activity.runOnUiThread {
+                    mDialogView.filepickerPlaceholder.beGone()
+                    updateItems(buildWorkspaceItems())
+                }
+                return@ensureBackgroundThread
+            }
+
             getItems(currPath) {
                 activity.runOnUiThread {
                     mDialogView.filepickerPlaceholder.beGone()
@@ -208,8 +212,19 @@ class FilePickerDialog(
             return
         }
 
-        val sortedItems = items.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
-        val adapter = FilepickerItemsAdapter(activity, sortedItems, mDialogView.filepickerList) {
+        val displayItems = if (showWorkspaceRoot) {
+            items
+        } else {
+            items.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        }
+        val adapter = FilepickerItemsAdapter(activity, displayItems, mDialogView.filepickerList) {
+            if (showWorkspaceRoot) {
+                currPath = (it as FileDirItem).path
+                showWorkspaceRoot = false
+                tryUpdateItems()
+                return@FilepickerItemsAdapter
+            }
+
             if ((it as FileDirItem).isDirectory) {
                 activity.handleLockedFolderOpening(it.path) { success ->
                     if (success) {
@@ -228,7 +243,7 @@ class FilePickerDialog(
 
         mDialogView.apply {
             filepickerList.adapter = adapter
-            filepickerBreadcrumbs.setBreadcrumb(currPath)
+            filepickerBreadcrumbs.setBreadcrumb(if (showWorkspaceRoot) WORKSPACE_ROOT_TITLE else currPath)
 
             if (root.context.areSystemAnimationsEnabled) {
                 filepickerList.scheduleLayoutAnimation()
@@ -242,6 +257,15 @@ class FilePickerDialog(
     }
 
     private fun verifyPath() {
+        if (showWorkspaceRoot) {
+            return
+        }
+
+        if (sessionFileCoordinator.isVirtualPath(activity, currPath)) {
+            sendSuccess()
+            return
+        }
+
         when {
             activity.isRestrictedSAFOnlyRoot(currPath) -> {
                 val document = activity.getSomeAndroidSAFDocument(currPath) ?: return
@@ -310,6 +334,33 @@ class FilePickerDialog(
     }
 
     private fun getItems(path: String, callback: (List<FileDirItem>) -> Unit) {
+        if (sessionFileCoordinator.isVirtualPath(activity, path)) {
+            val result = sessionFileCoordinator.listVirtualPath(activity, path)
+            if (!result.success) {
+                activity.runOnUiThread {
+                    activity.toast(result.messageCn)
+                }
+                callback(arrayListOf())
+                return
+            }
+
+            val remoteItems = ArrayList<FileDirItem>(result.entries.size)
+            result.entries.forEach { entry ->
+                remoteItems.add(
+                    FileDirItem(
+                        entry.localPath,
+                        entry.name,
+                        entry.directory,
+                        0,
+                        entry.size,
+                        entry.modifiedMs
+                    )
+                )
+            }
+            callback(remoteItems)
+            return
+        }
+
         when {
             activity.isRestrictedSAFOnlyRoot(path) -> {
                 activity.handleAndroidSAFDialog(path) {
@@ -360,7 +411,8 @@ class FilePickerDialog(
     private fun setupFavorites() {
         FilepickerFavoritesAdapter(activity, activity.baseConfig.favorites.toMutableList(), mDialogView.filepickerFavoritesList) {
             currPath = it as String
-            verifyPath()
+            showWorkspaceRoot = false
+            tryUpdateItems()
         }.apply {
             mDialogView.filepickerFavoritesList.adapter = this
         }
@@ -386,16 +438,93 @@ class FilePickerDialog(
 
     override fun breadcrumbClicked(id: Int) {
         if (id == 0) {
-            StoragePickerDialog(activity, currPath, forceShowRoot, true) {
-                currPath = it
+            if (!showWorkspaceRoot) {
+                showWorkspaceRoot = true
                 tryUpdateItems()
             }
         } else {
             val item = mDialogView.filepickerBreadcrumbs.getItem(id)
-            if (currPath != item.path.trimEnd('/')) {
+            if (!showWorkspaceRoot && currPath != item.path.trimEnd('/')) {
                 currPath = item.path
                 tryUpdateItems()
             }
         }
+    }
+
+    private fun normalizeInitialPath(rawPath: String): String {
+        var path = rawPath.trimEnd('/')
+        if (path.isEmpty()) {
+            return termuxRootPath
+        }
+
+        if (path.startsWith(activity.recycleBinPath)) {
+            return termuxRootPath
+        }
+
+        if (sessionFileCoordinator.isVirtualPath(activity, path)) {
+            return path
+        }
+
+        if (!activity.getDoesFilePathExist(path)) {
+            return termuxRootPath
+        }
+
+        if (!activity.getIsPathDirectory(path)) {
+            path = path.getParentPath().trimEnd('/')
+        }
+
+        if (path.isEmpty()) {
+            return termuxRootPath
+        }
+
+        return if (activity.getDoesFilePathExist(path)) path else termuxRootPath
+    }
+
+    private fun buildWorkspaceItems(): ArrayList<FileDirItem> {
+        val items = ArrayList<FileDirItem>()
+        val now = System.currentTimeMillis()
+        val usedPaths = LinkedHashSet<String>()
+
+        fun addWorkspace(name: String, path: String) {
+            val normalized = path.trimEnd('/')
+            if (normalized.isEmpty()) return
+            if (!usedPaths.add(normalized)) return
+            items.add(
+                FileDirItem(
+                    normalized,
+                    name,
+                    true,
+                    0,
+                    0L,
+                    now
+                )
+            )
+        }
+
+        addWorkspace("Termux", termuxRootPath)
+
+        val internal = activity.internalStoragePath.trimEnd('/')
+        if (internal.isNotEmpty() && activity.getDoesFilePathExist(internal)) {
+            addWorkspace("手机存储", internal)
+        }
+
+        activity.getStorageDirectories().forEach { root ->
+            val normalized = root.trimEnd('/')
+            if (normalized.isNotEmpty() && activity.getDoesFilePathExist(normalized)) {
+                addWorkspace("存储 / $normalized", normalized)
+            }
+        }
+
+        sessionFileCoordinator.listTargets(activity).forEach { target ->
+            if (target.entry.transport == SessionTransport.LOCAL) return@forEach
+            val root = FileRootResolver.resolveVirtualRoot(activity, target.entry)
+            addWorkspace("服务器 / ${target.entry.displayName}", root)
+        }
+
+        return items
+    }
+
+    companion object {
+        private const val WORKSPACE_ROOT_TITLE = "工作区"
     }
 }

@@ -95,7 +95,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     private static final String DEFAULT_SSH_TMUX_SESSION = "termux";
     private static final String DEFAULT_SSH_SHELL_NAME = "ssh-persistent";
     private static final String SSH_PERSIST_SHELL_NAME_PREFIX = "ssh-persistent-";
-    private static final int SSH_PERSIST_TMUX_PRELOAD_LINES = 4000;
+    private static final int SSH_PERSIST_TMUX_PRELOAD_LINES = 50000;
     private static final String TMUX_LIST_ITEM_PREFIX = "__TMUX_ITEM__|";
     private static final String TMUX_LIST_DONE = "__TMUX_LIST_DONE__";
     private static final String TMUX_SESSION_CREATED = "__TMUX_CREATED__";
@@ -672,19 +672,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         container.setPadding(padding, padding, padding, padding);
         scrollView.addView(container);
 
-        EditText nameInput = createDialogInput(container, R.string.hint_ssh_profile_name,
-            existing == null ? "" : existing.displayName, InputType.TYPE_CLASS_TEXT);
-        EditText hostInput = createDialogInput(container, R.string.hint_ssh_profile_host,
+        EditText commandInput = createDialogInput(container, R.string.hint_ssh_profile_host,
             existing == null ? "" : existing.host, InputType.TYPE_CLASS_TEXT);
-        EditText userInput = createDialogInput(container, R.string.hint_ssh_profile_user,
-            existing == null ? "" : existing.user, InputType.TYPE_CLASS_TEXT);
-        EditText portInput = createDialogInput(container, R.string.hint_ssh_profile_port,
-            existing == null ? "22" : String.valueOf(existing.port), InputType.TYPE_CLASS_NUMBER);
+        commandInput.setHint("SSH command (e.g. ssh root@1.2.3.4 -p 22)");
         EditText passwordInput = createDialogInput(container, R.string.hint_ssh_profile_password,
             existing == null ? "" : existing.password,
             InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        EditText optionsInput = createDialogInput(container, R.string.hint_ssh_profile_options,
-            existing == null ? "" : existing.extraOptions, InputType.TYPE_CLASS_TEXT);
 
         AlertDialog dialog = new AlertDialog.Builder(mActivity)
             .setTitle(isEdit ? R.string.title_ssh_profile_edit : R.string.title_ssh_profile_add)
@@ -694,41 +687,21 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             .create();
 
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-            String host = hostInput.getText() == null ? "" : hostInput.getText().toString().trim();
-            if (host.isEmpty()) {
-                mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_host_required), true);
+            String command = commandInput.getText() == null ? "" : commandInput.getText().toString().trim();
+            if (!isRawSshCommand(command)) {
+                mActivity.showToast("Please enter a full SSH command starting with ssh.", true);
                 return;
             }
 
-            int port = 22;
-            String portText = portInput.getText() == null ? "" : portInput.getText().toString().trim();
-            if (!portText.isEmpty()) {
-                try {
-                    port = Integer.parseInt(portText);
-                } catch (NumberFormatException ignored) {
-                    port = -1;
-                }
-            }
-            if (port < 1 || port > 65535) {
-                mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_port_invalid), true);
-                return;
-            }
-
-            String user = userInput.getText() == null ? "" : userInput.getText().toString().trim();
-            String displayName = nameInput.getText() == null ? "" : nameInput.getText().toString().trim();
-            if (displayName.isEmpty()) {
-                String userPrefix = user.isEmpty() ? "" : user + "@";
-                displayName = userPrefix + host + ":" + port;
-            }
-
+            String displayName = buildSshProfileDisplayName(command);
             SshProfile saved = new SshProfile(
                 isEdit ? existing.id : UUID.randomUUID().toString(),
                 displayName,
-                host,
-                port,
-                user,
+                command,
+                22,
+                "",
                 passwordInput.getText() == null ? "" : passwordInput.getText().toString(),
-                optionsInput.getText() == null ? "" : optionsInput.getText().toString().trim()
+                ""
             );
 
             ArrayList<SshProfile> profiles = loadSshProfiles();
@@ -748,6 +721,15 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             showSshProfilesDialog();
         }));
         dialog.show();
+    }
+
+    @NonNull
+    private String buildSshProfileDisplayName(@NonNull String sshCommand) {
+        String command = sshCommand.trim();
+        if (command.isEmpty()) return "ssh";
+        int max = 42;
+        if (command.length() <= max) return command;
+        return command.substring(0, max) + "...";
     }
 
     private EditText createDialogInput(@NonNull LinearLayout container, int hintRes, @NonNull String value, int inputType) {
@@ -850,7 +832,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         String host = profile.host == null ? "" : profile.host.trim();
         String user = profile.user == null ? "" : profile.user.trim();
         if (host.isEmpty()) return "<invalid-host>";
-        if (isRawSshCommand(host)) return host;
+        if (isRawSshCommand(host)) {
+            if (TextUtils.isEmpty(profile.password)) return host;
+            return host + "  (sshpass)";
+        }
         StringBuilder sb = new StringBuilder();
         if (!TextUtils.isEmpty(user)) sb.append(user).append("@");
         sb.append(host).append(":").append(profile.port);
@@ -1336,7 +1321,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     private boolean isRawSshCommand(@NonNull String hostInput) {
-        return hostInput.startsWith("ssh ");
+        String trimmed = hostInput.trim();
+        if (trimmed.isEmpty()) return false;
+        return trimmed.toLowerCase(Locale.ROOT).startsWith("ssh ");
     }
 
     @NonNull
@@ -1543,7 +1530,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         for (SshProfile p : profiles) {
             StringBuilder line = new StringBuilder();
             line.append(p.displayName);
-            if (!TextUtils.isEmpty(p.user)) {
+            String host = p.host == null ? "" : p.host.trim();
+            if (isRawSshCommand(host)) {
+                line.append("  (").append(host).append(")");
+            } else if (!TextUtils.isEmpty(p.user)) {
                 line.append("  (").append(p.user).append("@").append(p.host).append(":").append(p.port).append(")");
             } else {
                 line.append("  (").append(p.host).append(":").append(p.port).append(")");
@@ -1614,6 +1604,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         static SshProfile fromJson(@NonNull JSONObject json) {
             String id = json.optString("id", "").trim();
             String host = json.optString("host", "").trim();
+            if (host.isEmpty()) host = json.optString("sshCommand", "").trim();
             if (host.isEmpty()) return null;
 
             if (id.isEmpty()) id = UUID.randomUUID().toString();
@@ -1622,8 +1613,13 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             if (port <= 0) port = 22;
             String displayName = json.optString("displayName", "").trim();
             if (displayName.isEmpty()) {
-                String userPrefix = user.isEmpty() ? "" : user + "@";
-                displayName = userPrefix + host + ":" + port;
+                String lower = host.toLowerCase(Locale.ROOT);
+                if (lower.startsWith("ssh ")) {
+                    displayName = host;
+                } else {
+                    String userPrefix = user.isEmpty() ? "" : user + "@";
+                    displayName = userPrefix + host + ":" + port;
+                }
             }
 
             String password = json.optString("password", "");
@@ -1638,6 +1634,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                 json.put("id", id);
                 json.put("displayName", displayName);
                 json.put("host", host);
+                json.put("sshCommand", host);
                 json.put("port", port);
                 json.put("user", user);
                 json.put("password", password);
@@ -2142,6 +2139,33 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         }
 
         return pinnedHandles;
+    }
+
+    @Nullable
+    public String getSshBootstrapCommandForSession(@Nullable TerminalSession session) {
+        if (session == null) return null;
+
+        String remembered = sanitizeSshBootstrapCommand(getRememberedSshBootstrapCommand(session));
+        if (!TextUtils.isEmpty(remembered)) return remembered;
+
+        TermuxService service = mActivity.getTermuxService();
+        if (service == null) return null;
+        TermuxSession termuxSession = service.getTermuxSessionForTerminalSession(session);
+        String inferred = sanitizeSshBootstrapCommand(inferSshCommandFromSession(termuxSession));
+        if (TextUtils.isEmpty(inferred)) return null;
+
+        rememberSshBootstrapCommand(session, inferred);
+        return inferred;
+    }
+
+    @Nullable
+    public String getPinnedTmuxSessionForSession(@Nullable TerminalSession session) {
+        if (session == null) return null;
+        ArrayList<SshPersistenceRecord> records = loadSshPersistenceRecords();
+        int index = findSshPersistenceRecordIndexForSession(session, records);
+        if (index < 0 || index >= records.size()) return null;
+        String tmuxSession = sanitizeTmuxSessionName(records.get(index).tmuxSession);
+        return TextUtils.isEmpty(tmuxSession) ? null : tmuxSession;
     }
 
     private int findSshPersistenceRecordIndexForSession(@Nullable TerminalSession session,
@@ -3234,7 +3258,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
         return "tmux set-option -t " + safeTmuxSession + " mouse on >/dev/null 2>&1; " +
             "tmux set-window-option -t " + safeTmuxSession + " alternate-screen off >/dev/null 2>&1; " +
-            "tmux set-option -t " + safeTmuxSession + " history-limit 200000 >/dev/null 2>&1; " +
+            "tmux set-option -t " + safeTmuxSession + " history-limit " + SSH_PERSIST_TMUX_PRELOAD_LINES + " >/dev/null 2>&1; " +
             // Dump recent pane output before attach so local transcript has cache immediately.
             "pane=$(tmux display-message -p -t " + safeTmuxSession + " '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); " +
             "[ -n \"$pane\" ] && tmux capture-pane -p -t \"$pane\" -S -" + SSH_PERSIST_TMUX_PRELOAD_LINES + " 2>/dev/null || true; " +
@@ -3497,6 +3521,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     public void updateBackgroundColor() {
         if (!mActivity.isVisible()) return;
+        if (!mActivity.isTerminalTabActive()) return;
         TerminalSession session = mActivity.getCurrentSession();
         if (session != null && session.getEmulator() != null) {
             mActivity.getWindow().getDecorView().setBackgroundColor(session.getEmulator().mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND]);

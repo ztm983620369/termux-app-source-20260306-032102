@@ -1,29 +1,41 @@
 package org.fossify.filemanager.controllers
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.graphics.Typeface
 import android.media.RingtoneManager
 import android.os.Bundle
 import android.os.Handler
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.PopupWindow
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.viewpager.widget.ViewPager
 import com.stericson.RootTools.RootTools
+import com.termux.sessionsync.SavedSshProfileStore
+import com.termux.sessionsync.SessionFileCoordinator
+import com.termux.sessionsync.SessionFileMode
+import com.termux.sessionsync.SessionTransport
 import org.fossify.commons.dialogs.RadioGroupDialog
 import org.fossify.commons.extensions.appLockManager
 import org.fossify.commons.extensions.beGoneIf
 import org.fossify.commons.extensions.checkWhatsNew
+import org.fossify.commons.extensions.copyToClipboard
 import org.fossify.commons.extensions.getColoredDrawableWithColor
 import org.fossify.commons.extensions.getContrastColor
 import org.fossify.commons.extensions.getFilePublicUri
 import org.fossify.commons.extensions.getMimeType
+import org.fossify.commons.extensions.getProperBackgroundColor
 import org.fossify.commons.extensions.getProperPrimaryColor
 import org.fossify.commons.extensions.getProperTextColor
 import org.fossify.commons.extensions.getRealPathFromURI
@@ -72,7 +84,9 @@ import org.fossify.filemanager.fragments.MyViewPagerFragment
 import org.fossify.filemanager.fragments.RecentsFragment
 import org.fossify.filemanager.fragments.StorageFragment
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
+import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
+import org.fossify.filemanager.helpers.SessionSelfTestRunner
 import org.fossify.filemanager.interfaces.FileManagerHost
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import java.io.File
@@ -97,6 +111,10 @@ class FileManagerController(
     private var mStoredDateFormat = ""
     private var mStoredTimeFormat = ""
     private var mStoredShowTabs = 0
+    private val mSessionFileCoordinator = SessionFileCoordinator.getInstance()
+    private var mSelectedSessionId: String? = null
+    private var mInitialSessionApplied = false
+    private var mSwitchingSession = false
 
     val rootView: View
         get() = binding.root
@@ -114,7 +132,12 @@ class FileManagerController(
 
     fun onCreate(savedInstanceState: Bundle?) {
         activity.isSearchBarEnabled = true
+        // Termux host already provides its own status-bar area. Avoid applying top window insets twice.
+        binding.mainMenu.setApplyWindowInsets(false)
+        mSessionFileCoordinator.initialize(activity)
+        mSelectedSessionId = mSessionFileCoordinator.getSelectedSessionKey(activity)
         setupOptionsMenu()
+        applyContainerColors()
         refreshMenuItems()
         activity.config.preferTermuxStorage = true
         val scopedHome = clampToTermuxRoot(activity.config.homeFolder)
@@ -157,6 +180,7 @@ class FileManagerController(
             return
         }
 
+        applyContainerColors()
         refreshMenuItems()
         updateMenuColors()
 
@@ -179,6 +203,16 @@ class FileManagerController(
         if (binding.mainViewPager.adapter == null) {
             initFragments()
         }
+
+        if (!mInitialSessionApplied && binding.mainViewPager.adapter != null) {
+            mInitialSessionApplied = true
+        }
+    }
+
+    fun onHostTabVisible() {
+        applyContainerColors()
+        updateMenuColors()
+        refreshMenuItems()
     }
 
     fun onPause() {
@@ -211,7 +245,8 @@ class FileManagerController(
             return false
         } else if (currentFragment is ItemsFragment) {
             val currentPath = currentFragment.currentPath.trimEnd('/')
-            val atRoot = currentPath.isEmpty() || currentPath == "/" || currentPath == termuxRootPath
+            val navigatorRoot = NavigatorFolderHelper.rootPath(activity).trimEnd('/')
+            val atRoot = currentPath.isEmpty() || currentPath == "/" || currentPath == termuxRootPath || currentPath == navigatorRoot || isVirtualWorkspaceRoot(currentPath)
             if (atRoot) {
                 if (!wasBackJustPressed && activity.config.pressBackTwice) {
                     wasBackJustPressed = true
@@ -227,7 +262,7 @@ class FileManagerController(
                 }
             }
 
-            val parentPath = File(currentPath).parent?.trimEnd('/').orEmpty().ifEmpty { termuxRootPath }
+            val parentPath = resolveParentPathForNavigation(currentPath)
             openPath(parentPath, forceRefresh = true)
             return true
         }
@@ -244,6 +279,39 @@ class FileManagerController(
 
         val scopedPath = clampToTermuxRoot(newPath)
         getItemsFragment()?.openPath(scopedPath, forceRefresh)
+    }
+    override fun showSessionSwitcher() {
+        mSelectedSessionId = mSessionFileCoordinator.getSelectedSessionKey(activity)
+        val targets = mSessionFileCoordinator.listTargets(activity)
+        val items = ArrayList<RadioItem>(targets.size + 1)
+        var checkedIndex = 0
+
+        items.add(RadioItem(0, "\u672c\u5730\u76ee\u5f55", SessionFileCoordinator.LOCAL_TARGET_KEY))
+        if (mSelectedSessionId == null) checkedIndex = 0
+
+        targets.forEachIndexed { index, target ->
+            val entry = target.entry
+            val title = buildString {
+                append(entry.displayName)
+                append("  -  ")
+                append(transportLabelCn(entry.transport))
+                if (target.active) append("  -  \u5df2\u9009\u4e2d")
+            }
+            items.add(RadioItem(index + 1, title, target.key))
+
+            if (!mSelectedSessionId.isNullOrEmpty() && mSelectedSessionId == target.key) {
+                checkedIndex = index + 1
+            } else if (mSelectedSessionId.isNullOrEmpty() && target.active) {
+                checkedIndex = index + 1
+            }
+        }
+
+        RadioGroupDialog(activity, items, checkedIndex, R.string.app_name) {
+            val target = it.toString()
+            mSelectedSessionId = if (target == SessionFileCoordinator.LOCAL_TARGET_KEY) null else target
+            mSessionFileCoordinator.setSelectedSessionKey(activity, mSelectedSessionId)
+            applySelectedSessionContext(forceRefresh = true)
+        }
     }
 
     override fun toggleMainFabMenu() {
@@ -314,28 +382,32 @@ class FileManagerController(
         val isCreateDocumentIntent = intentProvider().action == Intent.ACTION_CREATE_DOCUMENT
         val currentViewType = activity.config.getFolderViewType(currentFragment.currentPath)
         val favorites = activity.config.favorites
+        val isNavigator = currentFragment is ItemsFragment && NavigatorFolderHelper.isNavigatorPath(activity, currentFragment.currentPath)
 
         binding.mainMenu.requireToolbar().menu.apply {
-            findItem(R.id.sort).isVisible = currentFragment is ItemsFragment
+            findItem(R.id.sort).isVisible = currentFragment is ItemsFragment && !isNavigator
             findItem(R.id.change_view_type).isVisible = currentFragment !is StorageFragment
 
-            findItem(R.id.add_favorite).isVisible = currentFragment is ItemsFragment && !favorites.contains(currentFragment.currentPath)
-            findItem(R.id.remove_favorite).isVisible = currentFragment is ItemsFragment && favorites.contains(currentFragment.currentPath)
-            findItem(R.id.go_to_favorite).isVisible = currentFragment is ItemsFragment && favorites.isNotEmpty()
+            findItem(R.id.add_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && !favorites.contains(currentFragment.currentPath)
+            findItem(R.id.remove_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && favorites.contains(currentFragment.currentPath)
+            findItem(R.id.go_to_favorite).isVisible = currentFragment is ItemsFragment
+            findItem(R.id.go_to_favorite).title = NavigatorFolderHelper.displayTitle()
 
-            findItem(R.id.toggle_filename).isVisible = currentViewType == VIEW_TYPE_GRID && currentFragment !is StorageFragment
+            findItem(R.id.toggle_filename).isVisible = currentViewType == VIEW_TYPE_GRID && currentFragment !is StorageFragment && !isNavigator
             findItem(R.id.go_home).isVisible = false
-            findItem(R.id.set_as_home).isVisible = currentFragment is ItemsFragment && currentFragment.currentPath != activity.config.homeFolder
+            findItem(R.id.set_as_home).isVisible = currentFragment is ItemsFragment && !isNavigator && currentFragment.currentPath != activity.config.homeFolder
             findItem(R.id.toggle_termux_storage).isVisible = false
 
-            findItem(R.id.open_in_terminal).isVisible = currentFragment is ItemsFragment && !isCreateDocumentIntent
+            findItem(R.id.open_in_terminal).isVisible = currentFragment is ItemsFragment && !isCreateDocumentIntent && !isNavigator
 
-            findItem(R.id.temporarily_show_hidden).isVisible = !activity.config.shouldShowHidden() && currentFragment !is StorageFragment
-            findItem(R.id.stop_showing_hidden).isVisible = activity.config.temporarilyShowHidden && currentFragment !is StorageFragment
+            findItem(R.id.temporarily_show_hidden).isVisible = !activity.config.shouldShowHidden() && currentFragment !is StorageFragment && !isNavigator
+            findItem(R.id.stop_showing_hidden).isVisible = activity.config.temporarilyShowHidden && currentFragment !is StorageFragment && !isNavigator
 
-            findItem(R.id.column_count).isVisible = currentViewType == VIEW_TYPE_GRID && currentFragment !is StorageFragment
+            findItem(R.id.column_count).isVisible = currentViewType == VIEW_TYPE_GRID && currentFragment !is StorageFragment && !isNavigator
 
             findItem(R.id.more_apps_from_us).isVisible = !activity.resources.getBoolean(R.bool.hide_google_relations)
+            findItem(R.id.self_test).isVisible = !isCreateDocumentIntent
+            findItem(R.id.self_test).title = "\u5de5\u4e1a\u7ea7\u81ea\u68c0"
             findItem(R.id.settings).isVisible = !isCreateDocumentIntent
             findItem(R.id.about).isVisible = !isCreateDocumentIntent
         }
@@ -393,6 +465,7 @@ class FileManagerController(
                     R.id.stop_showing_hidden -> tryToggleTemporarilyShowHidden()
                     R.id.column_count -> changeColumnCount()
                     R.id.more_apps_from_us -> activity.launchMoreAppsFromUsIntent()
+                    R.id.self_test -> runSessionIndustrialSelfTest()
                     R.id.settings -> launchSettings()
                     R.id.about -> launchAbout()
                     else -> return@setOnMenuItemClickListener false
@@ -409,7 +482,7 @@ class FileManagerController(
 
     private fun getPreferredStartPath(): String {
         activity.config.preferTermuxStorage = true
-        return clampToTermuxRoot(activity.config.homeFolder)
+        return termuxRootPath
     }
 
     private fun isInTermuxStorage(path: String): Boolean {
@@ -426,6 +499,17 @@ class FileManagerController(
 
     private fun updateMenuColors() {
         binding.mainMenu.updateColors()
+    }
+
+    private fun applyContainerColors() {
+        val backgroundColor = activity.getProperBackgroundColor()
+        binding.root.setBackgroundColor(backgroundColor)
+        binding.mainCoordinator.setBackgroundColor(backgroundColor)
+        binding.mainHolder.setBackgroundColor(backgroundColor)
+        binding.mainViewPager.setBackgroundColor(backgroundColor)
+        getAllFragments().forEach { fragment ->
+            fragment?.setBackgroundColor(backgroundColor)
+        }
     }
 
     private fun storeStateVariables() {
@@ -458,7 +542,8 @@ class FileManagerController(
 
     private fun initFileManager(refreshRecents: Boolean) {
         val intent = intentProvider()
-        if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
+        val hasExplicitPath = intent.action == Intent.ACTION_VIEW && intent.data != null
+        if (hasExplicitPath) {
             val data = intent.data
             if (data?.scheme == "file") {
                 openPath(data.path!!)
@@ -483,6 +568,10 @@ class FileManagerController(
         if (refreshRecents) {
             getRecentsFragment()?.refreshFragment()
         }
+
+        if (!hasExplicitPath && !mInitialSessionApplied) {
+            mInitialSessionApplied = true
+        }
     }
 
     private fun initFragments() {
@@ -498,6 +587,7 @@ class FileManagerController(
                     getAllFragments().forEach {
                         (it as? ItemOperationsListener)?.finishActMode()
                     }
+                    (getCurrentFragment() as? RecentsFragment)?.refreshFragment()
                     refreshMenuItems()
                 }
             })
@@ -716,21 +806,11 @@ class FileManagerController(
     }
 
     private fun goToFavorite() {
-        val favorites = activity.config.favorites.filter { isInTermuxStorage(it) }
-        val items = ArrayList<RadioItem>(favorites.size)
-        var currFavoriteIndex = -1
+        openPath(NavigatorFolderHelper.rootPath(activity), forceRefresh = true)
+    }
 
-        favorites.forEachIndexed { index, path ->
-            val visiblePath = activity.humanizePath(path).replace("/", " / ")
-            items.add(RadioItem(index, visiblePath, path))
-            if (path == getCurrentFragment()!!.currentPath) {
-                currFavoriteIndex = index
-            }
-        }
-
-        RadioGroupDialog(activity, items, currFavoriteIndex, R.string.go_to_favorite) {
-            openPath(it.toString())
-        }
+    private fun dp(value: Int): Int {
+        return (activity.resources.displayMetrics.density * value).toInt()
     }
 
     private fun setAsHome() {
@@ -761,6 +841,73 @@ class FileManagerController(
         getAllFragments().forEach {
             it?.refreshFragment()
         }
+    }
+
+    private fun runSessionIndustrialSelfTest() {
+        if (activity.isFinishing || activity.isDestroyed) return
+
+        val runningDialog = AlertDialog.Builder(activity)
+            .setTitle("\u81ea\u68c0\u4e2d")
+            .setMessage("\u6b63\u5728\u6267\u884c\u5168\u94fe\u8def\u81ea\u68c0\uff0c\u8bf7\u7a0d\u5019...")
+            .setCancelable(false)
+            .create()
+
+        try {
+            runningDialog.show()
+        } catch (_: Exception) {
+        }
+
+        ensureBackgroundThread {
+            val report = SessionSelfTestRunner.run(activity)
+            activity.runOnUiThread {
+                try {
+                    if (runningDialog.isShowing) {
+                        runningDialog.dismiss()
+                    }
+                } catch (_: Exception) {
+                }
+                showSessionSelfTestReport(report)
+            }
+        }
+    }
+
+    private fun showSessionSelfTestReport(report: SessionSelfTestRunner.Report) {
+        val logView = TextView(activity).apply {
+            text = report.content
+            setTextIsSelectable(true)
+            typeface = Typeface.MONOSPACE
+            textSize = 12f
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        val scrollView = ScrollView(activity).apply {
+            addView(
+                logView,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+
+        val title = if (report.success) {
+            "\u81ea\u68c0\u5b8c\u6210\uff1a\u5168\u90e8\u901a\u8fc7"
+        } else {
+            "\u81ea\u68c0\u5b8c\u6210\uff1a\u53d1\u73b0\u95ee\u9898"
+        }
+        val summary = "\u68c0\u67e5${report.totalChecks}\u9879\uff0c\u901a\u8fc7${report.passedChecks}\u9879\uff0c\u5931\u8d25${report.failedChecks}\u9879"
+
+        AlertDialog.Builder(activity)
+            .setTitle(title)
+            .setMessage(summary)
+            .setView(scrollView)
+            .setPositiveButton("\u590d\u5236\u65e5\u5fd7") { _, _ ->
+                activity.copyToClipboard(report.content)
+            }
+            .setNeutralButton("\u91cd\u65b0\u81ea\u68c0") { _, _ ->
+                runSessionIndustrialSelfTest()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     private fun launchSettings() {
@@ -799,12 +946,73 @@ class FileManagerController(
 
     private fun checkInvalidFavorites() {
         ensureBackgroundThread {
-            activity.config.favorites.forEach {
-                if (!isInTermuxStorage(it) || !File(it).exists()) {
-                    activity.config.removeFavorite(it)
+            val snapshot = activity.config.favorites.toList()
+            val virtualPrefix = "$termuxRootPath/.termux/sftp-virtual/"
+            val mountPrefix = "$termuxRootPath/.termux/sftp-mounts/"
+            snapshot.forEach { favoritePath ->
+                val normalized = favoritePath.trim().trimEnd('/')
+                val isTermuxScoped = isInTermuxStorage(normalized)
+                // Virtual SFTP favorites are logical paths and may not exist as local files.
+                // Keep them persistent across app restarts.
+                val isRemoteWorkspacePath = normalized.startsWith(virtualPrefix) || normalized.startsWith(mountPrefix)
+                val keep = isTermuxScoped && (isRemoteWorkspacePath || File(normalized).exists())
+                if (!keep) {
+                    activity.config.removeFavorite(favoritePath)
                 }
             }
         }
+    }
+    private fun applySelectedSessionContext(forceRefresh: Boolean) {
+        if (mSwitchingSession) return
+
+        mSwitchingSession = true
+        ensureBackgroundThread {
+            val result = mSessionFileCoordinator.resolveSelectedRoot(activity)
+            activity.runOnUiThread {
+                mSwitchingSession = false
+                mSelectedSessionId = mSessionFileCoordinator.getSelectedSessionKey(activity)
+
+                if (result.success) {
+                    if (result.mode == SessionFileMode.SFTP_PROTOCOL && result.messageCn.isNotBlank()) {
+                        activity.toast(result.messageCn)
+                    }
+                    openPath(result.rootPath, forceRefresh)
+                } else {
+                    if (result.messageCn.isNotBlank()) {
+                        activity.toast(result.messageCn)
+                    }
+                    val fallback = if (result.rootPath.isBlank()) termuxRootPath else result.rootPath
+                    openPath(fallback, forceRefresh)
+                }
+            }
+        }
+    }
+    private fun transportLabelCn(transport: SessionTransport): String {
+        return when (transport) {
+            SessionTransport.LOCAL -> "\u672c\u5730"
+            SessionTransport.SSH -> "SSH"
+            SessionTransport.SSH_PERSIST -> "\u6301\u4e45\u5316"
+            else -> "\u672a\u77e5"
+        }
+    }
+
+    private fun resolveParentPathForNavigation(rawPath: String): String {
+        val current = rawPath.trimEnd('/').ifEmpty { "/" }
+        if (current == "/") return termuxRootPath
+
+        if (isVirtualWorkspaceRoot(current)) {
+            return current
+        }
+
+        return File(current).parent?.trimEnd('/').orEmpty().ifEmpty { termuxRootPath }
+    }
+
+    private fun isVirtualWorkspaceRoot(current: String): Boolean {
+        if (!mSessionFileCoordinator.isVirtualPath(activity, current)) return false
+        val virtualPrefix = "$termuxRootPath/.termux/sftp-virtual/"
+        if (!current.startsWith(virtualPrefix)) return false
+        val tail = current.removePrefix(virtualPrefix)
+        return tail.isNotEmpty() && !tail.contains("/")
     }
 
     private fun finishCreateDocumentIntent(path: String, filename: String) {
@@ -835,7 +1043,7 @@ class FileManagerController(
         return fragments.getOrNull(binding.mainViewPager.currentItem)
     }
 
-    private fun getTabsList() = arrayListOf(TAB_FILES)
+    private fun getTabsList() = arrayListOf(TAB_FILES, TAB_RECENT_FILES)
 
     private fun checkWhatsNewDialog() {
         arrayListOf<Release>().apply {
@@ -843,3 +1051,6 @@ class FileManagerController(
         }
     }
 }
+
+
+

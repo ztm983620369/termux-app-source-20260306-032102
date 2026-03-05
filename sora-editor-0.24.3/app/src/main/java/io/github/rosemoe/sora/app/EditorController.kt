@@ -64,6 +64,7 @@ import com.termux.bridge.FileEditorContract
 import com.termux.bridge.FileOpenBridge
 import com.termux.bridge.FileOpenListener
 import com.termux.bridge.FileOpenRequest
+import com.termux.bridge.RecentFileHistory
 import io.github.rosemoe.sora.app.databinding.ActivityMainBinding
 import io.github.rosemoe.sora.app.lsp.LspTestActivity
 import io.github.rosemoe.sora.app.lsp.LspTestJavaActivity
@@ -102,6 +103,7 @@ import kotlinx.coroutines.withContext
 import org.eclipse.tm4e.core.internal.oniguruma.Oniguruma
 import java.io.File
 import java.io.FileInputStream
+import java.util.concurrent.atomic.AtomicLong
 import java.util.regex.PatternSyntaxException
 import kotlin.math.abs
 import kotlin.math.max
@@ -221,8 +223,13 @@ class EditorController(
     private var lastOpenAttemptAtMs: Long = 0L
     private var lastOpenOkAtMs: Long = 0L
     private var lastOpenError: String? = null
+    private val openGeneration = AtomicLong(0L)
+    private var loadedPath: String? = null
+    private var loadedLastModified: Long = -1L
+    private var loadedSize: Long = -1L
 
     private val prefs by lazy { activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
+    private var applyToolbarTopInsetFromSystemBars: Boolean = true
 
     // ---------------- IME accessory bar (FULL REFACTOR) ----------------
     private var barFullHeightPx: Int = 0
@@ -243,11 +250,12 @@ class EditorController(
         CrashHandler.INSTANCE.init(activity)
 
         activity.setSupportActionBar(binding.activityToolbar)
-        applyEdgeToEdgeForViews(binding.toolbarContainer, binding.root)
+        if (applyToolbarTopInsetFromSystemBars) {
+            applyEdgeToEdgeForViews(binding.toolbarContainer, binding.root)
+        }
 
         binding.mainBottomBar.visibility = View.INVISIBLE
-
-        // ✅ Fully refactored: ultra-smooth IME bar
+        // Fully refactored: ultra-smooth IME bar
         setupImeAccessoryBarController()
 
         autoSave = LinuxAutoSaveManager(
@@ -381,6 +389,14 @@ class EditorController(
 
         updateBtnState()
         editorEnv.applyUserPreferredTheme()
+    }
+
+    /**
+     * When embedded in a host that already handles status-bar insets, disable
+     * editor toolbar top inset to avoid duplicated top spacing.
+     */
+    fun setHostHandlesStatusBarInsets(hostHandlesInsets: Boolean) {
+        applyToolbarTopInsetFromSystemBars = !hostHandlesInsets
     }
 
     // ---------------- IME controller implementation ----------------
@@ -721,56 +737,113 @@ class EditorController(
         }
     }
 
-    private fun openDiskFile(path: String) {
+    private fun openDiskFile(request: FileOpenRequest) {
+        val path = request.path
+        val openToken = openGeneration.incrementAndGet()
         lifecycleScope.launch(Dispatchers.IO) {
             val file = File(path)
             lastOpenAttemptAtMs = System.currentTimeMillis()
-            lastOpenError = null
 
             if (!file.exists()) {
-                lastOpenError = "文件不存在: $path"
-                withContext(Dispatchers.Main) { toast(lastOpenError ?: "文件不存在") }
+                val error = "文件不存在: $path"
+                if (openToken == openGeneration.get()) {
+                    lastOpenError = error
+                    withContext(Dispatchers.Main) {
+                        if (openToken == openGeneration.get()) toast(error)
+                    }
+                }
                 return@launch
             }
             if (!file.isFile) {
-                lastOpenError = "不是文件: $path"
-                withContext(Dispatchers.Main) { toast(lastOpenError ?: "不是文件") }
+                val error = "路径不是文件: $path"
+                if (openToken == openGeneration.get()) {
+                    lastOpenError = error
+                    withContext(Dispatchers.Main) {
+                        if (openToken == openGeneration.get()) toast(error)
+                    }
+                }
                 return@launch
             }
             if (!file.canRead()) {
-                lastOpenError = "不可读: $path"
-                withContext(Dispatchers.Main) { toast(lastOpenError ?: "不可读") }
+                val error = "文件不可读: $path"
+                if (openToken == openGeneration.get()) {
+                    lastOpenError = error
+                    withContext(Dispatchers.Main) {
+                        if (openToken == openGeneration.get()) toast(error)
+                    }
+                }
                 return@launch
             }
 
-            val text = runCatching { FileInputStream(file).use { ContentIO.createFrom(it) } }
+            val fileModified = file.lastModified()
+            val fileSize = file.length()
+
+            // Skip parsing if the same file is already loaded and unchanged.
+            if (loadedPath == path && loadedLastModified == fileModified && loadedSize == fileSize && lastOpenError == null) {
+                if (openToken == openGeneration.get()) {
+                    withContext(Dispatchers.Main) {
+                        if (openToken != openGeneration.get()) return@withContext
+                        lastOpenOkAtMs = System.currentTimeMillis()
+                        RecentFileHistory.recordOpenedFile(
+                            activity,
+                            path,
+                            request.displayName ?: file.name
+                        )
+                    }
+                }
+                return@launch
+            }
+
+            val text = runCatching { FileInputStream(file).buffered().use { ContentIO.createFrom(it) } }
                 .getOrElse {
-                    lastOpenError = it.toString()
-                    withContext(Dispatchers.Main) { toast(it.toString()) }
+                    if (openToken == openGeneration.get()) {
+                        lastOpenError = it.toString()
+                        withContext(Dispatchers.Main) {
+                            if (openToken == openGeneration.get()) toast(it.toString())
+                        }
+                    }
                     return@launch
                 }
 
             withContext(Dispatchers.Main) {
+                if (openToken != openGeneration.get()) return@withContext
                 binding.editor.setText(text, null)
                 updateBtnState()
                 lastOpenOkAtMs = System.currentTimeMillis()
+                lastOpenError = null
+                loadedPath = path
+                loadedLastModified = fileModified
+                loadedSize = fileSize
                 autoSave.onFileOpenedFromDisk(path)
+                RecentFileHistory.recordOpenedFile(
+                    activity,
+                    path,
+                    request.displayName ?: file.name
+                )
 
-                // VS Code: auto apply syntax by file name (if enabled)
-                vscode.maybeAutoApplyVSCodeSyntaxByFileName(path)
+                // Apply syntax on next frame so text becomes visible earlier.
+                binding.editor.post {
+                    if (openToken != openGeneration.get()) return@post
+                    vscode.maybeAutoApplyVSCodeSyntaxByFileName(path)
+                }
             }
         }
     }
 
     private fun applyOpenRequest(req: FileOpenRequest?, source: String) {
         if (req == null) return
-        lastOpenRequest = req
+        val normalizedPath = req.path.trim()
+        if (normalizedPath.isEmpty()) return
+
+        val normalizedReq = if (normalizedPath == req.path) req else req.copy(path = normalizedPath)
+        lastOpenRequest = normalizedReq
+
         val seq = FileOpenBridge.getLatestSequence()
         if (source.startsWith("bridge")) {
             lastBridgeSeqHandled = seq
         }
-        title = req.displayName ?: File(req.path).name
-        openDiskFile(req.path)
+        title = normalizedReq.displayName ?: File(normalizedReq.path).name
+        openDiskFile(normalizedReq)
     }
 
     private val fileOpenListener = FileOpenListener { request ->
@@ -833,9 +906,9 @@ class EditorController(
                         .show()
                 } else {
                     val options = arrayOf(
-                        "Lua LSP（Kotlin）",
-                        "Lua LSP（Java）",
-                        "Python LSP（电脑端）"
+                        "Lua LSP (Kotlin)",
+                        "Lua LSP (Java)",
+                        "Python LSP (Desktop)"
                     )
                     AlertDialog.Builder(activity)
                         .setTitle(R.string.dialog_lsp_entry_title)
@@ -917,15 +990,15 @@ class EditorController(
             R.id.auto_save_enabled -> {
                 item.isChecked = !item.isChecked
                 autoSave.setEnabled(item.isChecked)
-                toast(if (item.isChecked) "自动保存：已开启" else "自动保存：已关闭")
+                toast(if (item.isChecked) "Auto-save enabled" else "Auto-save disabled")
             }
             R.id.save_file -> {
                 lifecycleScope.launch {
                     val r = autoSave.saveNow("manual")
                     if (r.ok) {
-                        toast("保存成功")
+                        toast("Saved")
                     } else {
-                        toast("保存失败：${r.error ?: "unknown"}")
+                        toast("Save failed: ${r.error ?: "unknown"}")
                     }
                 }
             }
@@ -939,7 +1012,7 @@ class EditorController(
                         .setNeutralButton(R.string.copy_text) { _, _ ->
                             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                             cm.setPrimaryClip(ClipData.newPlainText("autosave-selftest", report))
-                            toast("已复制")
+                            toast("Copied")
                         }
                         .show()
                 }
@@ -978,7 +1051,7 @@ class EditorController(
             R.id.run_project -> {
                 val path = lastOpenRequest?.path
                 if (path.isNullOrBlank()) {
-                    toast("未打开文件")
+                    toast("未打开任何文件，请先打开文件后再运行。")
                     return true
                 }
                 val command = prefs.getString(PREF_KEY_RUN_COMMAND, "").orEmpty().trim()
@@ -990,12 +1063,12 @@ class EditorController(
                 lifecycleScope.launch {
                     val save = autoSave.saveNow("run")
                     if (!save.ok) {
-                        toast("保存失败：${save.error ?: "unknown"}")
+                        toast("Save failed: ${save.error ?: "unknown"}")
                         return@launch
                     }
                     val workdir = File(path).parentFile?.absolutePath ?: File(path).absoluteFile.parentFile?.absolutePath.orEmpty()
                     if (workdir.isBlank()) {
-                        toast("无法确定工作目录")
+                        toast("Cannot determine working directory")
                         return@launch
                     }
                     IdeRunManager.launchCustomCommandInTerminal(
@@ -1009,7 +1082,7 @@ class EditorController(
                             .setPackage(com.termux.shared.termux.TermuxConstants.TERMUX_PACKAGE_NAME)
                             .putExtra("tab", "terminal")
                     )
-                    toast("运行：$command")
+                    toast("已发送运行命令: $command")
                 }
                 return true
             }
@@ -1190,16 +1263,16 @@ class EditorController(
         }.trimEnd()
 
         AlertDialog.Builder(activity)
-            .setTitle("编辑器自测")
+            .setTitle("Editor Self Test")
             .setMessage(text)
-            .setPositiveButton("复制") { _, _ ->
+            .setPositiveButton("Copy") { _, _ ->
                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cm.setPrimaryClip(ClipData.newPlainText("editor_self_test", text))
-                toast("已复制")
+                toast("Copied")
             }
-            .setNeutralButton("重载") { _, _ ->
+            .setNeutralButton("Reload") { _, _ ->
                 val latest = FileOpenBridge.getLatestRequest()
-                if (latest != null) applyOpenRequest(latest, "bridge.selftest.reload") else toast("无文件请求")
+                if (latest != null) applyOpenRequest(latest, "bridge.selftest.reload") else toast("No file request")
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()

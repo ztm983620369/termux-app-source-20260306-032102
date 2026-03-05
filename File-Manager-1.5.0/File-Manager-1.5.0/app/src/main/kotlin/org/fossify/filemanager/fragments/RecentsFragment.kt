@@ -1,17 +1,11 @@
 package org.fossify.filemanager.fragments
 
-import android.content.ContentResolver
 import android.content.Context
-import android.provider.MediaStore.Files
-import android.provider.MediaStore.Files.FileColumns
 import android.util.AttributeSet
-import androidx.core.os.bundleOf
+import com.termux.bridge.RecentFileHistory
 import org.fossify.commons.extensions.areSystemAnimationsEnabled
 import org.fossify.commons.extensions.beVisibleIf
-import org.fossify.commons.extensions.getDoesFilePathExist
 import org.fossify.commons.extensions.getFilenameFromPath
-import org.fossify.commons.extensions.getLongValue
-import org.fossify.commons.extensions.getStringValue
 import org.fossify.commons.extensions.normalizeString
 import org.fossify.commons.extensions.showErrorToast
 import org.fossify.commons.helpers.VIEW_TYPE_GRID
@@ -33,7 +27,10 @@ import java.io.File
 
 class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerFragment<MyViewPagerFragment.RecentsInnerBinding>(context, attributeSet),
     ItemOperationsListener {
-    private val RECENTS_LIMIT = 50
+    companion object {
+        private const val RECENTS_LIMIT = 200
+    }
+
     private var filesIgnoringSearch = ArrayList<ListItem>()
     private var lastSearchedText = ""
     private var zoomListener: MyRecyclerView.MyZoomListener? = null
@@ -161,44 +158,23 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
     }
 
     private fun getRecents(callback: (recents: ArrayList<ListItem>) -> Unit) {
-        val showHidden = context?.config?.shouldShowHidden() ?: return
+        val context = context ?: return
         val listItems = arrayListOf<ListItem>()
 
-        val uri = Files.getContentUri("external")
-        val projection = arrayOf(
-            FileColumns.DATA,
-            FileColumns.DISPLAY_NAME,
-            FileColumns.DATE_MODIFIED,
-            FileColumns.SIZE
-        )
-
         try {
-            val queryArgs = bundleOf(
-                ContentResolver.QUERY_ARG_LIMIT to RECENTS_LIMIT,
-                ContentResolver.QUERY_ARG_SORT_COLUMNS to arrayOf(FileColumns.DATE_MODIFIED),
-                ContentResolver.QUERY_ARG_SORT_DIRECTION to ContentResolver.QUERY_SORT_DIRECTION_DESCENDING
-            )
+            RecentFileHistory.getRecentFiles(context, RECENTS_LIMIT).forEach { entry ->
+                val path = entry.path
+                val file = File(path)
+                if (!file.exists() || !file.isFile) {
+                    RecentFileHistory.removePath(context, path)
+                    return@forEach
+                }
 
-            context?.contentResolver?.query(uri, projection, queryArgs, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    do {
-                        val path = cursor.getStringValue(FileColumns.DATA)
-                        if (File(path).isDirectory) {
-                            continue
-                        }
-
-                        val name = cursor.getStringValue(FileColumns.DISPLAY_NAME) ?: path.getFilenameFromPath()
-                        val size = cursor.getLongValue(FileColumns.SIZE)
-                        val modified = cursor.getLongValue(FileColumns.DATE_MODIFIED) * 1000
-                        val isHiddenFile = name.startsWith(".")
-                        val shouldShow = showHidden || (!isHiddenFile && !path.isPathInHiddenFolder())
-                        if (shouldShow && activity?.getDoesFilePathExist(path) == true) {
-                            if (wantedMimeTypes.any { isProperMimeType(it, path, false) }) {
-                                val fileDirItem = ListItem(path, name, false, 0, size, modified, false, false)
-                                listItems.add(fileDirItem)
-                            }
-                        }
-                    } while (cursor.moveToNext())
+                if (wantedMimeTypes.any { isProperMimeType(it, path, false) }) {
+                    val name = entry.displayName.ifBlank { path.getFilenameFromPath() }
+                    val size = file.length()
+                    val modified = entry.openedAtMs
+                    listItems.add(ListItem(path, name, false, 0, size, modified, false, false))
                 }
             }
         } catch (e: Exception) {

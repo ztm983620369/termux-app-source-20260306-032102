@@ -3,6 +3,7 @@ package org.fossify.filemanager.fragments
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Parcelable
+import android.os.SystemClock
 import android.util.AttributeSet
 import androidx.recyclerview.widget.GridLayoutManager
 import org.fossify.commons.activities.BaseSimpleActivity
@@ -19,22 +20,33 @@ import org.fossify.filemanager.dialogs.CreateNewItemDialog
 import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.extensions.isPathOnRoot
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
+import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
 import org.fossify.filemanager.interfaces.FileManagerHost
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
+import com.termux.sessionsync.SessionFileCoordinator
+import com.termux.sessionsync.SftpProtocolManager
 import java.io.File
 
 class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerFragment<MyViewPagerFragment.ItemsInnerBinding>(context, attributeSet),
     ItemOperationsListener {
+    private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
     private var showHidden = false
     private var lastSearchedText = ""
     private var scrollStates = HashMap<String, Parcelable>()
     private var zoomListener: MyRecyclerView.MyZoomListener? = null
+    private var pendingRevealRequest: RevealRequest? = null
 
     private var storedItems = ArrayList<ListItem>()
     private var itemsIgnoringSearch = ArrayList<ListItem>()
     private lateinit var binding: ItemsFragmentBinding
+
+    private data class RevealRequest(
+        val targetPath: String,
+        val highlightPaths: Set<String>,
+        val createdAtMs: Long = SystemClock.elapsedRealtime()
+    )
 
     override fun onFinishInflate() {
         super.onFinishInflate()
@@ -47,13 +59,18 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             this.activity = activity
             binding.apply {
                 pathBarHolder.setOnClickListener {
-                    val current = currentPath.trimEnd('/')
-                    if (current.isEmpty() || current == "/") {
+                    if (NavigatorFolderHelper.isNavigatorPath(activity, currentPath)) {
                         return@setOnClickListener
                     }
-                    var parent = current.getParentPath().trimEnd('/')
-                    if (parent.isEmpty()) parent = "/"
+                    val parent = resolveParentPathForNavigation(currentPath)
+                    if (parent == currentPath.trimEnd('/')) {
+                        return@setOnClickListener
+                    }
                     openPath(parent, forceRefresh = true)
+                }
+                pathBarHolder.setOnLongClickListener {
+                    (activity as? FileManagerHost)?.showSessionSwitcher()
+                    true
                 }
                 itemsSwipeRefresh.setOnRefreshListener { refreshFragment() }
                 itemsFab.setOnClickListener {
@@ -124,7 +141,9 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             }
 
             FileDirItem.sorting = context!!.config.getFolderSorting(currentPath)
-            listItems.sort()
+            if (!NavigatorFolderHelper.isNavigatorPath(context!!, currentPath)) {
+                listItems.sort()
+            }
 
             if (context!!.config.getFolderViewType(currentPath) == VIEW_TYPE_GRID && listItems.none { it.isSectionTitle }) {
                 if (listItems.any { it.mIsDirectory } && listItems.any { !it.mIsDirectory }) {
@@ -151,7 +170,14 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     private fun addItems(items: ArrayList<ListItem>, forceRefresh: Boolean = false) {
         activity?.runOnUiThread {
             binding.itemsSwipeRefresh.isRefreshing = false
-            binding.pathBarText.text = currentPath
+            val ctx = context
+            binding.pathBarText.text = if (ctx != null) {
+                if (NavigatorFolderHelper.isNavigatorPath(ctx, currentPath)) {
+                    NavigatorFolderHelper.displayTitle()
+                } else {
+                    sessionFileCoordinator.getDisplayPath(ctx, currentPath)
+                }
+            } else currentPath
             if (!forceRefresh && items.hashCode() == storedItems.hashCode()) {
                 return@runOnUiThread
             }
@@ -181,19 +207,39 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             }
 
             getRecyclerLayoutManager().onRestoreInstanceState(scrollStates[currentPath])
+            applyPendingRevealIfNeeded(items)
         }
     }
 
     private fun getScrollState() = getRecyclerLayoutManager().onSaveInstanceState()
 
     private fun getRecyclerLayoutManager() = (binding.itemsList.layoutManager as MyGridLayoutManager)
-
     @SuppressLint("NewApi")
     private fun getItems(path: String, callback: (originalPath: String, items: ArrayList<ListItem>) -> Unit) {
         ensureBackgroundThread {
             if (activity?.isDestroyed == false && activity?.isFinishing == false) {
-                val config = context!!.config
-                if (context.isRestrictedSAFOnlyRoot(path)) {
+                val ctx = context!!
+                val config = ctx.config
+                if (NavigatorFolderHelper.isNavigatorPath(ctx, path)) {
+                    callback(path, NavigatorFolderHelper.buildNavigatorItems(ctx))
+                } else if (sessionFileCoordinator.isVirtualPath(ctx, path)) {
+                    val result = sessionFileCoordinator.listVirtualPath(ctx, path)
+                    if (!result.success) {
+                        activity?.runOnUiThread {
+                            hideProgressBar()
+                            activity?.toast(result.messageCn)
+                        }
+                        callback(path, ArrayList())
+                    } else {
+                        callback(path, getListItemsFromRemoteEntries(result.entries))
+                    }
+                } else if (sessionFileCoordinator.isStaleVirtualPath(ctx, path)) {
+                    activity?.runOnUiThread {
+                        hideProgressBar()
+                        activity?.toast("SFTP \u4f1a\u8bdd\u5df2\u53d8\u5316\uff0c\u8bf7\u91cd\u65b0\u9009\u62e9\u4f1a\u8bdd\u3002")
+                    }
+                    callback(path, ArrayList())
+                } else if (context.isRestrictedSAFOnlyRoot(path)) {
                     activity?.runOnUiThread { hideProgressBar() }
                     activity?.handleAndroidSAFDialog(path, openInSystemAppAllowed = true) {
                         if (!it) {
@@ -295,7 +341,46 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         return listItems
     }
 
+    private fun getListItemsFromRemoteEntries(remoteEntries: ArrayList<SftpProtocolManager.RemoteEntry>): ArrayList<ListItem> {
+        val listItems = ArrayList<ListItem>()
+        remoteEntries.forEach {
+            val listItem = ListItem(it.localPath, it.name, it.directory, 0, it.size, it.modifiedMs, false, false)
+            if (wantedMimeTypes.any { mimeType -> isProperMimeType(mimeType, it.localPath, it.directory) }) {
+                listItems.add(listItem)
+            }
+        }
+        return listItems
+    }
+
     private fun itemClicked(item: FileDirItem) {
+        if (context != null && NavigatorFolderHelper.isNavigatorPath(context!!, currentPath)) {
+            val ctx = context!!
+            val selectedSessionKey = NavigatorFolderHelper.resolveSessionKeyForTargetPath(ctx, item.path)
+            sessionFileCoordinator.setSelectedSessionKey(ctx, selectedSessionKey)
+            openDirectory(item.path)
+            return
+        }
+
+        if (context != null && sessionFileCoordinator.isVirtualPath(context!!, item.path)) {
+            if (item.isDirectory) {
+                openDirectory(item.path)
+            } else {
+                showProgressBar()
+                ensureBackgroundThread {
+                    val result = sessionFileCoordinator.materializeVirtualFile(context!!, item.path)
+                    activity?.runOnUiThread {
+                        hideProgressBar()
+                        if (result.success) {
+                            clickedPath(result.localPath)
+                        } else {
+                            activity?.toast(result.messageCn)
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         if (item.isDirectory) {
             openDirectory(item.path)
         } else {
@@ -425,11 +510,16 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     }
 
     fun showCreateNewItemDialog() {
-        CreateNewItemDialog(activity as SimpleActivity, currentPath) {
-            if (it) {
-                refreshFragment()
+        CreateNewItemDialog(activity as SimpleActivity, currentPath) { success, createdPath ->
+            if (!success) {
+                return@CreateNewItemDialog
+            }
+
+            val revealPath = createdPath?.trim().orEmpty()
+            if (revealPath.isNotEmpty()) {
+                openPathAndHighlight(currentPath, arrayListOf(revealPath))
             } else {
-                activity?.toast(R.string.unknown_error_occurred)
+                refreshFragment()
             }
         }
     }
@@ -532,6 +622,22 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         openPath(currentPath)
     }
 
+    override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {
+        val normalizedTarget = clampToTermuxRoot(targetPath.trimEnd('/').ifEmpty { "/" })
+        val normalizedHighlights = LinkedHashSet<String>()
+        highlightPaths.forEach { raw ->
+            val value = raw.trim().replace('\\', '/').trimEnd('/')
+            if (value.isNotEmpty()) {
+                normalizedHighlights.add(value)
+            }
+        }
+        pendingRevealRequest = RevealRequest(
+            targetPath = normalizedTarget.trimEnd('/').ifEmpty { "/" },
+            highlightPaths = normalizedHighlights
+        )
+        openPath(normalizedTarget, forceRefresh = true)
+    }
+
     override fun deleteFiles(files: ArrayList<FileDirItem>) {
         val hasFolder = files.any { it.isDirectory }
         handleFileDeleting(files, hasFolder)
@@ -547,5 +653,105 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
 
         val normalized = path.trim().trimEnd('/').ifEmpty { root }
         return if (normalized == root || normalized.startsWith("$root/")) normalized else root
+    }
+
+    private fun resolveParentPathForNavigation(rawPath: String): String {
+        val ctx = context ?: return "/"
+        val root = ctx.filesDir.absolutePath.trimEnd('/')
+        val current = rawPath.trimEnd('/').ifEmpty { root }
+
+        if (current == "/" || current == root) {
+            return root
+        }
+
+        if (isVirtualWorkspaceRoot(ctx, current, root)) {
+            return current
+        }
+
+        var parent = current.getParentPath().trimEnd('/')
+        if (parent.isEmpty()) {
+            parent = root
+        }
+        return parent
+    }
+
+    private fun isVirtualWorkspaceRoot(ctx: Context, current: String, root: String): Boolean {
+        if (!sessionFileCoordinator.isVirtualPath(ctx, current)) return false
+        val virtualPrefix = "$root/.termux/sftp-virtual/"
+        if (!current.startsWith(virtualPrefix)) return false
+        val tail = current.removePrefix(virtualPrefix)
+        return tail.isNotEmpty() && !tail.contains("/")
+    }
+
+    private fun applyPendingRevealIfNeeded(items: ArrayList<ListItem>) {
+        val request = pendingRevealRequest ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (now - request.createdAtMs > 15_000L) {
+            pendingRevealRequest = null
+            return
+        }
+
+        val current = currentPath.trimEnd('/').ifEmpty { "/" }
+        if (current != request.targetPath) return
+        pendingRevealRequest = null
+
+        if (request.highlightPaths.isEmpty()) return
+
+        val pathCandidates = request.highlightPaths
+            .map { it.trimEnd('/').ifEmpty { "/" } }
+            .toSet()
+        val nameCandidates = request.highlightPaths
+            .map { it.getFilenameFromPath() }
+            .filter { it.isNotBlank() }
+            .toSet()
+
+        val matchedPaths = ArrayList<String>()
+        var firstIndex = -1
+        items.forEachIndexed { index, item ->
+            if (item.isSectionTitle || item.isGridTypeDivider) return@forEachIndexed
+            val normalizedItemPath = item.path.trimEnd('/').ifEmpty { "/" }
+            val directMatch = pathCandidates.contains(normalizedItemPath)
+            val nameMatch = nameCandidates.any { expected -> isSameOrIndexedConflictName(expected, item.name) }
+            if (directMatch || nameMatch) {
+                matchedPaths.add(item.path)
+                if (firstIndex == -1) firstIndex = index
+            }
+        }
+
+        if (matchedPaths.isEmpty()) return
+
+        binding.itemsList.post {
+            val adapter = getRecyclerAdapter() ?: return@post
+            if (firstIndex >= 0) {
+                runCatching { binding.itemsList.smoothScrollToPosition(firstIndex) }
+            }
+            adapter.highlightPathsOnce(matchedPaths)
+        }
+    }
+
+    private fun isSameOrIndexedConflictName(expectedName: String, actualName: String): Boolean {
+        if (expectedName == actualName) return true
+        if (expectedName.isBlank() || actualName.isBlank()) return false
+
+        val expectedDot = expectedName.lastIndexOf('.')
+        val actualDot = actualName.lastIndexOf('.')
+        if (expectedDot > 0 && actualDot > 0) {
+            val expectedExt = expectedName.substring(expectedDot)
+            val actualExt = actualName.substring(actualDot)
+            if (!expectedExt.equals(actualExt, ignoreCase = true)) return false
+            val expectedStem = expectedName.substring(0, expectedDot)
+            val actualStem = actualName.substring(0, actualDot)
+            return actualStem == expectedStem || hasIndexedSuffix(actualStem, expectedStem)
+        }
+
+        return hasIndexedSuffix(actualName, expectedName)
+    }
+
+    private fun hasIndexedSuffix(actual: String, base: String): Boolean {
+        if (!actual.startsWith(base)) return false
+        if (actual.length <= base.length + 2) return false
+        if (actual[base.length] != '(' || actual.last() != ')') return false
+        val number = actual.substring(base.length + 1, actual.length - 1)
+        return number.isNotEmpty() && number.all { it.isDigit() }
     }
 }

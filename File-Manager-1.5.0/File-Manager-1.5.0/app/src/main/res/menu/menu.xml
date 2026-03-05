@@ -11,7 +11,7 @@
         app:showAsAction="always" />
     <item
         android:id="@+id/go_to_favorite"
-        android:icon="@drawable/ic_folder_open_vector"
+        android:icon="@drawable/ic_home_vector"
         android:title="@string/go_to_favorite"
         app:showAsAction="always" />
     <item
@@ -72,6 +72,10 @@
         android:id="@+id/settings"
         android:icon="@drawable/ic_settings_cog_vector"
         android:title="@string/settings"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/self_test"
+        android:title="Self test"
         app:showAsAction="never" />
     <item
         android:id="@+id/about"

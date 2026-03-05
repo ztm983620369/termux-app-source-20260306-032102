@@ -9,6 +9,7 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
 import android.graphics.drawable.LayerDrawable
 import android.net.Uri
+import android.os.SystemClock
 import android.util.TypedValue
 import android.view.LayoutInflater
 import android.view.Menu
@@ -17,6 +18,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
+import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.viewbinding.ViewBinding
 import com.bumptech.glide.Glide
@@ -56,6 +58,7 @@ import org.fossify.commons.extensions.formatDate
 import org.fossify.commons.extensions.formatSize
 import org.fossify.commons.extensions.getAndroidSAFFileItems
 import org.fossify.commons.extensions.getAndroidSAFUri
+import org.fossify.commons.extensions.getAlertDialogBuilder
 import org.fossify.commons.extensions.getColoredDrawableWithColor
 import org.fossify.commons.extensions.getDefaultCopyDestinationPath
 import org.fossify.commons.extensions.getDocumentFile
@@ -110,14 +113,19 @@ import org.fossify.filemanager.helpers.OPEN_AS_IMAGE
 import org.fossify.filemanager.helpers.OPEN_AS_OTHER
 import org.fossify.filemanager.helpers.OPEN_AS_TEXT
 import org.fossify.filemanager.helpers.OPEN_AS_VIDEO
+import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
+import com.termux.sessionsync.FileRootResolver
+import com.termux.sessionsync.SessionFileCoordinator
+import com.termux.sessionsync.SftpProtocolManager
 import java.io.BufferedInputStream
 import java.io.Closeable
 import java.io.File
 import java.util.LinkedList
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ItemsAdapter(
     activity: SimpleActivity,
@@ -141,6 +149,9 @@ class ItemsAdapter(
     private var smallerFontSize = 0f
     private var dateFormat = ""
     private var timeFormat = ""
+    private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
+    private val transientHighlightKeys = LinkedHashSet<Int>()
+    private var clearTransientHighlightRunnable: Runnable? = null
 
     private val config = activity.config
     private val viewType = if (canHaveIndividualViewType) {
@@ -158,6 +169,10 @@ class ItemsAdapter(
         private const val TYPE_DIR = 2
         private const val TYPE_SECTION = 3
         private const val TYPE_GRID_TYPE_DIVIDER = 4
+        private const val TRANSIENT_HIGHLIGHT_DURATION_MS = 1_600L
+        private const val TRANSIENT_HIGHLIGHT_RETRY_MS = 700L
+        private val virtualDownloadInProgress = AtomicBoolean(false)
+        private val virtualUploadInProgress = AtomicBoolean(false)
     }
 
     init {
@@ -216,7 +231,8 @@ class ItemsAdapter(
     }
 
     override fun getIsItemSelectable(position: Int): Boolean {
-        return !listItems[position].isSectionTitle && !listItems[position].isGridTypeDivider
+        val item = listItems[position]
+        return !item.isSectionTitle && !item.isGridTypeDivider && item.children >= 0
     }
 
     override fun getItemSelectionKey(position: Int): Int? {
@@ -254,16 +270,24 @@ class ItemsAdapter(
 
     override fun onBindViewHolder(holder: MyRecyclerViewAdapter.ViewHolder, position: Int) {
         val fileDirItem = listItems[position]
-        holder.bindView(
+        val rowView = holder.bindView(
             any = fileDirItem,
             allowSingleClick = true,
-            allowLongClick = !fileDirItem.isSectionTitle
+            allowLongClick = false
         ) { itemView, layoutPosition ->
             val viewType = getItemViewType(position)
             setupView(
                 binding = Binding.getByItemViewType(viewType, isListViewType).bind(itemView),
                 listItem = fileDirItem
             )
+        }
+        rowView.setOnLongClickListener {
+            val adapterPosition = holder.bindingAdapterPosition
+            if (adapterPosition == RecyclerView.NO_POSITION) return@setOnLongClickListener true
+            val itemPosition = adapterPosition - positionOffset
+            if (!getIsItemSelectable(itemPosition)) return@setOnLongClickListener true
+            showLongPressActionDialog(itemPosition)
+            true
         }
         bindViewHolder(holder)
     }
@@ -291,6 +315,111 @@ class ItemsAdapter(
 
         menu.findItem(R.id.cab_hide).isVisible = unhiddenCnt > 0
         menu.findItem(R.id.cab_unhide).isVisible = hiddenCnt > 0
+    }
+
+    private data class LongPressAction(val id: Int, val title: String)
+
+    private fun showLongPressActionDialog(position: Int) {
+        if (position !in 0 until listItems.size) return
+        finishActMode()
+        toggleItemSelection(true, position, updateTitle = false)
+
+        val actions = buildLongPressActions()
+        if (actions.isEmpty()) {
+            finishActMode()
+            return
+        }
+
+        val selectedItem = listItems.getOrNull(position)
+        val dialogTitle = selectedItem?.name?.takeIf { it.isNotBlank() } ?: activity.getString(R.string.app_launcher_name)
+        val labels = actions.map { it.title }.toTypedArray()
+        var actionChosen = false
+
+        activity.getAlertDialogBuilder()
+            .setTitle(dialogTitle)
+            .setItems(labels) { _, which ->
+                val actionId = actions.getOrNull(which)?.id ?: return@setItems
+                actionChosen = true
+                actionItemPressed(actionId)
+                if (shouldClearSelectionImmediately(actionId)) {
+                    finishActMode()
+                }
+            }
+            .setOnDismissListener {
+                if (!actionChosen) {
+                    finishActMode()
+                }
+            }
+            .show()
+    }
+
+    private fun buildLongPressActions(): ArrayList<LongPressAction> {
+        if (selectedKeys.isEmpty()) return arrayListOf()
+        val selected = getSelectedFileDirItems()
+        if (selected.isEmpty()) return arrayListOf()
+
+        var hiddenCnt = 0
+        var unhiddenCnt = 0
+        selected.forEach {
+            if (it.name.startsWith(".")) hiddenCnt++ else unhiddenCnt++
+        }
+
+        val actions = ArrayList<LongPressAction>(14)
+        if (isPickMultipleIntent) {
+            actions.add(LongPressAction(R.id.cab_confirm_selection, activity.getString(R.string.confirm_selection)))
+        }
+        actions.add(LongPressAction(R.id.cab_rename, activity.getString(R.string.rename)))
+        actions.add(LongPressAction(R.id.cab_properties, activity.getString(R.string.properties)))
+        actions.add(LongPressAction(R.id.cab_share, activity.getString(R.string.share)))
+
+        if (isOneItemSelected()) {
+            actions.add(LongPressAction(R.id.cab_copy_path, activity.getString(R.string.copy_path)))
+            actions.add(LongPressAction(R.id.cab_create_shortcut, activity.getString(R.string.create_shortcut)))
+        }
+        if (isOneFileSelected()) {
+            actions.add(LongPressAction(R.id.cab_open_with, activity.getString(R.string.open_with)))
+            actions.add(LongPressAction(R.id.cab_open_as, activity.getString(R.string.open_as)))
+            actions.add(LongPressAction(R.id.cab_set_as, activity.getString(R.string.set_as)))
+        }
+        if (unhiddenCnt > 0) {
+            actions.add(LongPressAction(R.id.cab_hide, activity.getString(R.string.hide)))
+        }
+        if (hiddenCnt > 0) {
+            actions.add(LongPressAction(R.id.cab_unhide, activity.getString(R.string.unhide)))
+        }
+
+        actions.add(LongPressAction(R.id.cab_copy_to, activity.getString(R.string.copy_to)))
+        actions.add(LongPressAction(R.id.cab_move_to, activity.getString(R.string.move_to)))
+        actions.add(LongPressAction(R.id.cab_compress, activity.getString(R.string.compress)))
+
+        val hasZip = selected.any { it.path.isZipFile() }
+        if (hasZip) {
+            actions.add(LongPressAction(R.id.cab_decompress, activity.getString(R.string.decompress)))
+        }
+
+        actions.add(LongPressAction(R.id.cab_select_all, activity.getString(R.string.select_all)))
+        actions.add(LongPressAction(R.id.cab_delete, activity.getString(R.string.delete)))
+        return actions
+    }
+
+    private fun shouldClearSelectionImmediately(actionId: Int): Boolean {
+        return when (actionId) {
+            R.id.cab_confirm_selection,
+            R.id.cab_rename,
+            R.id.cab_properties,
+            R.id.cab_share,
+            R.id.cab_create_shortcut,
+            R.id.cab_copy_path,
+            R.id.cab_set_as,
+            R.id.cab_open_with,
+            R.id.cab_open_as,
+            R.id.cab_copy_to,
+            R.id.cab_move_to,
+            R.id.cab_compress,
+            R.id.cab_decompress -> true
+
+            else -> false
+        }
     }
 
     private fun confirmSelection() {
@@ -473,7 +602,14 @@ class ItemsAdapter(
     }
 
     private fun copyPath() {
-        activity.copyToClipboard(getFirstSelectedItemPath())
+        val selectedPath = getFirstSelectedItemPath()
+        val clipboardPath = if (sessionFileCoordinator.isVirtualPath(activity, selectedPath)) {
+            sessionFileCoordinator.getDisplayPath(activity, selectedPath).takeIf { it.isNotBlank() } ?: selectedPath
+        } else {
+            selectedPath
+        }
+
+        activity.copyToClipboard(clipboardPath)
         finishActMode()
     }
 
@@ -508,6 +644,15 @@ class ItemsAdapter(
 
     private fun copyMoveTo(isCopyOperation: Boolean) {
         val files = getSelectedFileDirItems()
+        if (files.isEmpty()) {
+            return
+        }
+
+        if (isCopyOperation && files.any { sessionFileCoordinator.isVirtualPath(activity, it.path) }) {
+            copyVirtualSelectionToLocal(files)
+            return
+        }
+
         val firstFile = files[0]
         val source = firstFile.getParentPath()
         FilePickerDialog(
@@ -520,6 +665,19 @@ class ItemsAdapter(
             showFavoritesButton = true
         ) {
             config.lastCopyPath = it
+            if (sessionFileCoordinator.isVirtualPath(activity, it)) {
+                if (!isCopyOperation) {
+                    activity.toast("\u4e0a\u4f20\u5230\u670d\u52a1\u5668\u6682\u4e0d\u652f\u6301\u79fb\u52a8\uff0c\u8bf7\u4f7f\u7528\u201c\u590d\u5236\u5230\u201d\u3002")
+                    return@FilePickerDialog
+                }
+                if (files.any { selected -> sessionFileCoordinator.isVirtualPath(activity, selected.path) }) {
+                    activity.toast("\u8bf7\u5206\u5f00\u9009\u62e9\u672c\u5730\u4e0e\u8fdc\u7a0b\u9879\u76ee\u540e\u518d\u4e0a\u4f20\u3002")
+                    return@FilePickerDialog
+                }
+                runVirtualUpload(files, it)
+                return@FilePickerDialog
+            }
+
             if (activity.isPathOnRoot(it) || activity.isPathOnRoot(firstFile.path)) {
                 copyMoveRootItems(files, it, isCopyOperation)
             } else {
@@ -571,6 +729,387 @@ class ItemsAdapter(
                         finishActMode()
                     }
                 }
+            }
+        }
+    }
+
+    private fun copyVirtualSelectionToLocal(files: ArrayList<FileDirItem>) {
+        val virtualItems = files.filter { sessionFileCoordinator.isVirtualPath(activity, it.path) }
+        if (virtualItems.isEmpty()) {
+            return
+        }
+
+        if (virtualItems.size != files.size) {
+            activity.toast("\u8bf7\u5206\u5f00\u9009\u62e9\u672c\u5730\u4e0e\u8fdc\u7a0b\u9879\u76ee\u540e\u518d\u590d\u5236\u3002")
+            return
+        }
+
+        val localRoot = FileRootResolver.termuxPrivateRoot(activity)
+        var defaultDestination = activity.getDefaultCopyDestinationPath(config.shouldShowHidden(), localRoot)
+        if (
+            sessionFileCoordinator.isVirtualPath(activity, defaultDestination)
+            || !activity.getDoesFilePathExist(defaultDestination)
+        ) {
+            defaultDestination = localRoot
+        }
+
+        FilePickerDialog(
+            activity = activity,
+            currPath = defaultDestination,
+            pickFile = false,
+            showHidden = config.shouldShowHidden(),
+            showFAB = true,
+            canAddShowHiddenButton = true,
+            showFavoritesButton = true
+        ) { destination ->
+            if (sessionFileCoordinator.isVirtualPath(activity, destination)) {
+                activity.toast("\u8bf7\u9009\u62e9\u672c\u5730\u76ee\u5f55\u4f5c\u4e3a\u4e0b\u8f7d\u76ee\u6807\u3002")
+                return@FilePickerDialog
+            }
+
+            config.lastCopyPath = destination
+            runVirtualDownload(virtualItems, destination)
+        }
+    }
+
+    private fun runVirtualDownload(virtualItems: List<FileDirItem>, destination: String) {
+        if (activity.isDestroyed || activity.isFinishing) {
+            return
+        }
+        if (!virtualDownloadInProgress.compareAndSet(false, true)) {
+            activity.toast("\u5df2\u6709\u4e0b\u8f7d\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+            return
+        }
+
+        val progressDialog = activity.getAlertDialogBuilder()
+            .setTitle("\u4e0b\u8f7d\u4e2d")
+            .setMessage("\u6b63\u5728\u51c6\u5907\u4e0b\u8f7d...")
+            .setNegativeButton("\u53d6\u6d88", null)
+            .setCancelable(false)
+            .create()
+        val cancelled = AtomicBoolean(false)
+        progressDialog.setOnShowListener {
+            progressDialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+                cancelled.set(true)
+                it.isEnabled = false
+            }
+        }
+        try {
+            progressDialog.show()
+        } catch (_: Exception) {
+        }
+
+        var lastUiUpdateAt = 0L
+        var lastSpeedAt = 0L
+        var lastSpeedBytes = 0L
+        var speedBytesPerSecond = 0L
+
+        ensureBackgroundThread {
+            try {
+                val virtualPaths = ArrayList<String>(virtualItems.size)
+                virtualItems.forEach { virtualPaths.add(it.path) }
+                val revealPaths = buildLocalRevealPaths(virtualItems, destination)
+                val result = sessionFileCoordinator.downloadVirtualPaths(
+                    activity,
+                    virtualPaths,
+                    destination,
+                    object : SftpProtocolManager.DownloadProgressListener {
+                        override fun onProgress(progress: SftpProtocolManager.DownloadProgress) {
+                            val now = SystemClock.elapsedRealtime()
+                            if (lastSpeedAt == 0L) {
+                                lastSpeedAt = now
+                                lastSpeedBytes = progress.transferredBytes
+                            } else {
+                                val deltaMs = now - lastSpeedAt
+                                if (deltaMs >= 260L || progress.transferredBytes < lastSpeedBytes) {
+                                    val deltaBytes = progress.transferredBytes - lastSpeedBytes
+                                    speedBytesPerSecond = if (deltaMs > 0L && deltaBytes > 0L) {
+                                        deltaBytes * 1000L / deltaMs
+                                    } else {
+                                        0L
+                                    }
+                                    lastSpeedAt = now
+                                    lastSpeedBytes = progress.transferredBytes
+                                }
+                            }
+
+                            if (now - lastUiUpdateAt < 100L && progress.transferredBytes < progress.totalBytes) {
+                                return
+                            }
+                            lastUiUpdateAt = now
+
+                            val finishedCount = progress.completedFiles + progress.failedFiles
+                            val percent = if (progress.totalBytes > 0L) {
+                                ((progress.transferredBytes * 100L) / progress.totalBytes).coerceIn(0L, 100L)
+                            } else {
+                                0L
+                            }
+                            val sizeText = if (progress.totalBytes > 0L) {
+                                "${progress.transferredBytes.formatSize()} / ${progress.totalBytes.formatSize()}"
+                            } else {
+                                "${progress.transferredBytes.formatSize()} / ?"
+                            }
+                            val speedText = if (speedBytesPerSecond > 0L) {
+                                "${speedBytesPerSecond.formatSize()}/s"
+                            } else {
+                                "--"
+                            }
+                            val currentFile = if (progress.currentFile.isNotEmpty()) {
+                                progress.currentFile
+                            } else {
+                                "\u51c6\u5907\u4e2d..."
+                            }
+                            val message = StringBuilder()
+                                .append("\u5f53\u524d\uff1a").append(currentFile).append('\n')
+                                .append("\u8fdb\u5ea6\uff1a").append(finishedCount).append('/').append(progress.totalFiles)
+                                .append(" (").append(percent).append("%)").append('\n')
+                                .append("\u5927\u5c0f\uff1a").append(sizeText).append('\n')
+                                .append("\u901f\u5ea6\uff1a").append(speedText)
+                                .toString()
+
+                            activity.runOnUiThread {
+                                if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                                    progressDialog.setMessage(message)
+                                }
+                            }
+                        }
+                    },
+                    object : SftpProtocolManager.DownloadControl {
+                        override fun isCancelled(): Boolean = cancelled.get()
+                    }
+                )
+
+                activity.runOnUiThread {
+                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                        try {
+                            progressDialog.dismiss()
+                        } catch (_: Exception) {
+                        }
+                    }
+
+                    when {
+                        result.success -> {
+                            activity.toast(
+                                "\u4e0b\u8f7d\u5b8c\u6210\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
+                                    result.downloadedBytes.formatSize()
+                                }"
+                            )
+                        }
+
+                        result.downloadedFiles > 0 -> {
+                            val reason = if (result.messageCn.isNotEmpty()) " ${result.messageCn}" else ""
+                            activity.toast(
+                                "\u90e8\u5206\u5b8c\u6210\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
+                                    result.downloadedBytes.formatSize()
+                                }$reason"
+                            )
+                        }
+
+                        else -> {
+                            val failure = if (result.messageCn.isNotEmpty()) {
+                                result.messageCn
+                            } else {
+                                "\u4e0b\u8f7d\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u7f51\u7edc\u6216\u8ba4\u8bc1\u4fe1\u606f\u3002"
+                            }
+                            activity.toast(failure)
+                        }
+                    }
+
+                    if (result.downloadedFiles > 0 && revealPaths.isNotEmpty()) {
+                        listener?.openPathAndHighlight(destination, revealPaths)
+                    } else {
+                        listener?.refreshFragment()
+                    }
+                    finishActMode()
+                }
+            } catch (t: Throwable) {
+                activity.runOnUiThread {
+                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                        try {
+                            progressDialog.dismiss()
+                        } catch (_: Exception) {
+                        }
+                    }
+                    val msg = t.message?.trim().orEmpty()
+                    if (msg.isNotEmpty()) {
+                        activity.toast("\u4e0b\u8f7d\u5f02\u5e38\uff1a$msg")
+                    } else {
+                        activity.toast("\u4e0b\u8f7d\u5f02\u5e38\uff0c\u8bf7\u91cd\u8bd5\u3002")
+                    }
+                }
+            } finally {
+                virtualDownloadInProgress.set(false)
+            }
+        }
+    }
+
+    private fun runVirtualUpload(localItems: List<FileDirItem>, destinationVirtualPath: String) {
+        if (activity.isDestroyed || activity.isFinishing) {
+            return
+        }
+        if (!virtualUploadInProgress.compareAndSet(false, true)) {
+            activity.toast("\u5df2\u6709\u4e0a\u4f20\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+            return
+        }
+
+        val progressDialog = activity.getAlertDialogBuilder()
+            .setTitle("\u4e0a\u4f20\u4e2d")
+            .setMessage("\u6b63\u5728\u51c6\u5907\u4e0a\u4f20...")
+            .setNegativeButton("\u53d6\u6d88", null)
+            .setCancelable(false)
+            .create()
+        val cancelled = AtomicBoolean(false)
+        progressDialog.setOnShowListener {
+            progressDialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+                cancelled.set(true)
+                it.isEnabled = false
+            }
+        }
+        try {
+            progressDialog.show()
+        } catch (_: Exception) {
+        }
+
+        var lastUiUpdateAt = 0L
+        var lastSpeedAt = 0L
+        var lastSpeedBytes = 0L
+        var speedBytesPerSecond = 0L
+
+        ensureBackgroundThread {
+            try {
+                val localPaths = ArrayList<String>(localItems.size)
+                localItems.forEach { localPaths.add(it.path) }
+                val revealPaths = buildVirtualRevealPaths(localItems, destinationVirtualPath)
+                val result = sessionFileCoordinator.uploadLocalPathsToVirtual(
+                    activity,
+                    localPaths,
+                    destinationVirtualPath,
+                    object : SftpProtocolManager.UploadProgressListener {
+                        override fun onProgress(progress: SftpProtocolManager.UploadProgress) {
+                            val now = SystemClock.elapsedRealtime()
+                            if (lastSpeedAt == 0L) {
+                                lastSpeedAt = now
+                                lastSpeedBytes = progress.transferredBytes
+                            } else {
+                                val deltaMs = now - lastSpeedAt
+                                if (deltaMs >= 260L || progress.transferredBytes < lastSpeedBytes) {
+                                    val deltaBytes = progress.transferredBytes - lastSpeedBytes
+                                    speedBytesPerSecond = if (deltaMs > 0L && deltaBytes > 0L) {
+                                        deltaBytes * 1000L / deltaMs
+                                    } else {
+                                        0L
+                                    }
+                                    lastSpeedAt = now
+                                    lastSpeedBytes = progress.transferredBytes
+                                }
+                            }
+
+                            if (now - lastUiUpdateAt < 100L && progress.transferredBytes < progress.totalBytes) {
+                                return
+                            }
+                            lastUiUpdateAt = now
+
+                            val finishedCount = progress.completedFiles + progress.failedFiles
+                            val percent = if (progress.totalBytes > 0L) {
+                                ((progress.transferredBytes * 100L) / progress.totalBytes).coerceIn(0L, 100L)
+                            } else {
+                                0L
+                            }
+                            val sizeText = if (progress.totalBytes > 0L) {
+                                "${progress.transferredBytes.formatSize()} / ${progress.totalBytes.formatSize()}"
+                            } else {
+                                "${progress.transferredBytes.formatSize()} / ?"
+                            }
+                            val speedText = if (speedBytesPerSecond > 0L) {
+                                "${speedBytesPerSecond.formatSize()}/s"
+                            } else {
+                                "--"
+                            }
+                            val currentFile = if (progress.currentFile.isNotEmpty()) {
+                                progress.currentFile
+                            } else {
+                                "\u51c6\u5907\u4e2d..."
+                            }
+                            val message = StringBuilder()
+                                .append("\u5f53\u524d\uff1a").append(currentFile).append('\n')
+                                .append("\u8fdb\u5ea6\uff1a").append(finishedCount).append('/').append(progress.totalFiles)
+                                .append(" (").append(percent).append("%)").append('\n')
+                                .append("\u5927\u5c0f\uff1a").append(sizeText).append('\n')
+                                .append("\u901f\u5ea6\uff1a").append(speedText)
+                                .toString()
+
+                            activity.runOnUiThread {
+                                if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                                    progressDialog.setMessage(message)
+                                }
+                            }
+                        }
+                    },
+                    object : SftpProtocolManager.UploadControl {
+                        override fun isCancelled(): Boolean = cancelled.get()
+                    }
+                )
+
+                activity.runOnUiThread {
+                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                        try {
+                            progressDialog.dismiss()
+                        } catch (_: Exception) {
+                        }
+                    }
+
+                    when {
+                        result.success -> {
+                            activity.toast(
+                                "\u4e0a\u4f20\u5b8c\u6210\uff1a${result.uploadedFiles}/${result.totalFiles}\uff0c${
+                                    result.uploadedBytes.formatSize()
+                                }"
+                            )
+                        }
+
+                        result.uploadedFiles > 0 -> {
+                            val reason = if (result.messageCn.isNotEmpty()) " ${result.messageCn}" else ""
+                            activity.toast(
+                                "\u90e8\u5206\u5b8c\u6210\uff1a${result.uploadedFiles}/${result.totalFiles}\uff0c${
+                                    result.uploadedBytes.formatSize()
+                                }$reason"
+                            )
+                        }
+
+                        else -> {
+                            val failure = if (result.messageCn.isNotEmpty()) {
+                                result.messageCn
+                            } else {
+                                "\u4e0a\u4f20\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u7f51\u7edc\u6216\u8ba4\u8bc1\u4fe1\u606f\u3002"
+                            }
+                            activity.toast(failure)
+                        }
+                    }
+
+                    if (result.uploadedFiles > 0 && revealPaths.isNotEmpty()) {
+                        listener?.openPathAndHighlight(destinationVirtualPath, revealPaths)
+                    } else {
+                        listener?.refreshFragment()
+                    }
+                    finishActMode()
+                }
+            } catch (t: Throwable) {
+                activity.runOnUiThread {
+                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                        try {
+                            progressDialog.dismiss()
+                        } catch (_: Exception) {
+                        }
+                    }
+                    val msg = t.message?.trim().orEmpty()
+                    if (msg.isNotEmpty()) {
+                        activity.toast("\u4e0a\u4f20\u5f02\u5e38\uff1a$msg")
+                    } else {
+                        activity.toast("\u4e0a\u4f20\u5f02\u5e38\uff0c\u8bf7\u91cd\u8bd5\u3002")
+                    }
+                }
+            } finally {
+                virtualUploadInProgress.set(false)
             }
         }
     }
@@ -958,6 +1497,32 @@ class ItemsAdapter(
 
     private fun getFirstSelectedItemPath() = getSelectedFileDirItems().first().path
 
+    private fun buildLocalRevealPaths(virtualItems: List<FileDirItem>, destination: String): ArrayList<String> {
+        val reveal = ArrayList<String>(virtualItems.size)
+        virtualItems.forEach { item ->
+            val name = item.name.ifBlank { item.path.getFilenameFromPath() }
+            if (name.isBlank()) return@forEach
+            reveal.add(File(destination, name).absolutePath.replace('\\', '/'))
+        }
+        return reveal
+    }
+
+    private fun buildVirtualRevealPaths(localItems: List<FileDirItem>, destinationVirtualPath: String): ArrayList<String> {
+        val reveal = ArrayList<String>(localItems.size)
+        val normalizedDestination = destinationVirtualPath.replace('\\', '/').trimEnd('/').ifEmpty { "/" }
+        localItems.forEach { item ->
+            val name = item.name.ifBlank { item.path.getFilenameFromPath() }
+            if (name.isBlank()) return@forEach
+            val fullPath = if (normalizedDestination == "/") {
+                "/$name"
+            } else {
+                "$normalizedDestination/$name"
+            }
+            reveal.add(fullPath)
+        }
+        return reveal
+    }
+
     private fun getSelectedFileDirItems(): ArrayList<FileDirItem> {
         return listItems.filter {
             selectedKeys.contains(it.path.hashCode())
@@ -975,6 +1540,73 @@ class ItemsAdapter(
             textToHighlight = highlightText
             notifyDataSetChanged()
         }
+    }
+
+    fun highlightPathsOnce(paths: List<String>) {
+        if (paths.isEmpty()) return
+
+        val newHighlightKeys = LinkedHashSet<Int>(paths.size)
+        paths.forEach { path ->
+            val key = path.hashCode()
+            if (getItemKeyPosition(key) != -1) {
+                newHighlightKeys.add(key)
+            }
+        }
+        if (newHighlightKeys.isEmpty()) return
+
+        clearPendingHighlightClear()
+        clearTransientHighlightsNow()
+
+        val changedPositions = LinkedHashSet<Int>()
+        newHighlightKeys.forEach { key ->
+            val position = getItemKeyPosition(key)
+            if (position == -1 || !getIsItemSelectable(position)) return@forEach
+            if (selectedKeys.add(key)) {
+                changedPositions.add(position + positionOffset)
+            }
+            transientHighlightKeys.add(key)
+        }
+        changedPositions.forEach(::notifyItemChanged)
+        scheduleTransientHighlightClear(TRANSIENT_HIGHLIGHT_DURATION_MS)
+    }
+
+    private fun scheduleTransientHighlightClear(delayMs: Long) {
+        if (transientHighlightKeys.isEmpty()) return
+        clearPendingHighlightClear()
+        val runnable = Runnable {
+            if (transientHighlightKeys.isEmpty()) {
+                clearTransientHighlightRunnable = null
+                return@Runnable
+            }
+            if (actMode != null) {
+                scheduleTransientHighlightClear(TRANSIENT_HIGHLIGHT_RETRY_MS)
+                return@Runnable
+            }
+            clearTransientHighlightsNow()
+            clearTransientHighlightRunnable = null
+        }
+        clearTransientHighlightRunnable = runnable
+        recyclerView.postDelayed(runnable, delayMs)
+    }
+
+    private fun clearPendingHighlightClear() {
+        clearTransientHighlightRunnable?.let { recyclerView.removeCallbacks(it) }
+        clearTransientHighlightRunnable = null
+    }
+
+    private fun clearTransientHighlightsNow() {
+        if (transientHighlightKeys.isEmpty()) return
+        val changedPositions = LinkedHashSet<Int>()
+        val keys = ArrayList(transientHighlightKeys)
+        transientHighlightKeys.clear()
+        keys.forEach { key ->
+            if (!selectedKeys.remove(key)) return@forEach
+            val position = getItemKeyPosition(key)
+            if (position != -1) {
+                changedPositions.add(position + positionOffset)
+            }
+        }
+        changedPositions.forEach(::notifyItemChanged)
     }
 
     fun updateFontSizes() {
@@ -1014,6 +1646,12 @@ class ItemsAdapter(
                 Glide.with(activity).clear(icon)
             }
         }
+    }
+
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        clearPendingHighlightClear()
+        transientHighlightKeys.clear()
+        super.onDetachedFromRecyclerView(recyclerView)
     }
 
     private fun setupView(binding: ItemViewBinding, listItem: ListItem) {
@@ -1103,6 +1741,9 @@ class ItemsAdapter(
 
     private fun getChildrenCnt(item: FileDirItem): String {
         val children = item.children
+        if (children < 0) {
+            return NavigatorFolderHelper.getItemSubtitle(activity, item.path)
+        }
         return activity.resources.getQuantityString(R.plurals.items, children, children)
     }
 

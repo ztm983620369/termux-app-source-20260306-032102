@@ -18,4 +18,6 @@ interface ItemOperationsListener {
     fun columnCountChanged()
 
     fun finishActMode()
+
+    fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {}
 }

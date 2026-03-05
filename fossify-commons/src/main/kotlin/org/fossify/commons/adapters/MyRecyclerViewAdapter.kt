@@ -278,7 +278,20 @@ abstract class MyRecyclerViewAdapter(val activity: BaseSimpleActivity, val recyc
     }
 
     fun finishActMode() {
-        actMode?.finish()
+        if (actMode != null) {
+            actMode?.finish()
+            return
+        }
+
+        if (selectedKeys.isEmpty()) return
+        val keys = selectedKeys.toList()
+        selectedKeys.clear()
+        keys.forEach { key ->
+            val position = getItemKeyPosition(key)
+            if (position != -1) {
+                notifyItemChanged(position + positionOffset)
+            }
+        }
     }
 
     fun updateTextColor(textColor: Int) {

@@ -8,16 +8,16 @@
     <FrameLayout
         android:id="@+id/search_bar_container"
         android:layout_width="match_parent"
-        android:layout_height="?attr/actionBarSize"
+        android:layout_height="@dimen/min_row_height"
         android:paddingStart="@dimen/activity_margin"
-        android:paddingTop="@dimen/medium_margin"
+        android:paddingTop="@dimen/small_margin"
         android:paddingEnd="@dimen/activity_margin"
-        android:paddingBottom="@dimen/medium_margin">
+        android:paddingBottom="@dimen/small_margin">
 
         <RelativeLayout
             android:id="@+id/toolbar_container"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="match_parent"
             android:background="@drawable/search_menu_background"
             android:focusableInTouchMode="true"
             tools:ignore="UselessParent">

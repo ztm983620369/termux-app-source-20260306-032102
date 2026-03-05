@@ -65,7 +65,7 @@
 | `:sora-oniguruma-native` | `sora-editor-0.24.3/oniguruma-native` | 185 | 98 |
 
 ---
-
+ 
 ## 4. 依赖关系（核心）
 
 - `:app` 依赖：`:terminal-view`、`:termux-shared`、`:terminal-tabs`、`:ui-shell`、`:sora-demo`、`:file-bridge`、`:file-manager`、`:fossify-commons`  

@@ -55,6 +55,7 @@ android {
         implementation project(":terminal-tabs")
         implementation project(":ui-shell")
         implementation project(":sora-demo")
+        implementation project(":session-sync-core")
         implementation project(":file-bridge")
         implementation project(":file-manager")
         implementation project(":fossify-commons")
