@@ -1,40 +1,40 @@
-# Artifact Calculator Kit
+# Artifact Calculator Kit（中文说明）
 
-This folder provides a practical, buildable three-artifact template:
+这个目录提供一套可直接构建与验证的三件套产物：
 
-- `calculator-m3.apk`: standalone Compose Material 3 calculator app.
-- `calculator-m3.zip`: zip package containing the same calculator APK.
-- `calculator-m3.dex`: Dex entry compatible with Termux `ShadowDexRunner` (`com.termux.shadowtemplate.DemoEntry#run(Context)`).
+- `calculator-m3.apk`：独立的 Compose Material 3 计算器应用。
+- `calculator-m3.zip`：包含同一 APK 的压缩包。
+- `calculator-m3.dex`：兼容 Termux `ShadowDexRunner` 的 Dex 入口（`com.termux.shadowtemplate.DemoEntry#run(Context)`）。
 
-## Why this is structured this way
+## 结构设计原因
 
-- APK and ZIP can carry a full Android UI app.
-- Dex in the current Termux chain is reflection-based code execution, not a full manifest/resource app container.
-- So the Dex artifact launches the installed calculator app and writes a run report.
+- APK 和 ZIP 可以承载完整的 Android UI 应用。
+- 当前 Termux 链路中的 Dex 主要是反射执行代码，不是完整的清单/资源容器。
+- 因此 Dex 产物的职责是：拉起已安装的计算器应用，并输出一次运行报告。
 
-## Build
+## 构建方法
 
-From repository root:
+在仓库根目录执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\artifact-calculator-kit\build-all.ps1
 ```
 
-Generated artifacts are in `artifact-calculator-kit\out`.
+构建产物输出到 `artifact-calculator-kit\out`。
 
-## Device deploy and run
+## 设备部署与运行
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\artifact-calculator-kit\adb-deploy-run.ps1
 ```
 
-This script:
+脚本会执行以下操作：
 
-- installs and launches `calculator-m3.apk`,
-- pushes `calculator-m3.dex` and `calculator-m3.zip` to `/sdcard/Download/termux-artifacts`,
-- executes Dex `main()` once via `dalvikvm` for a live report.
+- 安装并启动 `calculator-m3.apk`；
+- 将 `calculator-m3.dex` 与 `calculator-m3.zip` 推送到 `/sdcard/Download/termux-artifacts`；
+- 通过 `dalvikvm` 执行一次 Dex `main()` 并输出实时报告。
 
-## Notes
+## 备注
 
-- `adb-deploy-run.ps1` uses `artifact-calculator-kit\tools\adb_bridge.py` (direct ADB protocol over localhost `5037`), so it does not require `adb.exe` in PATH.
-- If your local adb server is not running, start it on your host first.
+- `adb-deploy-run.ps1` 依赖 `artifact-calculator-kit\tools\adb_bridge.py`（通过 localhost `5037` 直连 ADB 协议），不要求 `adb.exe` 在 `PATH` 中。
+- 如果本机 adb server 未启动，请先在宿主机启动。
