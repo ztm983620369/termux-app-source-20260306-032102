@@ -1,0 +1,4 @@
+.build-work/
+calculator-app/.gradle/
+calculator-app/app/build/
+out/
