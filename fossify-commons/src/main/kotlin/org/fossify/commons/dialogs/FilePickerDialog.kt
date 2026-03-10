@@ -77,8 +77,15 @@ class FilePickerDialog(
     private val showFavoritesButton: Boolean = false,
     private val showRationale: Boolean = true,
     private val enforceStorageRestrictions: Boolean = true,
+    private val targetScope: TargetScope = TargetScope.ANY,
     private val callback: (pickedPath: String) -> Unit
 ) : Breadcrumbs.BreadcrumbsListener {
+
+    enum class TargetScope {
+        ANY,
+        LOCAL_ONLY,
+        REMOTE_ONLY
+    }
 
     private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
     private val termuxRootPath = activity.filesDir.absolutePath.trimEnd('/')
@@ -258,6 +265,16 @@ class FilePickerDialog(
 
     private fun verifyPath() {
         if (showWorkspaceRoot) {
+            return
+        }
+
+        if (targetScope == TargetScope.LOCAL_ONLY && sessionFileCoordinator.isVirtualPath(activity, currPath)) {
+            activity.toast("请选择本地目录作为目标。", Toast.LENGTH_LONG)
+            return
+        }
+
+        if (targetScope == TargetScope.REMOTE_ONLY && !sessionFileCoordinator.isVirtualPath(activity, currPath)) {
+            activity.toast("请选择服务器目录作为目标。", Toast.LENGTH_LONG)
             return
         }
 
@@ -453,12 +470,25 @@ class FilePickerDialog(
 
     private fun normalizeInitialPath(rawPath: String): String {
         var path = rawPath.trimEnd('/')
+        val firstRemoteRoot = firstRemoteRoot()
+
+        if (targetScope == TargetScope.LOCAL_ONLY && sessionFileCoordinator.isVirtualPath(activity, path)) {
+            path = preferredLocalRoot()
+        }
+
+        if (targetScope == TargetScope.REMOTE_ONLY && !sessionFileCoordinator.isVirtualPath(activity, path)) {
+            return firstRemoteRoot ?: termuxRootPath
+        }
+
         if (path.isEmpty()) {
-            return termuxRootPath
+            return when (targetScope) {
+                TargetScope.LOCAL_ONLY, TargetScope.ANY -> preferredLocalRoot()
+                TargetScope.REMOTE_ONLY -> firstRemoteRoot ?: termuxRootPath
+            }
         }
 
         if (path.startsWith(activity.recycleBinPath)) {
-            return termuxRootPath
+            return preferredLocalRoot()
         }
 
         if (sessionFileCoordinator.isVirtualPath(activity, path)) {
@@ -466,7 +496,10 @@ class FilePickerDialog(
         }
 
         if (!activity.getDoesFilePathExist(path)) {
-            return termuxRootPath
+            return when (targetScope) {
+                TargetScope.LOCAL_ONLY, TargetScope.ANY -> preferredLocalRoot()
+                TargetScope.REMOTE_ONLY -> firstRemoteRoot ?: termuxRootPath
+            }
         }
 
         if (!activity.getIsPathDirectory(path)) {
@@ -474,10 +507,10 @@ class FilePickerDialog(
         }
 
         if (path.isEmpty()) {
-            return termuxRootPath
+            return preferredLocalRoot()
         }
 
-        return if (activity.getDoesFilePathExist(path)) path else termuxRootPath
+        return if (activity.getDoesFilePathExist(path)) path else preferredLocalRoot()
     }
 
     private fun buildWorkspaceItems(): ArrayList<FileDirItem> {
@@ -501,27 +534,45 @@ class FilePickerDialog(
             )
         }
 
-        addWorkspace("Termux", termuxRootPath)
+        if (targetScope != TargetScope.REMOTE_ONLY) {
+            addWorkspace("Termux", termuxRootPath)
 
-        val internal = activity.internalStoragePath.trimEnd('/')
-        if (internal.isNotEmpty() && activity.getDoesFilePathExist(internal)) {
-            addWorkspace("手机存储", internal)
-        }
+            val internal = activity.internalStoragePath.trimEnd('/')
+            if (internal.isNotEmpty() && activity.getDoesFilePathExist(internal)) {
+                addWorkspace("手机存储", internal)
+            }
 
-        activity.getStorageDirectories().forEach { root ->
-            val normalized = root.trimEnd('/')
-            if (normalized.isNotEmpty() && activity.getDoesFilePathExist(normalized)) {
-                addWorkspace("存储 / $normalized", normalized)
+            activity.getStorageDirectories().forEach { root ->
+                val normalized = root.trimEnd('/')
+                if (normalized.isNotEmpty() && activity.getDoesFilePathExist(normalized)) {
+                    addWorkspace("存储 / $normalized", normalized)
+                }
             }
         }
 
-        sessionFileCoordinator.listTargets(activity).forEach { target ->
-            if (target.entry.transport == SessionTransport.LOCAL) return@forEach
-            val root = FileRootResolver.resolveVirtualRoot(activity, target.entry)
-            addWorkspace("服务器 / ${target.entry.displayName}", root)
+        if (targetScope != TargetScope.LOCAL_ONLY) {
+            sessionFileCoordinator.listTargets(activity).forEach { target ->
+                if (target.entry.transport == SessionTransport.LOCAL) return@forEach
+                val root = FileRootResolver.resolveVirtualRoot(activity, target.entry)
+                addWorkspace("服务器 / ${target.entry.displayName}", root)
+            }
         }
 
         return items
+    }
+
+    private fun preferredLocalRoot(): String {
+        val internal = activity.internalStoragePath.trimEnd('/')
+        if (internal.isNotEmpty() && activity.getDoesFilePathExist(internal)) {
+            return internal
+        }
+        return termuxRootPath
+    }
+
+    private fun firstRemoteRoot(): String? {
+        return sessionFileCoordinator.listTargets(activity)
+            .firstOrNull { it.entry.transport != SessionTransport.LOCAL }
+            ?.let { FileRootResolver.resolveVirtualRoot(activity, it.entry) }
     }
 
     companion object {

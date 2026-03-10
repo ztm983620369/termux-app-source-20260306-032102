@@ -13,11 +13,13 @@ import org.fossify.filemanager.R
 import org.fossify.filemanager.activities.SimpleActivity
 import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.fragments.MyViewPagerFragment
+import org.fossify.filemanager.interfaces.FileManagerDependencies
 
 class ViewPagerAdapter(
     val activity: SimpleActivity,
     val tabsToShow: ArrayList<Int>,
-    private val intentProvider: () -> Intent
+    private val intentProvider: () -> Intent,
+    private val dependencies: FileManagerDependencies
 ) : PagerAdapter() {
     override fun instantiateItem(container: ViewGroup, position: Int): Any {
         val layout = getFragment(position)
@@ -49,6 +51,7 @@ class ViewPagerAdapter(
             this.isGetContentIntent = isGetContentIntent
             wantedMimeTypes = extraMimeTypes?.toList() ?: listOf(getContentMimeType)
             updateIsCreateDocumentIntent(isCreateDocumentIntent)
+            bindDependencies(dependencies)
 
             setupFragment(activity)
             onResume(activity.getProperTextColor())

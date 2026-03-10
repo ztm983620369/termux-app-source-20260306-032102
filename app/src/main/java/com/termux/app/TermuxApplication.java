@@ -77,6 +77,7 @@ public class TermuxApplication extends Application {
         }
 
         tuneLeakCanaryIfPresent();
+        SftpTransferRecoveryService.startIfNeeded(context);
     }
 
     public static void setLogConfig(Context context) {

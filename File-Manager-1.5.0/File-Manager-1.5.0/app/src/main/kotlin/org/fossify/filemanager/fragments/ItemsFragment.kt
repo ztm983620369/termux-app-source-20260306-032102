@@ -22,9 +22,10 @@ import org.fossify.filemanager.extensions.isPathOnRoot
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
 import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
-import org.fossify.filemanager.interfaces.FileManagerHost
+import org.fossify.filemanager.helpers.TermuxPathScope
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
+import com.termux.bridge.FileOpenRequest
 import com.termux.sessionsync.SessionFileCoordinator
 import com.termux.sessionsync.SftpProtocolManager
 import java.io.File
@@ -69,15 +70,15 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                     openPath(parent, forceRefresh = true)
                 }
                 pathBarHolder.setOnLongClickListener {
-                    (activity as? FileManagerHost)?.showSessionSwitcher()
+                    fileManagerControllerCommands.showSessionSwitcher()
                     true
                 }
                 itemsSwipeRefresh.setOnRefreshListener { refreshFragment() }
                 itemsFab.setOnClickListener {
                     if (isCreateDocumentIntent) {
-                        (activity as? FileManagerHost)?.createDocumentConfirmed(currentPath)
+                        fileManagerControllerCommands.createDocumentConfirmed(currentPath)
                     } else {
-                        (activity as? FileManagerHost)?.toggleMainFabMenu()
+                        fileManagerControllerCommands.toggleMainFabMenu()
                     }
                 }
                 itemsFab.beGone()
@@ -129,7 +130,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         if (realPath.isEmpty()) {
             realPath = "/"
         }
-        realPath = clampToTermuxRoot(realPath)
+        realPath = clampToVisiblePath(realPath)
 
         scrollStates[currentPath] = getScrollState()!!
         currentPath = realPath
@@ -157,7 +158,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
 
             itemsIgnoringSearch = listItems
             activity?.runOnUiThread {
-                (activity as? FileManagerHost)?.refreshMenuItems()
+                fileManagerControllerCommands.refreshMenuItems()
                 addItems(listItems, forceRefresh)
                 if (context != null && currentViewType != context!!.config.getFolderViewType(currentPath)) {
                     setupLayoutManager()
@@ -371,7 +372,21 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                     activity?.runOnUiThread {
                         hideProgressBar()
                         if (result.success) {
-                            clickedPath(result.localPath)
+                            val localPath = result.localPath
+                            val extension = item.name.substringAfterLast('.', "").lowercase().ifBlank { null }
+                            clickedPath(
+                                localPath,
+                                FileOpenRequest(
+                                    path = localPath,
+                                    displayName = item.name,
+                                    readOnly = false,
+                                    extension = extension,
+                                    mimeType = localPath.getMimeType(),
+                                    originType = FileOpenRequest.ORIGIN_SFTP_VIRTUAL,
+                                    originPath = item.path,
+                                    originDisplayPath = sessionFileCoordinator.getDisplayPath(context!!, item.path)
+                                )
+                            )
                         } else {
                             activity?.toast(result.messageCn)
                         }
@@ -389,7 +404,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     }
 
     private fun openDirectory(path: String) {
-        (activity as? FileManagerHost)?.openedDirectory()
+        fileManagerControllerCommands.openedDirectory()
         openPath(path)
     }
 
@@ -587,20 +602,20 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     private fun increaseColumnCount() {
         if (currentViewType == VIEW_TYPE_GRID) {
             context!!.config.fileColumnCnt += 1
-            (activity as? FileManagerHost)?.updateFragmentColumnCounts()
+            fileManagerControllerCommands.updateFragmentColumnCounts()
         }
     }
 
     private fun reduceColumnCount() {
         if (currentViewType == VIEW_TYPE_GRID) {
             context!!.config.fileColumnCnt -= 1
-            (activity as? FileManagerHost)?.updateFragmentColumnCounts()
+            fileManagerControllerCommands.updateFragmentColumnCounts()
         }
     }
 
     override fun columnCountChanged() {
         (binding.itemsList.layoutManager as MyGridLayoutManager).spanCount = context!!.config.fileColumnCnt
-        (activity as? FileManagerHost)?.refreshMenuItems()
+        fileManagerControllerCommands.refreshMenuItems()
         getRecyclerAdapter()?.apply {
             notifyItemRangeChanged(0, listItems.size)
         }
@@ -623,7 +638,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     }
 
     override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {
-        val normalizedTarget = clampToTermuxRoot(targetPath.trimEnd('/').ifEmpty { "/" })
+        val normalizedTarget = clampToVisiblePath(targetPath.trimEnd('/').ifEmpty { "/" })
         val normalizedHighlights = LinkedHashSet<String>()
         highlightPaths.forEach { raw ->
             val value = raw.trim().replace('\\', '/').trimEnd('/')
@@ -644,40 +659,40 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     }
 
     override fun selectedPaths(paths: ArrayList<String>) {
-        (activity as? FileManagerHost)?.pickedPaths(paths)
+        fileManagerResultHandler.pickedPaths(paths)
     }
 
-    private fun clampToTermuxRoot(path: String): String {
-        val root = context?.filesDir?.absolutePath?.trimEnd('/').orEmpty()
-        if (root.isEmpty()) return path
-
-        val normalized = path.trim().trimEnd('/').ifEmpty { root }
-        return if (normalized == root || normalized.startsWith("$root/")) normalized else root
+    private fun clampToVisiblePath(path: String): String {
+        val ctx = context ?: return TermuxPathScope.normalizePath(path)
+        val isTermuxScoped = fileManagerEnvironment.isTermuxScopedFileManager()
+        val fallback = if (isTermuxScoped) TermuxPathScope.preferredLocalRoot(ctx) else "/"
+        return TermuxPathScope.clampVisiblePath(ctx, path, fallback, isTermuxScoped)
     }
 
     private fun resolveParentPathForNavigation(rawPath: String): String {
         val ctx = context ?: return "/"
-        val root = ctx.filesDir.absolutePath.trimEnd('/')
-        val current = rawPath.trimEnd('/').ifEmpty { root }
+        val isTermuxScoped = fileManagerEnvironment.isTermuxScopedFileManager()
+        val localRoot = if (isTermuxScoped) TermuxPathScope.preferredLocalRoot(ctx) else "/"
+        val current = TermuxPathScope.normalizePath(rawPath).ifEmpty { localRoot }
 
-        if (current == "/" || current == root) {
-            return root
+        if (current == "/" || (isTermuxScoped && current == localRoot)) {
+            return localRoot
         }
 
-        if (isVirtualWorkspaceRoot(ctx, current, root)) {
+        if (isVirtualWorkspaceRoot(ctx, current)) {
             return current
         }
 
         var parent = current.getParentPath().trimEnd('/')
-        if (parent.isEmpty()) {
-            parent = root
+        if (parent.isEmpty() || parent == "/") {
+            parent = localRoot
         }
-        return parent
+        return if (isTermuxScoped) TermuxPathScope.clampVisiblePath(ctx, parent, localRoot, true) else parent
     }
 
-    private fun isVirtualWorkspaceRoot(ctx: Context, current: String, root: String): Boolean {
+    private fun isVirtualWorkspaceRoot(ctx: Context, current: String): Boolean {
         if (!sessionFileCoordinator.isVirtualPath(ctx, current)) return false
-        val virtualPrefix = "$root/.termux/sftp-virtual/"
+        val virtualPrefix = "${TermuxPathScope.termuxRootPath(ctx)}/.termux/sftp-virtual/"
         if (!current.startsWith(virtualPrefix)) return false
         val tail = current.removePrefix(virtualPrefix)
         return tail.isNotEmpty() && !tail.contains("/")

@@ -15,8 +15,12 @@ import com.jcraft.jsch.SftpException;
 import com.jcraft.jsch.SftpProgressMonitor;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -27,14 +31,19 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.security.MessageDigest;
 import java.util.Set;
 import java.util.Vector;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -49,10 +58,22 @@ public final class SftpProtocolManager {
     private static final int DIRECTORY_CACHE_MAX_ENTRIES = 384;
     private static final int RECOVERABLE_RETRY_COUNT = 1;
     private static final int MAX_CHANNEL_POOL_PER_CLIENT = 3;
+    private static final int MAX_TRANSFER_WORKERS = 3;
     private static final long CHANNEL_IDLE_TTL_MS = 18_000L;
     private static final int PREWARM_MAX_THREADS = 2;
     private static final AtomicInteger PREWARM_THREAD_COUNTER = new AtomicInteger(1);
+    private static final AtomicInteger TRANSFER_THREAD_COUNTER = new AtomicInteger(1);
+    private static final AtomicInteger TRANSFER_TEMP_COUNTER = new AtomicInteger(1);
+    private static final long FULL_DIGEST_VERIFY_MAX_BYTES = 2L * 1024L * 1024L;
+    private static final int SAMPLE_DIGEST_VERIFY_BYTES = 256 * 1024;
+    private static final int TRANSFER_DIGEST_BUFFER_BYTES = 32 * 1024;
     private static final long DOWNLOAD_PROGRESS_MIN_INTERVAL_MS = 120L;
+    private static final ThreadLocal<Integer> SUPPRESS_TRANSFER_JOURNAL_DEPTH = new ThreadLocal<Integer>() {
+        @Override
+        protected Integer initialValue() {
+            return 0;
+        }
+    };
     private static final Set<String> SSH_OPTIONS_WITH_VALUE = new HashSet<>(Arrays.asList(
         "-b", "-c", "-D", "-E", "-F", "-I", "-i", "-J", "-L", "-l",
         "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"
@@ -90,6 +111,27 @@ public final class SftpProtocolManager {
         );
         executor.allowCoreThreadTimeOut(true);
         return executor;
+    }
+
+    @NonNull
+    private static ExecutorService createTransferExecutor(@NonNull String prefix, int workerCount) {
+        int safeWorkers = Math.max(1, workerCount);
+        ThreadFactory threadFactory = runnable -> {
+            Thread thread = new Thread(
+                runnable,
+                prefix + "-" + TRANSFER_THREAD_COUNTER.getAndIncrement()
+            );
+            thread.setPriority(Math.max(Thread.MIN_PRIORITY + 1, Thread.NORM_PRIORITY - 1));
+            return thread;
+        };
+        return new ThreadPoolExecutor(
+            safeWorkers,
+            safeWorkers,
+            20L,
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(),
+            threadFactory
+        );
     }
 
     public boolean isVirtualPath(@NonNull Context context, @Nullable String path) {
@@ -310,11 +352,71 @@ public final class SftpProtocolManager {
     }
 
     @NonNull
+    public DeleteResult deleteVirtualPath(@NonNull Context context, @Nullable String virtualPath) {
+        VirtualTarget target = resolveVirtualTarget(context, virtualPath);
+        if (target == null) {
+            return DeleteResult.fail("\u5220\u9664\u5931\u8d25\uff1a\u76ee\u6807\u4e0d\u662f\u6709\u6548\u7684 SFTP \u8def\u5f84\u3002");
+        }
+        if ("/".equals(target.remotePath)) {
+            return DeleteResult.fail("\u5220\u9664\u5931\u8d25\uff1a\u4e0d\u5141\u8bb8\u5220\u9664\u8fdc\u7a0b\u6839\u76ee\u5f55\u3002");
+        }
+
+        try {
+            withReconnectRetry(context, target.entry, channel -> {
+                deleteRemotePathRecursive(channel, target.remotePath);
+                return null;
+            });
+
+            synchronized (mLock) {
+                clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(target.entry));
+            }
+            String localPath = target.virtualRoot + ("/".equals(target.remotePath) ? "" : target.remotePath);
+            return DeleteResult.ok(localPath);
+        } catch (Exception e) {
+            clearSessionByEntry(target.entry);
+            return DeleteResult.fail("\u5220\u9664\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
+        }
+    }
+
+    @NonNull
     public DownloadResult downloadVirtualPaths(@NonNull Context context,
                                                @NonNull List<String> virtualPaths,
                                                @NonNull String destinationDir,
                                                @Nullable DownloadProgressListener listener,
                                                @Nullable DownloadControl control) {
+        return downloadVirtualPathsInternal(
+            context,
+            virtualPaths,
+            destinationDir,
+            listener,
+            control,
+            false
+        );
+    }
+
+    @NonNull
+    DownloadResult resumeDownloadVirtualPaths(@NonNull Context context,
+                                              @NonNull List<String> virtualPaths,
+                                              @NonNull String destinationDir,
+                                              @Nullable DownloadProgressListener listener,
+                                              @Nullable DownloadControl control) {
+        return downloadVirtualPathsInternal(
+            context,
+            virtualPaths,
+            destinationDir,
+            listener,
+            control,
+            true
+        );
+    }
+
+    @NonNull
+    private DownloadResult downloadVirtualPathsInternal(@NonNull Context context,
+                                                        @NonNull List<String> virtualPaths,
+                                                        @NonNull String destinationDir,
+                                                        @Nullable DownloadProgressListener listener,
+                                                        @Nullable DownloadControl control,
+                                                        boolean resumeExistingOutputs) {
         if (virtualPaths.isEmpty()) {
             return DownloadResult.fail("\u672a\u9009\u62e9\u9700\u8981\u4e0b\u8f7d\u7684\u6587\u4ef6\u3002");
         }
@@ -346,7 +448,9 @@ public final class SftpProtocolManager {
             String topName = topLevelNameForTarget(target);
             if (TextUtils.isEmpty(topName)) topName = target.entry.displayName;
             File desiredTopLevel = new File(destinationRoot, topName);
-            File topLevelLocal = ensureUniqueDestinationRoot(desiredTopLevel, reservedTopLevelPaths);
+            File topLevelLocal = resumeExistingOutputs
+                ? reserveDestinationRoot(desiredTopLevel, reservedTopLevelPaths)
+                : ensureUniqueDestinationRoot(desiredTopLevel, reservedTopLevelPaths);
 
             try {
                 collectDownloadTasks(context, target, topLevelLocal, tasks,
@@ -387,111 +491,142 @@ public final class SftpProtocolManager {
             if (task.size > 0) totalBytes += task.size;
         }
 
-        DownloadProgressState progressState = new DownloadProgressState(tasks.size(), totalBytes);
-        emitDownloadProgress(listener, progressState, true);
+        String journalSessionKey = null;
+        if (!tasks.isEmpty() && tasks.get(0) != null) {
+            journalSessionKey = clientKeyForEntry(tasks.get(0).entry);
+        }
+        SftpTransferJournal.TaskHandle journalHandle = isTransferJournalSuppressed() ? null
+            : SftpTransferJournal.getInstance().startTask(
+                context,
+                SftpTransferJournal.TaskKind.DOWNLOAD,
+                journalSessionKey,
+                destinationDir,
+                tasks.size(),
+                totalBytes
+            );
+        SftpTransferJournal.getInstance().configureTask(context, journalHandle, virtualPaths, destinationDir);
+        DownloadProgressListener effectiveListener = wrapDownloadProgressListener(context, journalHandle, listener);
 
-        int downloadedFiles = 0;
-        int failedFiles = 0;
-        long downloadedBytes = 0L;
+        ConcurrentTransferProgressState progressState = new ConcurrentTransferProgressState(tasks.size(), totalBytes);
+        emitDownloadProgress(effectiveListener, progressState, true);
+
         String firstDownloadError = null;
+        ArrayList<PreparedDownloadTask> preparedTasks = new ArrayList<>(tasks.size());
 
         for (DownloadFileTask task : tasks) {
             if (task == null) continue;
 
-            File outputFile = resolveNonConflictingFile(task.localFile);
+            File outputFile = resumeExistingOutputs
+                ? task.localFile
+                : resolveNonConflictingFile(task.localFile);
             File parent = outputFile.getParentFile();
             if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
-                failedFiles++;
+                progressState.onFileFailed(outputFile.getAbsolutePath(), outputFile.getName(), task.size);
+                emitDownloadProgress(listener, progressState, true);
                 if (firstDownloadError == null) {
                     firstDownloadError = "\u65e0\u6cd5\u521b\u5efa\u672c\u5730\u76ee\u5f55\u3002";
                 }
-                progressState.completedFiles = downloadedFiles;
-                progressState.failedFiles = failedFiles;
-                progressState.downloadedBytes = downloadedBytes;
-                progressState.currentFile = outputFile.getName();
-                progressState.currentFileSize = Math.max(0L, task.size);
-                progressState.currentFileTransferred = 0L;
-                emitDownloadProgress(listener, progressState, true);
                 continue;
             }
 
-            progressState.completedFiles = downloadedFiles;
-            progressState.failedFiles = failedFiles;
-            progressState.downloadedBytes = downloadedBytes;
-            progressState.currentFile = outputFile.getName();
-            progressState.currentFileSize = Math.max(0L, task.size);
-            progressState.currentFileTransferred = 0L;
-            emitDownloadProgress(listener, progressState, true);
+            preparedTasks.add(new PreparedDownloadTask(task, outputFile));
+        }
+
+        if (!preparedTasks.isEmpty()) {
+            AtomicBoolean internalCancelled = new AtomicBoolean(false);
+            DownloadControl effectiveControl = () -> internalCancelled.get() || isCancelled(control);
+            ExecutorService executor = createTransferExecutor("sftp-download",
+                resolveTransferWorkerCount(preparedTasks.size()));
+            ExecutorCompletionService<DownloadTaskResult> completionService =
+                new ExecutorCompletionService<>(executor);
+            ArrayList<Future<DownloadTaskResult>> futures = new ArrayList<>(preparedTasks.size());
+            int submittedCount = 0;
 
             try {
-                long fileBytes = downloadSingleFile(context, task.entry, task.remotePath, outputFile,
-                    progressState, listener, control);
-                downloadedFiles++;
-                downloadedBytes += Math.max(0L, fileBytes);
+                for (PreparedDownloadTask task : preparedTasks) {
+                    futures.add(completionService.submit(() ->
+                        performDownloadTask(context, task, progressState, effectiveListener, effectiveControl, journalHandle)));
+                    submittedCount++;
+                }
+            } catch (RejectedExecutionException e) {
+                internalCancelled.set(true);
+                cancelTransferFutures(futures, executor);
+                DownloadResult result = DownloadResult.fail("\u4e0b\u8f7d\u5931\u8d25\uff1a\u4f20\u8f93\u7ebf\u7a0b\u6c60\u521d\u59cb\u5316\u5931\u8d25\u3002");
+                finishDownloadJournal(context, journalHandle, result);
+                return result;
+            }
 
-                if (task.modifiedMs > 0) {
-                    try {
-                        outputFile.setLastModified(task.modifiedMs);
-                    } catch (Throwable ignored) {
-                    }
+            try {
+                for (int index = 0; index < submittedCount; index++) {
+                    DownloadTaskResult result = completionService.take().get();
+                if (result.cancelled) {
+                    internalCancelled.set(true);
+                    cancelTransferFutures(futures, executor);
+                    DownloadResult cancelled = DownloadResult.cancelled(
+                        tasks.size(),
+                        progressState.completedFiles(),
+                        progressState.failedFiles(),
+                        totalBytes,
+                        progressState.settledBytes()
+                    );
+                    finishDownloadJournal(context, journalHandle, cancelled);
+                    return cancelled;
                 }
-
-                progressState.completedFiles = downloadedFiles;
-                progressState.failedFiles = failedFiles;
-                progressState.downloadedBytes = downloadedBytes;
-                progressState.currentFileTransferred =
-                    progressState.currentFileSize > 0
-                        ? progressState.currentFileSize
-                        : Math.max(fileBytes, progressState.currentFileTransferred);
-                emitDownloadProgress(listener, progressState, true);
-            } catch (Exception e) {
-                if (e instanceof OperationCanceledException) {
-                    try {
-                        if (outputFile.exists()) outputFile.delete();
-                    } catch (Throwable ignored) {
-                    }
-                    return DownloadResult.cancelled(tasks.size(), downloadedFiles, failedFiles, totalBytes, downloadedBytes);
+                if (!result.success && firstDownloadError == null && !TextUtils.isEmpty(result.errorMessage)) {
+                    firstDownloadError = result.errorMessage;
                 }
-                failedFiles++;
-                if (firstDownloadError == null) {
-                    firstDownloadError = classifyExceptionMessage(e);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            internalCancelled.set(true);
+            cancelTransferFutures(futures, executor);
+            DownloadResult cancelled = DownloadResult.cancelled(
+                tasks.size(),
+                progressState.completedFiles(),
+                progressState.failedFiles(),
+                totalBytes,
+                progressState.settledBytes()
+            );
+            finishDownloadJournal(context, journalHandle, cancelled);
+            return cancelled;
+        } catch (Exception e) {
+            internalCancelled.set(true);
+            cancelTransferFutures(futures, executor);
+            if (firstDownloadError == null) {
+                Throwable cause = e.getCause() == null ? e : e.getCause();
+                    firstDownloadError = classifyExceptionMessage(cause);
                 }
-                try {
-                    if (outputFile.exists()) {
-                        // keep destination clean on failed transfer
-                        outputFile.delete();
-                    }
-                } catch (Throwable ignored) {
-                }
-                progressState.completedFiles = downloadedFiles;
-                progressState.failedFiles = failedFiles;
-                progressState.downloadedBytes = downloadedBytes;
-                progressState.currentFileTransferred = 0L;
-                emitDownloadProgress(listener, progressState, true);
+            } finally {
+                shutdownTransferExecutor(executor);
             }
         }
 
-        progressState.completedFiles = downloadedFiles;
-        progressState.failedFiles = failedFiles;
-        progressState.downloadedBytes = downloadedBytes;
-        progressState.currentFile = "";
-        progressState.currentFileSize = 0L;
-        progressState.currentFileTransferred = 0L;
-        emitDownloadProgress(listener, progressState, true);
+        progressState.onTransferFinished();
+        emitDownloadProgress(effectiveListener, progressState, true);
+
+        int downloadedFiles = progressState.completedFiles();
+        int failedFiles = progressState.failedFiles();
+        long downloadedBytes = progressState.settledBytes();
 
         if (failedFiles == 0) {
-            return DownloadResult.ok(tasks.size(), downloadedFiles, 0, totalBytes, downloadedBytes);
+            DownloadResult result = DownloadResult.ok(tasks.size(), downloadedFiles, 0, totalBytes, downloadedBytes);
+            finishDownloadJournal(context, journalHandle, result);
+            return result;
         }
 
         String reason = TextUtils.isEmpty(firstDownloadError)
             ? "\u8bf7\u68c0\u67e5\u7f51\u7edc\u548c\u8ba4\u8bc1\u540e\u91cd\u8bd5\u3002"
             : firstDownloadError;
         if (downloadedFiles > 0) {
-            return DownloadResult.partial(tasks.size(), downloadedFiles, failedFiles, totalBytes, downloadedBytes,
+            DownloadResult result = DownloadResult.partial(tasks.size(), downloadedFiles, failedFiles, totalBytes, downloadedBytes,
                 "\u90e8\u5206\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25\uff1a" + reason);
+            finishDownloadJournal(context, journalHandle, result);
+            return result;
         }
-        return DownloadResult.failWithStats(tasks.size(), 0, failedFiles, totalBytes, downloadedBytes,
+        DownloadResult result = DownloadResult.failWithStats(tasks.size(), 0, failedFiles, totalBytes, downloadedBytes,
             "\u4e0b\u8f7d\u5931\u8d25\uff1a" + reason);
+        finishDownloadJournal(context, journalHandle, result);
+        return result;
     }
 
     @NonNull
@@ -603,83 +738,503 @@ public final class SftpProtocolManager {
             if (task.size > 0) totalBytes += task.size;
         }
 
-        UploadProgressState progressState = new UploadProgressState(tasks.size(), totalBytes);
-        emitUploadProgress(listener, progressState, true);
+        String journalSessionKey = clientKeyForEntry(destination.entry);
+        SftpTransferJournal.TaskHandle journalHandle = isTransferJournalSuppressed() ? null
+            : SftpTransferJournal.getInstance().startTask(
+                context,
+                SftpTransferJournal.TaskKind.UPLOAD,
+                journalSessionKey,
+                destinationVirtualDir,
+                tasks.size(),
+                totalBytes
+            );
+        SftpTransferJournal.getInstance().configureTask(context, journalHandle, localPaths, destinationVirtualDir);
+        UploadProgressListener effectiveListener = wrapUploadProgressListener(context, journalHandle, listener);
 
-        int uploadedFiles = 0;
-        int failedFiles = 0;
-        long uploadedBytes = 0L;
+        ConcurrentTransferProgressState progressState = new ConcurrentTransferProgressState(tasks.size(), totalBytes);
+        emitUploadProgress(effectiveListener, progressState, true);
+
         String firstUploadError = null;
+        AtomicBoolean internalCancelled = new AtomicBoolean(false);
+        UploadControl effectiveControl = () -> internalCancelled.get() || isCancelled(control);
+        ExecutorService executor = createTransferExecutor("sftp-upload", resolveTransferWorkerCount(tasks.size()));
+        ExecutorCompletionService<UploadTaskResult> completionService =
+            new ExecutorCompletionService<>(executor);
+        ArrayList<Future<UploadTaskResult>> futures = new ArrayList<>(tasks.size());
+        int submittedCount = 0;
 
-        for (UploadFileTask task : tasks) {
-            if (task == null) continue;
-
-            if (isCancelled(control)) {
-                return UploadResult.cancelled(tasks.size(), uploadedFiles, failedFiles, totalBytes, uploadedBytes);
+        try {
+            for (UploadFileTask task : tasks) {
+                if (task == null) continue;
+                futures.add(completionService.submit(() ->
+                    performUploadTask(context, destination.entry, task, progressState, effectiveListener, effectiveControl, journalHandle)));
+                submittedCount++;
             }
+        } catch (RejectedExecutionException e) {
+            internalCancelled.set(true);
+            cancelTransferFutures(futures, executor);
+            UploadResult result = UploadResult.fail("\u4e0a\u4f20\u5931\u8d25\uff1a\u4f20\u8f93\u7ebf\u7a0b\u6c60\u521d\u59cb\u5316\u5931\u8d25\u3002");
+            finishUploadJournal(context, journalHandle, result);
+            return result;
+        }
 
-            progressState.completedFiles = uploadedFiles;
-            progressState.failedFiles = failedFiles;
-            progressState.uploadedBytes = uploadedBytes;
-            progressState.currentFile = task.localFile.getName();
-            progressState.currentFileSize = Math.max(0L, task.size);
-            progressState.currentFileTransferred = 0L;
-            emitUploadProgress(listener, progressState, true);
-
-            try {
-                long fileBytes = uploadSingleFile(context, destination.entry, task, progressState, listener, control);
-                uploadedFiles++;
-                uploadedBytes += Math.max(0L, fileBytes);
-
-                progressState.completedFiles = uploadedFiles;
-                progressState.failedFiles = failedFiles;
-                progressState.uploadedBytes = uploadedBytes;
-                progressState.currentFileTransferred =
-                    progressState.currentFileSize > 0
-                        ? progressState.currentFileSize
-                        : Math.max(fileBytes, progressState.currentFileTransferred);
-                emitUploadProgress(listener, progressState, true);
-            } catch (Exception e) {
-                if (e instanceof OperationCanceledException) {
-                    return UploadResult.cancelled(tasks.size(), uploadedFiles, failedFiles, totalBytes, uploadedBytes);
+        try {
+            for (int index = 0; index < submittedCount; index++) {
+                UploadTaskResult result = completionService.take().get();
+                if (result.cancelled) {
+                    internalCancelled.set(true);
+                    cancelTransferFutures(futures, executor);
+                    UploadResult cancelled = UploadResult.cancelled(
+                        tasks.size(),
+                        progressState.completedFiles(),
+                        progressState.failedFiles(),
+                        totalBytes,
+                        progressState.settledBytes()
+                    );
+                    finishUploadJournal(context, journalHandle, cancelled);
+                    return cancelled;
                 }
-                failedFiles++;
-                if (firstUploadError == null) {
-                    firstUploadError = classifyExceptionMessage(e);
+                if (!result.success && firstUploadError == null && !TextUtils.isEmpty(result.errorMessage)) {
+                    firstUploadError = result.errorMessage;
                 }
-                progressState.completedFiles = uploadedFiles;
-                progressState.failedFiles = failedFiles;
-                progressState.uploadedBytes = uploadedBytes;
-                progressState.currentFileTransferred = 0L;
-                emitUploadProgress(listener, progressState, true);
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            internalCancelled.set(true);
+            cancelTransferFutures(futures, executor);
+            UploadResult cancelled = UploadResult.cancelled(
+                tasks.size(),
+                progressState.completedFiles(),
+                progressState.failedFiles(),
+                totalBytes,
+                progressState.settledBytes()
+            );
+            finishUploadJournal(context, journalHandle, cancelled);
+            return cancelled;
+        } catch (Exception e) {
+            internalCancelled.set(true);
+            cancelTransferFutures(futures, executor);
+            if (firstUploadError == null) {
+                Throwable cause = e.getCause() == null ? e : e.getCause();
+                firstUploadError = classifyExceptionMessage(cause);
+            }
+        } finally {
+            shutdownTransferExecutor(executor);
         }
 
         synchronized (mLock) {
             clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(destination.entry));
         }
 
-        progressState.completedFiles = uploadedFiles;
-        progressState.failedFiles = failedFiles;
-        progressState.uploadedBytes = uploadedBytes;
-        progressState.currentFile = "";
-        progressState.currentFileSize = 0L;
-        progressState.currentFileTransferred = 0L;
-        emitUploadProgress(listener, progressState, true);
+        progressState.onTransferFinished();
+        emitUploadProgress(effectiveListener, progressState, true);
+
+        int uploadedFiles = progressState.completedFiles();
+        int failedFiles = progressState.failedFiles();
+        long uploadedBytes = progressState.settledBytes();
 
         if (failedFiles == 0) {
-            return UploadResult.ok(tasks.size(), uploadedFiles, 0, totalBytes, uploadedBytes);
+            UploadResult result = UploadResult.ok(tasks.size(), uploadedFiles, 0, totalBytes, uploadedBytes);
+            finishUploadJournal(context, journalHandle, result);
+            return result;
         }
 
         String reason = TextUtils.isEmpty(firstUploadError)
             ? "\u8bf7\u68c0\u67e5\u7f51\u7edc\u548c\u8ba4\u8bc1\u540e\u91cd\u8bd5\u3002"
             : firstUploadError;
         if (uploadedFiles > 0) {
-            return UploadResult.partial(tasks.size(), uploadedFiles, failedFiles, totalBytes, uploadedBytes,
+            UploadResult result = UploadResult.partial(tasks.size(), uploadedFiles, failedFiles, totalBytes, uploadedBytes,
                 "\u90e8\u5206\u6587\u4ef6\u4e0a\u4f20\u5931\u8d25\uff1a" + reason);
+            finishUploadJournal(context, journalHandle, result);
+            return result;
         }
-        return UploadResult.failWithStats(tasks.size(), 0, failedFiles, totalBytes, uploadedBytes,
+        UploadResult result = UploadResult.failWithStats(tasks.size(), 0, failedFiles, totalBytes, uploadedBytes,
             "\u4e0a\u4f20\u5931\u8d25\uff1a" + reason);
+        finishUploadJournal(context, journalHandle, result);
+        return result;
+    }
+
+    @NonNull
+    public RemoteTransferResult transferVirtualPaths(@NonNull Context context,
+                                                     @NonNull List<String> sourceVirtualPaths,
+                                                     @NonNull String destinationVirtualDir,
+                                                     @Nullable RemoteTransferProgressListener listener,
+                                                     @Nullable RemoteTransferControl control) {
+        return transferVirtualPathsInternal(
+            context,
+            sourceVirtualPaths,
+            destinationVirtualDir,
+            null,
+            listener,
+            control
+        );
+    }
+
+    @NonNull
+    RemoteTransferResult resumeTransferVirtualPaths(@NonNull Context context,
+                                                    @NonNull List<String> sourceVirtualPaths,
+                                                    @NonNull String destinationVirtualDir,
+                                                    @Nullable String stageDirectoryPath,
+                                                    @Nullable RemoteTransferProgressListener listener,
+                                                    @Nullable RemoteTransferControl control) {
+        return transferVirtualPathsInternal(
+            context,
+            sourceVirtualPaths,
+            destinationVirtualDir,
+            stageDirectoryPath,
+            listener,
+            control
+        );
+    }
+
+    @NonNull
+    private RemoteTransferResult transferVirtualPathsInternal(@NonNull Context context,
+                                                              @NonNull List<String> sourceVirtualPaths,
+                                                              @NonNull String destinationVirtualDir,
+                                                              @Nullable String stageDirectoryPath,
+                                                              @Nullable RemoteTransferProgressListener listener,
+                                                              @Nullable RemoteTransferControl control) {
+        if (sourceVirtualPaths.isEmpty()) {
+            return RemoteTransferResult.fail("\u672a\u9009\u62e9\u9700\u8981\u4e92\u4f20\u7684\u670d\u52a1\u5668\u6587\u4ef6\u3002");
+        }
+
+        VirtualTarget destinationTarget = resolveVirtualTarget(context, destinationVirtualDir);
+        String journalSessionKey = destinationTarget == null ? null : clientKeyForEntry(destinationTarget.entry);
+        SftpTransferJournal.TaskHandle journalHandle = isTransferJournalSuppressed() ? null
+            : SftpTransferJournal.getInstance().startTask(
+                context,
+                SftpTransferJournal.TaskKind.RELAY,
+                journalSessionKey,
+                destinationVirtualDir,
+                sourceVirtualPaths.size(),
+                0L
+            );
+        SftpTransferJournal.getInstance().configureTask(context, journalHandle, sourceVirtualPaths, destinationVirtualDir);
+        RemoteTransferProgressListener effectiveListener =
+            wrapRemoteTransferProgressListener(context, journalHandle, listener);
+
+        RemoteTransferWorkflowStateMachine workflow = new RemoteTransferWorkflowStateMachine();
+        workflow.beginPreparing();
+        emitRemoteTransferProgress(effectiveListener, workflow.snapshot());
+
+        RemoteTransferResult finalResult = null;
+        File stagingDirectory = null;
+        boolean resumeExistingStage = !TextUtils.isEmpty(stageDirectoryPath);
+        try {
+            if (isCancelled(control)) {
+                finalResult = RemoteTransferResult.cancelled(0, 0, 0, 0L, 0L);
+                return finalResult;
+            }
+
+            stagingDirectory = resumeExistingStage
+                ? ensureRecoveryStageDirectory(stageDirectoryPath)
+                : createRemoteTransferStagingDirectory(context);
+            SftpTransferJournal.getInstance().attachStageDirectory(
+                context,
+                journalHandle,
+                stagingDirectory.getAbsolutePath()
+            );
+            pushTransferJournalSuppressed();
+            DownloadResult downloadResult;
+            try {
+                DownloadProgressListener relayDownloadListener = progress -> {
+                    workflow.bindDownload(progress);
+                    emitRemoteTransferProgress(effectiveListener, workflow.snapshot());
+                };
+                DownloadControl relayDownloadControl = () -> isCancelled(control);
+                downloadResult = resumeExistingStage
+                    ? resumeDownloadVirtualPaths(
+                        context,
+                        sourceVirtualPaths,
+                        stagingDirectory.getAbsolutePath(),
+                        relayDownloadListener,
+                        relayDownloadControl
+                    )
+                    : downloadVirtualPaths(
+                        context,
+                        sourceVirtualPaths,
+                        stagingDirectory.getAbsolutePath(),
+                        relayDownloadListener,
+                        relayDownloadControl
+                    );
+            } finally {
+                popTransferJournalSuppressed();
+            }
+
+            if (isCancelled(control) || isCancelledMessage(downloadResult.messageCn)) {
+                finalResult = RemoteTransferResult.cancelled(
+                    downloadResult.totalFiles,
+                    downloadResult.downloadedFiles,
+                    downloadResult.failedFiles,
+                    downloadResult.totalBytes,
+                    downloadResult.downloadedBytes
+                );
+                return finalResult;
+            }
+
+            if (!downloadResult.success) {
+                finalResult = RemoteTransferResult.failWithStats(
+                    downloadResult.totalFiles,
+                    downloadResult.downloadedFiles,
+                    downloadResult.failedFiles,
+                    downloadResult.totalBytes,
+                    downloadResult.downloadedBytes,
+                    downloadResult.messageCn
+                );
+                return finalResult;
+            }
+
+            ArrayList<String> stagedLocalPaths = collectTopLevelStagedPaths(stagingDirectory);
+            pushTransferJournalSuppressed();
+            UploadResult uploadResult;
+            try {
+                uploadResult = uploadLocalPathsToVirtual(
+                    context,
+                    stagedLocalPaths,
+                    destinationVirtualDir,
+                    progress -> {
+                        workflow.bindUpload(progress);
+                        emitRemoteTransferProgress(effectiveListener, workflow.snapshot());
+                    },
+                    () -> isCancelled(control)
+                );
+            } finally {
+                popTransferJournalSuppressed();
+            }
+
+            if (isCancelled(control) || isCancelledMessage(uploadResult.messageCn)) {
+                finalResult = RemoteTransferResult.cancelled(
+                    uploadResult.totalFiles,
+                    uploadResult.uploadedFiles,
+                    uploadResult.failedFiles,
+                    uploadResult.totalBytes,
+                    uploadResult.uploadedBytes
+                );
+                return finalResult;
+            }
+
+            if (uploadResult.success) {
+                finalResult = RemoteTransferResult.ok(
+                    uploadResult.totalFiles,
+                    uploadResult.uploadedFiles,
+                    uploadResult.failedFiles,
+                    uploadResult.totalBytes,
+                    uploadResult.uploadedBytes
+                );
+                return finalResult;
+            }
+
+            finalResult = RemoteTransferResult.failWithStats(
+                uploadResult.totalFiles,
+                uploadResult.uploadedFiles,
+                uploadResult.failedFiles,
+                uploadResult.totalBytes,
+                uploadResult.uploadedBytes,
+                uploadResult.messageCn
+            );
+            return finalResult;
+        } catch (Exception e) {
+            finalResult = RemoteTransferResult.fail("\u670d\u52a1\u5668\u4e92\u4f20\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
+            return finalResult;
+        } finally {
+            workflow.beginCleanup(finalResult == null ? "" : finalResult.messageCn);
+            emitRemoteTransferProgress(effectiveListener, workflow.snapshot());
+            deleteDirectoryContents(stagingDirectory);
+
+            if (finalResult == null) {
+                finalResult = RemoteTransferResult.fail("\u670d\u52a1\u5668\u4e92\u4f20\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5\u3002");
+            }
+
+            if (finalResult.success) {
+                workflow.markCompleted(
+                    finalResult.totalFiles,
+                    finalResult.transferredFiles,
+                    finalResult.failedFiles,
+                    finalResult.totalBytes,
+                    finalResult.transferredBytes,
+                    finalResult.messageCn
+                );
+            } else if (isCancelledMessage(finalResult.messageCn)) {
+                workflow.markCancelled(
+                    finalResult.totalFiles,
+                    finalResult.transferredFiles,
+                    finalResult.failedFiles,
+                    finalResult.totalBytes,
+                    finalResult.transferredBytes,
+                    finalResult.messageCn
+                );
+            } else {
+                workflow.markFailed(
+                    finalResult.totalFiles,
+                    finalResult.transferredFiles,
+                    finalResult.failedFiles,
+                    finalResult.totalBytes,
+                    finalResult.transferredBytes,
+                    finalResult.messageCn
+                );
+            }
+            emitRemoteTransferProgress(effectiveListener, workflow.snapshot());
+            finishRemoteTransferJournal(context, journalHandle, finalResult);
+        }
+    }
+
+    private UploadTaskResult performUploadTask(@NonNull Context context,
+                                               @NonNull SessionEntry entry,
+                                               @NonNull UploadFileTask task,
+                                               @NonNull ConcurrentTransferProgressState progressState,
+                                               @Nullable UploadProgressListener listener,
+                                               @Nullable UploadControl control,
+                                               @Nullable SftpTransferJournal.TaskHandle journalHandle) {
+        String localDisplayName = task.localFile.getName();
+        final String displayName = TextUtils.isEmpty(localDisplayName) ? task.remotePath : localDisplayName;
+        final long declaredSize = Math.max(0L, task.size);
+        final String taskKey = task.remotePath;
+
+        UploadProgressState workerProgress = new UploadProgressState(1, declaredSize);
+        workerProgress.currentFile = displayName;
+        workerProgress.currentFileSize = declaredSize;
+
+        progressState.onFileStarted(taskKey, displayName, declaredSize);
+        emitUploadProgress(listener, progressState, true);
+
+        UploadProgressListener relayListener = progress -> {
+            String currentDisplayName = TextUtils.isEmpty(progress.currentFile)
+                ? displayName
+                : progress.currentFile;
+            progressState.onFileProgress(
+                taskKey,
+                currentDisplayName,
+                Math.max(workerProgress.currentFileSize, progress.currentFileSize),
+                progress.currentFileTransferred
+            );
+            emitUploadProgress(listener, progressState, false);
+        };
+
+        try {
+            long fileBytes = uploadSingleFile(context, entry, task, workerProgress, relayListener, control, journalHandle);
+            long finalSize = workerProgress.currentFileSize > 0
+                ? workerProgress.currentFileSize
+                : Math.max(declaredSize, fileBytes);
+            progressState.onFileSucceeded(taskKey, displayName, finalSize, fileBytes);
+            emitUploadProgress(listener, progressState, true);
+            return UploadTaskResult.success(fileBytes);
+        } catch (Exception e) {
+            if (e instanceof OperationCanceledException || isCancelled(control)) {
+                progressState.onFileCancelled(taskKey, displayName, workerProgress.currentFileSize);
+                emitUploadProgress(listener, progressState, true);
+                return UploadTaskResult.cancelled();
+            }
+            progressState.onFileFailed(taskKey, displayName, workerProgress.currentFileSize);
+            emitUploadProgress(listener, progressState, true);
+            return UploadTaskResult.failure(classifyExceptionMessage(e));
+        }
+    }
+
+    private DownloadTaskResult performDownloadTask(@NonNull Context context,
+                                                   @NonNull PreparedDownloadTask preparedTask,
+                                                   @NonNull ConcurrentTransferProgressState progressState,
+                                                   @Nullable DownloadProgressListener listener,
+                                                   @Nullable DownloadControl control,
+                                                   @Nullable SftpTransferJournal.TaskHandle journalHandle) {
+        DownloadFileTask task = preparedTask.task;
+        File outputFile = preparedTask.outputFile;
+        final String displayName = outputFile.getName();
+        final long declaredSize = Math.max(0L, task.size);
+        final String taskKey = outputFile.getAbsolutePath();
+
+        DownloadProgressState workerProgress = new DownloadProgressState(1, declaredSize);
+        workerProgress.currentFile = displayName;
+        workerProgress.currentFileSize = declaredSize;
+
+        progressState.onFileStarted(taskKey, displayName, declaredSize);
+        emitDownloadProgress(listener, progressState, true);
+
+        DownloadProgressListener relayListener = progress -> {
+            String currentDisplayName = TextUtils.isEmpty(progress.currentFile)
+                ? displayName
+                : progress.currentFile;
+            progressState.onFileProgress(
+                taskKey,
+                currentDisplayName,
+                Math.max(workerProgress.currentFileSize, progress.currentFileSize),
+                progress.currentFileTransferred
+            );
+            emitDownloadProgress(listener, progressState, false);
+        };
+
+        try {
+            long fileBytes = downloadSingleFile(
+                context,
+                task.entry,
+                task.remotePath,
+                outputFile,
+                workerProgress,
+                relayListener,
+                control,
+                journalHandle
+            );
+
+            if (task.modifiedMs > 0L) {
+                try {
+                    outputFile.setLastModified(task.modifiedMs);
+                } catch (Throwable ignored) {
+                }
+            }
+
+            long finalSize = workerProgress.currentFileSize > 0
+                ? workerProgress.currentFileSize
+                : Math.max(declaredSize, fileBytes);
+            progressState.onFileSucceeded(taskKey, displayName, finalSize, fileBytes);
+            emitDownloadProgress(listener, progressState, true);
+            return DownloadTaskResult.success(fileBytes);
+        } catch (Exception e) {
+            try {
+                if (outputFile.exists()) {
+                    outputFile.delete();
+                }
+            } catch (Throwable ignored) {
+            }
+
+            if (e instanceof OperationCanceledException || isCancelled(control)) {
+                progressState.onFileCancelled(taskKey, displayName, workerProgress.currentFileSize);
+                emitDownloadProgress(listener, progressState, true);
+                return DownloadTaskResult.cancelled();
+            }
+
+            progressState.onFileFailed(taskKey, displayName, workerProgress.currentFileSize);
+            emitDownloadProgress(listener, progressState, true);
+            return DownloadTaskResult.failure(classifyExceptionMessage(e));
+        }
+    }
+
+    private static int resolveTransferWorkerCount(int taskCount) {
+        if (taskCount <= 1) {
+            return 1;
+        }
+        return Math.max(1, Math.min(taskCount, Math.min(MAX_TRANSFER_WORKERS, MAX_CHANNEL_POOL_PER_CLIENT)));
+    }
+
+    private static void cancelTransferFutures(@NonNull List<? extends Future<?>> futures,
+                                              @Nullable ExecutorService executor) {
+        for (Future<?> future : futures) {
+            if (future == null) continue;
+            try {
+                future.cancel(true);
+            } catch (Throwable ignored) {
+            }
+        }
+        shutdownTransferExecutor(executor);
+    }
+
+    private static void shutdownTransferExecutor(@Nullable ExecutorService executor) {
+        if (executor == null) return;
+        try {
+            executor.shutdownNow();
+            executor.awaitTermination(300L, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Throwable ignored) {
+        }
     }
 
     private void collectUploadTasksRecursive(@NonNull File localFile,
@@ -722,7 +1277,8 @@ public final class SftpProtocolManager {
                                   @NonNull UploadFileTask task,
                                   @NonNull UploadProgressState progressState,
                                   @Nullable UploadProgressListener listener,
-                                  @Nullable UploadControl control) throws Exception {
+                                  @Nullable UploadControl control,
+                                  @Nullable SftpTransferJournal.TaskHandle journalHandle) throws Exception {
         Exception lastError = null;
         int maxAttempts = RECOVERABLE_RETRY_COUNT + 1;
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
@@ -730,6 +1286,7 @@ public final class SftpProtocolManager {
             ChannelSftp channel = null;
             boolean channelBroken = false;
             final long[] currentTransferred = new long[]{0L};
+            String tempRemotePath = null;
             try {
                 if (isCancelled(control)) {
                     throw new OperationCanceledException();
@@ -737,6 +1294,86 @@ public final class SftpProtocolManager {
                 holder = ensureClient(context, entry);
                 channel = holder.borrowChannel();
                 ensureRemoteDirectoryExists(channel, parentRemotePath(task.remotePath));
+                long localSize = task.size > 0 ? task.size : task.localFile.length();
+
+                try {
+                    SftpATTRS finalAttrs = channel.stat(normalizeRemotePath(task.remotePath));
+                    if (finalAttrs != null) {
+                        if (finalAttrs.isDir()) {
+                            throw new IllegalStateException("\u8fdc\u7a0b\u76ee\u6807\u8def\u5f84\u88ab\u76ee\u5f55\u5360\u7528\uff1a" + task.remotePath);
+                        }
+                        progressState.currentFile = buildTransferStageLabel(task.localFile.getName(), task.remotePath, "\u6821\u9a8c\u5df2\u5b58\u5728\u6587\u4ef6");
+                        emitUploadProgress(listener, progressState, true);
+                        verifyUploadedTempFile(channel, task.remotePath, task.localFile, task.size, control);
+                        if (progressState.currentFileSize <= 0 && localSize > 0L) {
+                            progressState.currentFileSize = localSize;
+                        }
+                        progressState.currentFileTransferred =
+                            progressState.currentFileSize > 0
+                                ? progressState.currentFileSize
+                                : localSize;
+                        emitUploadProgress(listener, progressState, true);
+                        return Math.max(0L, localSize);
+                    }
+                } catch (SftpException e) {
+                    if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                        throw e;
+                    }
+                } catch (OperationCanceledException e) {
+                    throw e;
+                } catch (Exception ignored) {
+                }
+
+                tempRemotePath = buildRemoteTransferTempPath(task.remotePath);
+                SftpTransferJournal.getInstance().addRemoteTempPath(
+                    context,
+                    journalHandle,
+                    clientKeyForEntry(entry),
+                    tempRemotePath
+                );
+                long resumeOffset = 0L;
+                int putMode = ChannelSftp.OVERWRITE;
+                try {
+                    SftpATTRS tempAttrs = channel.stat(normalizeRemotePath(tempRemotePath));
+                    if (tempAttrs != null) {
+                        if (tempAttrs.isDir()) {
+                            throw new IllegalStateException("\u8fdc\u7a0b\u4e34\u65f6\u8def\u5f84\u88ab\u76ee\u5f55\u5360\u7528\uff1a" + tempRemotePath);
+                        }
+                        resumeOffset = Math.max(0L, tempAttrs.getSize());
+                    }
+                } catch (SftpException e) {
+                    if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                        throw e;
+                    }
+                }
+                if (resumeOffset > localSize) {
+                    deleteRemoteFileIfExists(channel, tempRemotePath);
+                    resumeOffset = 0L;
+                }
+                if (resumeOffset > 0L) {
+                    currentTransferred[0] = resumeOffset;
+                    progressState.currentFileTransferred = resumeOffset;
+                    emitUploadProgress(listener, progressState, true);
+                }
+                if (localSize > 0L && resumeOffset == localSize) {
+                    progressState.currentFile = buildTransferStageLabel(task.localFile.getName(), task.remotePath, "\u6821\u9a8c\u4e34\u65f6\u6587\u4ef6");
+                    emitUploadProgress(listener, progressState, true);
+                    verifyUploadedTempFile(channel, tempRemotePath, task.localFile, task.size, control);
+                    progressState.currentFile = buildTransferStageLabel(task.localFile.getName(), task.remotePath, "\u63d0\u4ea4\u8fdc\u7a0b\u66ff\u6362");
+                    emitUploadProgress(listener, progressState, true);
+                    replaceRemoteFile(channel, tempRemotePath, task.remotePath);
+                    SftpTransferJournal.getInstance().clearRemoteTempPath(
+                        context,
+                        journalHandle,
+                        clientKeyForEntry(entry),
+                        tempRemotePath
+                    );
+                    tempRemotePath = null;
+                    return localSize;
+                }
+                if (resumeOffset > 0L) {
+                    putMode = ChannelSftp.RESUME;
+                }
 
                 SftpProgressMonitor monitor = new SftpProgressMonitor() {
                     @Override
@@ -767,14 +1404,28 @@ public final class SftpProtocolManager {
                     public void end() {
                     }
                 };
-                channel.put(task.localFile.getAbsolutePath(), task.remotePath, monitor, ChannelSftp.OVERWRITE);
+                channel.put(task.localFile.getAbsolutePath(), tempRemotePath, monitor, putMode);
 
                 if (task.modifiedMs > 0L) {
                     try {
-                        channel.setMtime(task.remotePath, (int) (task.modifiedMs / 1000L));
+                        channel.setMtime(tempRemotePath, (int) (task.modifiedMs / 1000L));
                     } catch (Throwable ignored) {
                     }
                 }
+
+                progressState.currentFile = buildTransferStageLabel(task.localFile.getName(), task.remotePath, "\u6821\u9a8c\u8fdc\u7a0b\u4e34\u65f6\u6587\u4ef6");
+                emitUploadProgress(listener, progressState, true);
+                verifyUploadedTempFile(channel, tempRemotePath, task.localFile, task.size, control);
+                progressState.currentFile = buildTransferStageLabel(task.localFile.getName(), task.remotePath, "\u63d0\u4ea4\u8fdc\u7a0b\u66ff\u6362");
+                emitUploadProgress(listener, progressState, true);
+                replaceRemoteFile(channel, tempRemotePath, task.remotePath);
+                SftpTransferJournal.getInstance().clearRemoteTempPath(
+                    context,
+                    journalHandle,
+                    clientKeyForEntry(entry),
+                    tempRemotePath
+                );
+                tempRemotePath = null;
 
                 long fileBytes = task.size > 0 ? task.size : task.localFile.length();
                 if (fileBytes <= 0) {
@@ -791,7 +1442,7 @@ public final class SftpProtocolManager {
                 }
                 lastError = e;
                 channelBroken = true;
-                progressState.currentFileTransferred = 0L;
+                progressState.currentFileTransferred = Math.max(0L, currentTransferred[0]);
                 emitUploadProgress(listener, progressState, true);
 
                 if (attempt >= maxAttempts - 1 || !isRecoverableTransportException(e)) {
@@ -891,7 +1542,8 @@ public final class SftpProtocolManager {
                                     @NonNull File outputFile,
                                     @NonNull DownloadProgressState progressState,
                                     @Nullable DownloadProgressListener listener,
-                                    @Nullable DownloadControl control) throws Exception {
+                                    @Nullable DownloadControl control,
+                                    @Nullable SftpTransferJournal.TaskHandle journalHandle) throws Exception {
         Exception lastError = null;
         int maxAttempts = RECOVERABLE_RETRY_COUNT + 1;
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
@@ -899,13 +1551,86 @@ public final class SftpProtocolManager {
             ChannelSftp channel = null;
             boolean channelBroken = false;
             final long[] currentTransferred = new long[]{0L};
+            File tempFile = buildLocalTransferTempFile(outputFile);
             try {
                 if (isCancelled(control)) {
                     throw new OperationCanceledException();
                 }
                 holder = ensureClient(context, entry);
                 channel = holder.borrowChannel();
-                try (OutputStream outputStream = new FileOutputStream(outputFile, false)) {
+                SftpATTRS remoteAttrs = channel.stat(normalizeRemotePath(remotePath));
+                if (remoteAttrs == null || remoteAttrs.isDir()) {
+                    throw new IllegalStateException("\u8fdc\u7a0b\u6587\u4ef6\u4e0d\u53ef\u4e0b\u8f7d\uff1a" + remotePath);
+                }
+                long remoteSize = Math.max(0L, remoteAttrs.getSize());
+                if (progressState.currentFileSize <= 0 && remoteSize > 0L) {
+                    progressState.currentFileSize = remoteSize;
+                }
+
+                if (outputFile.exists() && outputFile.isDirectory()) {
+                    throw new IllegalStateException("\u672c\u5730\u76ee\u6807\u8def\u5f84\u88ab\u76ee\u5f55\u5360\u7528\uff1a" + outputFile.getAbsolutePath());
+                }
+                if (outputFile.exists()) {
+                    try {
+                        progressState.currentFile = buildTransferStageLabel(outputFile.getName(), remotePath, "\u6821\u9a8c\u672c\u5730\u5df2\u5b58\u5728\u6587\u4ef6");
+                        emitDownloadProgress(listener, progressState, true);
+                        verifyDownloadedTempFile(channel, remotePath, outputFile, control);
+                        progressState.currentFileTransferred =
+                            progressState.currentFileSize > 0
+                                ? progressState.currentFileSize
+                                : remoteSize;
+                        emitDownloadProgress(listener, progressState, true);
+                        return Math.max(0L, outputFile.length());
+                    } catch (OperationCanceledException e) {
+                        throw e;
+                    } catch (Exception ignored) {
+                    }
+                }
+
+                if (tempFile.exists() && tempFile.isDirectory()) {
+                    throw new IllegalStateException("\u672c\u5730\u4e34\u65f6\u6587\u4ef6\u8def\u5f84\u88ab\u76ee\u5f55\u5360\u7528\uff1a" + tempFile.getAbsolutePath());
+                }
+                SftpTransferJournal.getInstance().addLocalTempPath(
+                    context,
+                    journalHandle,
+                    tempFile.getAbsolutePath()
+                );
+                long resumeOffset = tempFile.exists() ? Math.max(0L, tempFile.length()) : 0L;
+                if (resumeOffset > remoteSize) {
+                    try {
+                        tempFile.delete();
+                    } catch (Throwable ignored) {
+                    }
+                    resumeOffset = 0L;
+                }
+                if (resumeOffset > 0L) {
+                    currentTransferred[0] = resumeOffset;
+                    progressState.currentFileTransferred = resumeOffset;
+                    emitDownloadProgress(listener, progressState, true);
+                }
+                if (remoteSize > 0L && resumeOffset == remoteSize) {
+                    progressState.currentFile = buildTransferStageLabel(outputFile.getName(), remotePath, "\u6821\u9a8c\u4e34\u65f6\u6587\u4ef6");
+                    emitDownloadProgress(listener, progressState, true);
+                    verifyDownloadedTempFile(channel, remotePath, tempFile, control);
+                    progressState.currentFile = buildTransferStageLabel(outputFile.getName(), remotePath, "\u63d0\u4ea4\u672c\u5730\u66ff\u6362");
+                    emitDownloadProgress(listener, progressState, true);
+                    moveLocalTransferFile(tempFile, outputFile);
+                    SftpTransferJournal.getInstance().clearLocalTempPath(
+                        context,
+                        journalHandle,
+                        tempFile.getAbsolutePath()
+                    );
+                    progressState.currentFileTransferred =
+                        progressState.currentFileSize > 0
+                            ? progressState.currentFileSize
+                            : remoteSize;
+                    emitDownloadProgress(listener, progressState, true);
+                    return Math.max(0L, outputFile.length());
+                }
+
+                boolean append = resumeOffset > 0L;
+                int getMode = append ? ChannelSftp.RESUME : ChannelSftp.OVERWRITE;
+                try (FileOutputStream outputStream = new FileOutputStream(tempFile, append)) {
                     SftpProgressMonitor monitor = new SftpProgressMonitor() {
                         @Override
                         public void init(int op, String src, String dest, long max) {
@@ -935,9 +1660,24 @@ public final class SftpProtocolManager {
                         public void end() {
                         }
                     };
-                    channel.get(remotePath, outputStream, monitor, ChannelSftp.OVERWRITE, 0L);
+                    channel.get(remotePath, outputStream, monitor, getMode, resumeOffset);
                     outputStream.flush();
+                    try {
+                        outputStream.getFD().sync();
+                    } catch (Throwable ignored) {
+                    }
                 }
+                progressState.currentFile = buildTransferStageLabel(outputFile.getName(), remotePath, "\u6821\u9a8c\u4e0b\u8f7d\u6587\u4ef6");
+                emitDownloadProgress(listener, progressState, true);
+                verifyDownloadedTempFile(channel, remotePath, tempFile, control);
+                progressState.currentFile = buildTransferStageLabel(outputFile.getName(), remotePath, "\u63d0\u4ea4\u672c\u5730\u66ff\u6362");
+                emitDownloadProgress(listener, progressState, true);
+                moveLocalTransferFile(tempFile, outputFile);
+                SftpTransferJournal.getInstance().clearLocalTempPath(
+                    context,
+                    journalHandle,
+                    tempFile.getAbsolutePath()
+                );
 
                 long fileBytes = outputFile.length();
                 if (fileBytes <= 0) {
@@ -957,7 +1697,7 @@ public final class SftpProtocolManager {
                 }
                 lastError = e;
                 channelBroken = true;
-                progressState.currentFileTransferred = 0L;
+                progressState.currentFileTransferred = Math.max(0L, currentTransferred[0]);
                 emitDownloadProgress(listener, progressState, true);
 
                 if (attempt >= maxAttempts - 1 || !isRecoverableTransportException(e)) {
@@ -1042,12 +1782,626 @@ public final class SftpProtocolManager {
         }
     }
 
+    private static void emitDownloadProgress(@Nullable DownloadProgressListener listener,
+                                             @NonNull ConcurrentTransferProgressState state,
+                                             boolean force) {
+        if (listener == null) return;
+        ConcurrentTransferProgressSnapshot snapshot = state.snapshot(force);
+        if (snapshot == null) return;
+
+        DownloadProgress progress = new DownloadProgress(
+            snapshot.totalFiles,
+            snapshot.completedFiles,
+            snapshot.failedFiles,
+            snapshot.totalBytes,
+            snapshot.transferredBytes,
+            snapshot.currentFile,
+            snapshot.currentFileTransferred,
+            snapshot.currentFileSize
+        );
+        try {
+            listener.onProgress(progress);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void emitUploadProgress(@Nullable UploadProgressListener listener,
+                                           @NonNull ConcurrentTransferProgressState state,
+                                           boolean force) {
+        if (listener == null) return;
+        ConcurrentTransferProgressSnapshot snapshot = state.snapshot(force);
+        if (snapshot == null) return;
+
+        UploadProgress progress = new UploadProgress(
+            snapshot.totalFiles,
+            snapshot.completedFiles,
+            snapshot.failedFiles,
+            snapshot.totalBytes,
+            snapshot.transferredBytes,
+            snapshot.currentFile,
+            snapshot.currentFileTransferred,
+            snapshot.currentFileSize
+        );
+        try {
+            listener.onProgress(progress);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void emitRemoteTransferProgress(@Nullable RemoteTransferProgressListener listener,
+                                                   @NonNull RemoteTransferWorkflowStateMachine.Snapshot snapshot) {
+        if (listener == null) return;
+        RemoteTransferProgress progress = new RemoteTransferProgress(
+            snapshot.stage.name(),
+            RemoteTransferWorkflowStateMachine.stageLabelCn(snapshot.stage),
+            snapshot.totalFiles,
+            snapshot.completedFiles,
+            snapshot.failedFiles,
+            snapshot.totalBytes,
+            snapshot.transferredBytes,
+            snapshot.currentFile,
+            snapshot.currentFileTransferred,
+            snapshot.currentFileSize,
+            snapshot.messageCn
+        );
+        try {
+            listener.onProgress(progress);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Nullable
+    private static DownloadProgressListener wrapDownloadProgressListener(@NonNull Context context,
+                                                                        @Nullable SftpTransferJournal.TaskHandle handle,
+                                                                        @Nullable DownloadProgressListener delegate) {
+        if (handle == null && delegate == null) return null;
+        return progress -> {
+            if (handle != null) {
+                SftpTransferJournal.getInstance().updateProgress(
+                    context,
+                    handle,
+                    progress.totalFiles,
+                    progress.completedFiles,
+                    progress.failedFiles,
+                    progress.totalBytes,
+                    progress.transferredBytes,
+                    progress.currentFile
+                );
+            }
+            if (delegate != null) {
+                delegate.onProgress(progress);
+            }
+        };
+    }
+
+    @Nullable
+    private static UploadProgressListener wrapUploadProgressListener(@NonNull Context context,
+                                                                    @Nullable SftpTransferJournal.TaskHandle handle,
+                                                                    @Nullable UploadProgressListener delegate) {
+        if (handle == null && delegate == null) return null;
+        return progress -> {
+            if (handle != null) {
+                SftpTransferJournal.getInstance().updateProgress(
+                    context,
+                    handle,
+                    progress.totalFiles,
+                    progress.completedFiles,
+                    progress.failedFiles,
+                    progress.totalBytes,
+                    progress.transferredBytes,
+                    progress.currentFile
+                );
+            }
+            if (delegate != null) {
+                delegate.onProgress(progress);
+            }
+        };
+    }
+
+    @Nullable
+    private static RemoteTransferProgressListener wrapRemoteTransferProgressListener(@NonNull Context context,
+                                                                                    @Nullable SftpTransferJournal.TaskHandle handle,
+                                                                                    @Nullable RemoteTransferProgressListener delegate) {
+        if (handle == null && delegate == null) return null;
+        return progress -> {
+            if (handle != null) {
+                String currentFile = progress.currentFile;
+                if (!TextUtils.isEmpty(progress.stageLabelCn)) {
+                    currentFile = progress.stageLabelCn + (TextUtils.isEmpty(currentFile) ? "" : (": " + currentFile));
+                }
+                SftpTransferJournal.getInstance().updateProgress(
+                    context,
+                    handle,
+                    progress.totalFiles,
+                    progress.completedFiles,
+                    progress.failedFiles,
+                    progress.totalBytes,
+                    progress.transferredBytes,
+                    currentFile
+                );
+            }
+            if (delegate != null) {
+                delegate.onProgress(progress);
+            }
+        };
+    }
+
+    private static void finishDownloadJournal(@NonNull Context context,
+                                              @Nullable SftpTransferJournal.TaskHandle handle,
+                                              @NonNull DownloadResult result) {
+        if (handle == null) return;
+        SftpTransferJournal.getInstance().finishTask(
+            context,
+            handle,
+            result.success
+                ? SftpTransferJournal.TaskStatus.COMPLETED
+                : (isCancelledMessage(result.messageCn)
+                    ? SftpTransferJournal.TaskStatus.CANCELLED
+                    : SftpTransferJournal.TaskStatus.FAILED),
+            result.messageCn,
+            result.totalFiles,
+            result.downloadedFiles,
+            result.failedFiles,
+            result.totalBytes,
+            result.downloadedBytes
+        );
+    }
+
+    private static void finishUploadJournal(@NonNull Context context,
+                                            @Nullable SftpTransferJournal.TaskHandle handle,
+                                            @NonNull UploadResult result) {
+        if (handle == null) return;
+        SftpTransferJournal.getInstance().finishTask(
+            context,
+            handle,
+            result.success
+                ? SftpTransferJournal.TaskStatus.COMPLETED
+                : (isCancelledMessage(result.messageCn)
+                    ? SftpTransferJournal.TaskStatus.CANCELLED
+                    : SftpTransferJournal.TaskStatus.FAILED),
+            result.messageCn,
+            result.totalFiles,
+            result.uploadedFiles,
+            result.failedFiles,
+            result.totalBytes,
+            result.uploadedBytes
+        );
+    }
+
+    private static void finishRemoteTransferJournal(@NonNull Context context,
+                                                    @Nullable SftpTransferJournal.TaskHandle handle,
+                                                    @NonNull RemoteTransferResult result) {
+        if (handle == null) return;
+        SftpTransferJournal.getInstance().finishTask(
+            context,
+            handle,
+            result.success
+                ? SftpTransferJournal.TaskStatus.COMPLETED
+                : (isCancelledMessage(result.messageCn)
+                    ? SftpTransferJournal.TaskStatus.CANCELLED
+                    : SftpTransferJournal.TaskStatus.FAILED),
+            result.messageCn,
+            result.totalFiles,
+            result.transferredFiles,
+            result.failedFiles,
+            result.totalBytes,
+            result.transferredBytes
+        );
+    }
+
+    @NonNull
+    private static String buildRemoteTransferTempPath(@NonNull String remotePath) {
+        String normalized = normalizeRemotePath(remotePath);
+        String parent = parentRemotePath(normalized);
+        String name = normalized.substring(normalized.lastIndexOf('/') + 1);
+        if (TextUtils.isEmpty(name)) {
+            name = "upload-item";
+        }
+        return joinRemotePath(
+            parent,
+            "." + name + ".termux-upload-" + shortSha1Hex(normalized) + ".part"
+        );
+    }
+
+    private static void deleteRemoteFileIfExists(@NonNull ChannelSftp channel,
+                                                 @NonNull String remotePath) throws Exception {
+        String normalized = normalizeRemotePath(remotePath);
+        try {
+            SftpATTRS attrs = channel.stat(normalized);
+            if (attrs == null) {
+                return;
+            }
+            if (attrs.isDir()) {
+                throw new IllegalStateException("\u8fdc\u7a0b\u4e34\u65f6\u8def\u5f84\u88ab\u76ee\u5f55\u5360\u7528\uff1a" + normalized);
+            }
+            channel.rm(normalized);
+        } catch (SftpException e) {
+            if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                throw e;
+            }
+        }
+    }
+
+    private static void deleteRemotePathRecursive(@NonNull ChannelSftp channel,
+                                                  @NonNull String remotePath) throws Exception {
+        String normalized = normalizeRemotePath(remotePath);
+        SftpATTRS attrs;
+        try {
+            attrs = channel.stat(normalized);
+        } catch (SftpException e) {
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                return;
+            }
+            throw e;
+        }
+        if (attrs == null) return;
+
+        if (!attrs.isDir()) {
+            deleteRemoteFileIfExists(channel, normalized);
+            return;
+        }
+
+        Vector<?> rows = channel.ls(normalized);
+        for (Object row : rows) {
+            if (!(row instanceof ChannelSftp.LsEntry)) continue;
+            ChannelSftp.LsEntry item = (ChannelSftp.LsEntry) row;
+            String name = item.getFilename();
+            if (TextUtils.isEmpty(name) || ".".equals(name) || "..".equals(name)) continue;
+            deleteRemotePathRecursive(channel, joinRemotePath(normalized, name));
+        }
+
+        try {
+            channel.rmdir(normalized);
+        } catch (SftpException e) {
+            if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                throw e;
+            }
+        }
+    }
+
+    private static void replaceRemoteFile(@NonNull ChannelSftp channel,
+                                          @NonNull String stagedRemotePath,
+                                          @NonNull String targetRemotePath) throws Exception {
+        String normalizedTarget = normalizeRemotePath(targetRemotePath);
+        String backupRemotePath = null;
+        try {
+            SftpATTRS existing = channel.stat(normalizedTarget);
+            if (existing != null) {
+                if (existing.isDir()) {
+                    throw new IllegalStateException("\u8fdc\u7a0b\u76ee\u6807\u662f\u76ee\u5f55\uff0c\u65e0\u6cd5\u8986\u76d6\uff1a" + normalizedTarget);
+                }
+                backupRemotePath = buildRemoteBackupPath(normalizedTarget);
+                deleteRemoteFileIfExists(channel, backupRemotePath);
+                channel.rename(normalizedTarget, backupRemotePath);
+            }
+        } catch (SftpException e) {
+            if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                throw e;
+            }
+        }
+        boolean committed = false;
+        try {
+            channel.rename(normalizeRemotePath(stagedRemotePath), normalizedTarget);
+            committed = true;
+        } finally {
+            if (!committed && !TextUtils.isEmpty(backupRemotePath)) {
+                try {
+                    channel.rename(backupRemotePath, normalizedTarget);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        if (!TextUtils.isEmpty(backupRemotePath)) {
+            deleteRemoteFileIfExists(channel, backupRemotePath);
+        }
+    }
+
+    @NonNull
+    private static String buildRemoteBackupPath(@NonNull String remotePath) {
+        String normalized = normalizeRemotePath(remotePath);
+        String parent = parentRemotePath(normalized);
+        String name = normalized.substring(normalized.lastIndexOf('/') + 1);
+        if (TextUtils.isEmpty(name)) {
+            name = "target-item";
+        }
+        return joinRemotePath(
+            parent,
+            "." + name + ".termux-backup-" + TRANSFER_TEMP_COUNTER.getAndIncrement() + ".bak"
+        );
+    }
+
+    @NonNull
+    private static File buildLocalTransferTempFile(@NonNull File outputFile) {
+        File parent = outputFile.getParentFile();
+        String name = outputFile.getName();
+        if (TextUtils.isEmpty(name)) {
+            name = "download-item";
+        }
+        String tempName = "." + name + ".termux-download-" + shortSha1Hex(outputFile.getAbsolutePath()) + ".part";
+        return parent == null ? new File(tempName) : new File(parent, tempName);
+    }
+
+    private static void moveLocalTransferFile(@NonNull File tempFile,
+                                              @NonNull File outputFile) throws Exception {
+        if (outputFile.exists() && !outputFile.delete()) {
+            throw new IllegalStateException("\u65e0\u6cd5\u66ff\u6362\u672c\u5730\u76ee\u6807\u6587\u4ef6\uff1a" + outputFile.getAbsolutePath());
+        }
+        if (tempFile.renameTo(outputFile)) {
+            return;
+        }
+        copyLocalFileContents(tempFile, outputFile);
+        if (!tempFile.delete()) {
+            try {
+                tempFile.deleteOnExit();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void copyLocalFileContents(@NonNull File source,
+                                              @NonNull File target) throws Exception {
+        try (InputStream inputStream = new FileInputStream(source);
+             FileOutputStream outputStream = new FileOutputStream(target, false)) {
+            byte[] buffer = new byte[16 * 1024];
+            int read;
+            while ((read = inputStream.read(buffer)) >= 0) {
+                if (read == 0) continue;
+                outputStream.write(buffer, 0, read);
+            }
+            outputStream.flush();
+            try {
+                outputStream.getFD().sync();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void verifyUploadedTempFile(@NonNull ChannelSftp channel,
+                                               @NonNull String remoteTempPath,
+                                               @NonNull File sourceFile,
+                                               long declaredSize,
+                                               @Nullable UploadControl control) throws Exception {
+        SftpATTRS attrs = channel.stat(normalizeRemotePath(remoteTempPath));
+        if (attrs == null || attrs.isDir()) {
+            throw new IllegalStateException("\u8fdc\u7a0b\u4e34\u65f6\u6587\u4ef6\u7f3a\u5931\u6216\u7c7b\u578b\u9519\u8bef\u3002");
+        }
+        long expectedSize = declaredSize > 0 ? declaredSize : sourceFile.length();
+        long remoteSize = Math.max(0L, attrs.getSize());
+        if (expectedSize >= 0L && remoteSize != expectedSize) {
+            throw new IllegalStateException(
+                "\u4e0a\u4f20\u540e\u8fdc\u7a0b\u5927\u5c0f\u6821\u9a8c\u5931\u8d25\uff1aexpected=" + expectedSize + " actual=" + remoteSize
+            );
+        }
+        if (expectedSize > 0L && expectedSize <= FULL_DIGEST_VERIFY_MAX_BYTES) {
+            String localDigest = computeLocalSha256(sourceFile, control == null ? null : control::isCancelled);
+            String remoteDigest = computeRemoteSha256(channel, remoteTempPath, control == null ? null : control::isCancelled);
+            if (!TextUtils.equals(localDigest, remoteDigest)) {
+                throw new IllegalStateException("\u4e0a\u4f20\u540e\u8fdc\u7a0b SHA-256 \u6821\u9a8c\u5931\u8d25\u3002");
+            }
+        } else if (expectedSize > FULL_DIGEST_VERIFY_MAX_BYTES) {
+            String localDigest = computeLocalSampleDigest(sourceFile, expectedSize, control == null ? null : control::isCancelled);
+            String remoteDigest = computeRemoteSampleDigest(channel, remoteTempPath, expectedSize, control == null ? null : control::isCancelled);
+            if (!TextUtils.equals(localDigest, remoteDigest)) {
+                throw new IllegalStateException("\u4e0a\u4f20\u540e\u8fdc\u7a0b\u91c7\u6837\u6821\u9a8c\u5931\u8d25\u3002");
+            }
+        }
+    }
+
+    private static void verifyDownloadedTempFile(@NonNull ChannelSftp channel,
+                                                 @NonNull String remotePath,
+                                                 @NonNull File tempFile,
+                                                 @Nullable DownloadControl control) throws Exception {
+        SftpATTRS attrs = channel.stat(normalizeRemotePath(remotePath));
+        if (attrs == null || attrs.isDir()) {
+            throw new IllegalStateException("\u8fdc\u7a0b\u6e90\u6587\u4ef6\u7f3a\u5931\u6216\u7c7b\u578b\u9519\u8bef\u3002");
+        }
+        long remoteSize = Math.max(0L, attrs.getSize());
+        long localSize = Math.max(0L, tempFile.length());
+        if (remoteSize != localSize) {
+            throw new IllegalStateException(
+                "\u4e0b\u8f7d\u540e\u672c\u5730\u5927\u5c0f\u6821\u9a8c\u5931\u8d25\uff1aexpected=" + remoteSize + " actual=" + localSize
+            );
+        }
+        if (remoteSize > 0L && remoteSize <= FULL_DIGEST_VERIFY_MAX_BYTES) {
+            String localDigest = computeLocalSha256(tempFile, control == null ? null : control::isCancelled);
+            String remoteDigest = computeRemoteSha256(channel, remotePath, control == null ? null : control::isCancelled);
+            if (!TextUtils.equals(localDigest, remoteDigest)) {
+                throw new IllegalStateException("\u4e0b\u8f7d\u540e SHA-256 \u6821\u9a8c\u5931\u8d25\u3002");
+            }
+        } else if (remoteSize > FULL_DIGEST_VERIFY_MAX_BYTES) {
+            String localDigest = computeLocalSampleDigest(tempFile, remoteSize, control == null ? null : control::isCancelled);
+            String remoteDigest = computeRemoteSampleDigest(channel, remotePath, remoteSize, control == null ? null : control::isCancelled);
+            if (!TextUtils.equals(localDigest, remoteDigest)) {
+                throw new IllegalStateException("\u4e0b\u8f7d\u540e\u91c7\u6837\u6821\u9a8c\u5931\u8d25\u3002");
+            }
+        }
+    }
+
+    @NonNull
+    private static String computeLocalSha256(@NonNull File file,
+                                             @Nullable CancelProbe cancelProbe) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (FileInputStream inputStream = new FileInputStream(file)) {
+            byte[] buffer = new byte[TRANSFER_DIGEST_BUFFER_BYTES];
+            while (true) {
+                if (cancelProbe != null && cancelProbe.isCancelled()) {
+                    throw new OperationCanceledException();
+                }
+                int read = inputStream.read(buffer);
+                if (read < 0) break;
+                if (read == 0) continue;
+                digest.update(buffer, 0, read);
+            }
+        }
+        return toHex(digest.digest());
+    }
+
+    @NonNull
+    private static String computeRemoteSha256(@NonNull ChannelSftp channel,
+                                              @NonNull String remotePath,
+                                              @Nullable CancelProbe cancelProbe) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream inputStream = channel.get(normalizeRemotePath(remotePath))) {
+            byte[] buffer = new byte[TRANSFER_DIGEST_BUFFER_BYTES];
+            while (true) {
+                if (cancelProbe != null && cancelProbe.isCancelled()) {
+                    throw new OperationCanceledException();
+                }
+                int read = inputStream.read(buffer);
+                if (read < 0) break;
+                if (read == 0) continue;
+                digest.update(buffer, 0, read);
+            }
+        }
+        return toHex(digest.digest());
+    }
+
+    @NonNull
+    private static String computeLocalSampleDigest(@NonNull File file,
+                                                   long fileSize,
+                                                   @Nullable CancelProbe cancelProbe) throws Exception {
+        if (fileSize <= 0L || fileSize <= FULL_DIGEST_VERIFY_MAX_BYTES || fileSize <= SAMPLE_DIGEST_VERIFY_BYTES * 2L) {
+            return computeLocalSha256(file, cancelProbe);
+        }
+
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        digest.update(("sample:" + fileSize + ":" + SAMPLE_DIGEST_VERIFY_BYTES).getBytes(StandardCharsets.UTF_8));
+        try (RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r")) {
+            updateRandomAccessDigest(randomAccessFile, digest, 0L, SAMPLE_DIGEST_VERIFY_BYTES, cancelProbe);
+            long tailOffset = Math.max((long) SAMPLE_DIGEST_VERIFY_BYTES, fileSize - SAMPLE_DIGEST_VERIFY_BYTES);
+            updateRandomAccessDigest(randomAccessFile, digest, tailOffset, fileSize - tailOffset, cancelProbe);
+        }
+        return toHex(digest.digest());
+    }
+
+    @NonNull
+    private static String computeRemoteSampleDigest(@NonNull ChannelSftp channel,
+                                                    @NonNull String remotePath,
+                                                    long remoteSize,
+                                                    @Nullable CancelProbe cancelProbe) throws Exception {
+        if (remoteSize <= 0L || remoteSize <= FULL_DIGEST_VERIFY_MAX_BYTES || remoteSize <= SAMPLE_DIGEST_VERIFY_BYTES * 2L) {
+            return computeRemoteSha256(channel, remotePath, cancelProbe);
+        }
+
+        String normalizedRemotePath = normalizeRemotePath(remotePath);
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        digest.update(("sample:" + remoteSize + ":" + SAMPLE_DIGEST_VERIFY_BYTES).getBytes(StandardCharsets.UTF_8));
+        try (InputStream inputStream = channel.get(normalizedRemotePath, null, 0L)) {
+            updateInputStreamDigest(inputStream, digest, SAMPLE_DIGEST_VERIFY_BYTES, cancelProbe);
+        }
+        long tailOffset = Math.max((long) SAMPLE_DIGEST_VERIFY_BYTES, remoteSize - SAMPLE_DIGEST_VERIFY_BYTES);
+        try (InputStream inputStream = channel.get(normalizedRemotePath, null, tailOffset)) {
+            updateInputStreamDigest(inputStream, digest, remoteSize - tailOffset, cancelProbe);
+        }
+        return toHex(digest.digest());
+    }
+
+    private static void updateRandomAccessDigest(@NonNull RandomAccessFile randomAccessFile,
+                                                 @NonNull MessageDigest digest,
+                                                 long offset,
+                                                 long maxBytes,
+                                                 @Nullable CancelProbe cancelProbe) throws Exception {
+        if (maxBytes <= 0L) return;
+        randomAccessFile.seek(Math.max(0L, offset));
+        byte[] buffer = new byte[TRANSFER_DIGEST_BUFFER_BYTES];
+        long remaining = maxBytes;
+        while (remaining > 0L) {
+            if (cancelProbe != null && cancelProbe.isCancelled()) {
+                throw new OperationCanceledException();
+            }
+            int read = randomAccessFile.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+            if (read < 0) break;
+            if (read == 0) continue;
+            digest.update(buffer, 0, read);
+            remaining -= read;
+        }
+    }
+
+    private static void updateInputStreamDigest(@NonNull InputStream inputStream,
+                                                @NonNull MessageDigest digest,
+                                                long maxBytes,
+                                                @Nullable CancelProbe cancelProbe) throws Exception {
+        if (maxBytes <= 0L) return;
+        byte[] buffer = new byte[TRANSFER_DIGEST_BUFFER_BYTES];
+        long remaining = maxBytes;
+        while (remaining > 0L) {
+            if (cancelProbe != null && cancelProbe.isCancelled()) {
+                throw new OperationCanceledException();
+            }
+            int read = inputStream.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+            if (read < 0) break;
+            if (read == 0) continue;
+            digest.update(buffer, 0, read);
+            remaining -= read;
+        }
+    }
+
+    @NonNull
+    private static String toHex(@NonNull byte[] data) {
+        StringBuilder hex = new StringBuilder(data.length * 2);
+        for (byte b : data) {
+            hex.append(String.format(Locale.US, "%02x", b));
+        }
+        return hex.toString();
+    }
+
+    @NonNull
+    private static String shortSha1Hex(@NonNull String raw) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-1");
+            byte[] data = digest.digest(raw.getBytes(StandardCharsets.UTF_8));
+            String hex = toHex(data);
+            return hex.length() > 12 ? hex.substring(0, 12) : hex;
+        } catch (Throwable ignored) {
+            return Integer.toHexString(raw.hashCode());
+        }
+    }
+
+    @NonNull
+    private static String buildTransferStageLabel(@Nullable String preferredName,
+                                                  @NonNull String fallbackPath,
+                                                  @NonNull String stageLabelCn) {
+        String baseName = trimToEmpty(preferredName);
+        if (TextUtils.isEmpty(baseName)) {
+            int slashIndex = fallbackPath.lastIndexOf('/');
+            baseName = slashIndex >= 0 ? fallbackPath.substring(slashIndex + 1) : fallbackPath;
+        }
+        if (TextUtils.isEmpty(baseName)) {
+            baseName = "transfer-item";
+        }
+        return baseName + "（" + trimToEmpty(stageLabelCn) + "）";
+    }
+
+    @NonNull
+    private static String trimToEmpty(@Nullable String value) {
+        return value == null ? "" : value.trim();
+    }
+
     private static boolean isCancelled(@Nullable DownloadControl control) {
         if (control == null) return false;
         try {
             return control.isCancelled();
         } catch (Throwable ignored) {
             return false;
+        }
+    }
+
+    private static boolean isTransferJournalSuppressed() {
+        Integer depth = SUPPRESS_TRANSFER_JOURNAL_DEPTH.get();
+        return depth != null && depth > 0;
+    }
+
+    private static void pushTransferJournalSuppressed() {
+        Integer depth = SUPPRESS_TRANSFER_JOURNAL_DEPTH.get();
+        SUPPRESS_TRANSFER_JOURNAL_DEPTH.set(depth == null ? 1 : depth + 1);
+    }
+
+    private static void popTransferJournalSuppressed() {
+        Integer depth = SUPPRESS_TRANSFER_JOURNAL_DEPTH.get();
+        if (depth == null || depth <= 1) {
+            SUPPRESS_TRANSFER_JOURNAL_DEPTH.set(0);
+        } else {
+            SUPPRESS_TRANSFER_JOURNAL_DEPTH.set(depth - 1);
         }
     }
 
@@ -1058,6 +2412,100 @@ public final class SftpProtocolManager {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private static boolean isCancelled(@Nullable RemoteTransferControl control) {
+        if (control == null) return false;
+        try {
+            return control.isCancelled();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    @NonNull
+    private static ArrayList<String> collectTopLevelStagedPaths(@Nullable File stagingDirectory) {
+        ArrayList<String> out = new ArrayList<>();
+        if (stagingDirectory == null || !stagingDirectory.exists()) {
+            return out;
+        }
+
+        File[] children = stagingDirectory.listFiles();
+        if (children == null || children.length == 0) {
+            return out;
+        }
+
+        Arrays.sort(children, (left, right) -> {
+            if (left == right) return 0;
+            if (left == null) return 1;
+            if (right == null) return -1;
+            boolean leftDir = left.isDirectory();
+            boolean rightDir = right.isDirectory();
+            if (leftDir != rightDir) {
+                return leftDir ? -1 : 1;
+            }
+            return left.getName().compareToIgnoreCase(right.getName());
+        });
+
+        for (File child : children) {
+            if (child == null || !child.exists()) continue;
+            out.add(child.getAbsolutePath());
+        }
+        return out;
+    }
+
+    @NonNull
+    private static File ensureRecoveryStageDirectory(@Nullable String stageDirectoryPath) {
+        if (TextUtils.isEmpty(stageDirectoryPath)) {
+            throw new IllegalStateException("\u7f3a\u5c11\u53ef\u6062\u590d\u7684\u4e2d\u8f6c\u76ee\u5f55\u8def\u5f84\u3002");
+        }
+        File stageDirectory = new File(stageDirectoryPath);
+        if (stageDirectory.exists()) {
+            if (!stageDirectory.isDirectory()) {
+                throw new IllegalStateException("\u6062\u590d\u4e2d\u8f6c\u76ee\u5f55\u5931\u8d25\uff1a\u8def\u5f84\u4e0d\u662f\u76ee\u5f55\u3002");
+            }
+            return stageDirectory;
+        }
+        if (!stageDirectory.mkdirs() && !stageDirectory.exists()) {
+            throw new IllegalStateException("\u65e0\u6cd5\u521b\u5efa\u53ef\u6062\u590d\u7684\u4e2d\u8f6c\u76ee\u5f55\u3002");
+        }
+        return stageDirectory;
+    }
+
+    @NonNull
+    private static File createRemoteTransferStagingDirectory(@NonNull Context context) {
+        File root = new File(FileRootResolver.resolveTransferRoot(context));
+        if (!root.exists() && !root.mkdirs() && !root.exists()) {
+            throw new IllegalStateException("\u65e0\u6cd5\u521b\u5efa\u670d\u52a1\u5668\u4e92\u4f20\u6839\u76ee\u5f55\u3002");
+        }
+
+        for (int index = 1; index <= 24; index++) {
+            File candidate = new File(root, "relay-" + System.currentTimeMillis() + "-" + index);
+            if (!candidate.exists() && candidate.mkdirs()) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("\u65e0\u6cd5\u521b\u5efa\u670d\u52a1\u5668\u4e92\u4f20\u4e2d\u8f6c\u76ee\u5f55\u3002");
+    }
+
+    private static void deleteDirectoryContents(@Nullable File file) {
+        if (file == null || !file.exists()) return;
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    deleteDirectoryContents(child);
+                }
+            }
+        }
+        try {
+            file.delete();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static boolean isCancelledMessage(@Nullable String messageCn) {
+        return !TextUtils.isEmpty(messageCn) && messageCn.contains("\u5df2\u53d6\u6d88");
     }
 
     @NonNull
@@ -1138,6 +2586,20 @@ public final class SftpProtocolManager {
         int index = 1;
         String abs = out.getAbsolutePath();
         while (reservedAbsolutePaths.contains(abs) || out.exists()) {
+            out = new File(desired.getParentFile(), appendNumberSuffix(desired.getName(), index++));
+            abs = out.getAbsolutePath();
+        }
+        reservedAbsolutePaths.add(abs);
+        return out;
+    }
+
+    @NonNull
+    private static File reserveDestinationRoot(@NonNull File desired,
+                                               @NonNull Set<String> reservedAbsolutePaths) {
+        File out = desired;
+        int index = 1;
+        String abs = out.getAbsolutePath();
+        while (reservedAbsolutePaths.contains(abs)) {
             out = new File(desired.getParentFile(), appendNumberSuffix(desired.getName(), index++));
             abs = out.getAbsolutePath();
         }
@@ -1246,11 +2708,14 @@ public final class SftpProtocolManager {
             JSch jsch = new JSch();
             File homeDir = new File(context.getFilesDir(), "home");
             addSshIdentities(jsch, homeDir, parsed);
+            SshHostTrustStore trustStore = SshHostTrustStore.getInstance();
+            trustStore.initialize(context);
+            jsch.setHostKeyRepository(trustStore);
 
             com.jcraft.jsch.Session session = jsch.getSession(parsed.user, parsed.host, parsed.port);
             if (!TextUtils.isEmpty(parsed.password)) session.setPassword(parsed.password);
             Properties config = new Properties();
-            config.put("StrictHostKeyChecking", "no");
+            config.put("StrictHostKeyChecking", "yes");
             config.put("PreferredAuthentications",
                 TextUtils.isEmpty(parsed.password)
                     ? "publickey,keyboard-interactive,password"
@@ -1266,6 +2731,7 @@ public final class SftpProtocolManager {
 
             ClientHolder newHolder = new ClientHolder(clientKey, entry.id, session);
             mClients.put(clientKey, newHolder);
+            cleanupPendingRemoteTempPaths(context, entry, newHolder);
             return newHolder;
         }
     }
@@ -1353,6 +2819,53 @@ public final class SftpProtocolManager {
             }
         }
         throw lastError == null ? new IllegalStateException("SFTP operation failed") : lastError;
+    }
+
+    private void cleanupPendingRemoteTempPaths(@NonNull Context context,
+                                               @NonNull SessionEntry entry,
+                                               @NonNull ClientHolder holder) {
+        String sessionKey = clientKeyForEntry(entry);
+        List<String> pendingPaths = SftpTransferJournal.getInstance().listPendingRemoteTempPaths(context, sessionKey);
+        if (pendingPaths.isEmpty()) {
+            return;
+        }
+
+        ChannelSftp channel = null;
+        boolean broken = false;
+        try {
+            channel = holder.borrowChannel();
+            for (String pendingPath : pendingPaths) {
+                if (TextUtils.isEmpty(pendingPath)) continue;
+                try {
+                    deleteRemoteFileIfExists(channel, pendingPath);
+                    SftpTransferJournal.getInstance().acknowledgeRemoteTempPath(context, sessionKey, pendingPath);
+                } catch (Exception cleanupError) {
+                    broken = true;
+                    SessionSyncTracer.getInstance().warn(
+                        context,
+                        "SftpProtocolManager",
+                        "cleanupPendingRemoteTempPaths",
+                        sessionKey,
+                        "\u6e05\u7406\u8fdc\u7a0b\u4e34\u65f6\u6587\u4ef6\u5931\u8d25",
+                        cleanupError.getMessage()
+                    );
+                    break;
+                }
+            }
+        } catch (Exception borrowError) {
+            SessionSyncTracer.getInstance().warn(
+                context,
+                "SftpProtocolManager",
+                "cleanupPendingRemoteTempPaths",
+                sessionKey,
+                "\u65e0\u6cd5\u6253\u5f00\u901a\u9053\u6e05\u7406\u8fdc\u7a0b\u4e34\u65f6\u6587\u4ef6",
+                borrowError.getMessage()
+            );
+        } finally {
+            if (channel != null) {
+                holder.releaseChannel(channel, broken);
+            }
+        }
     }
 
     private static boolean isRecoverableTransportException(@Nullable Throwable throwable) {
@@ -1543,6 +3056,11 @@ public final class SftpProtocolManager {
         if (lower.contains("auth fail") || lower.contains("permission denied")) {
             return "\u8ba4\u8bc1\u5931\u8d25\uff08\u7528\u6237\u540d\u002f\u5bc6\u7801\u002f\u5bc6\u94a5\u9519\u8bef\u6216\u670d\u52a1\u5668\u62d2\u7edd\uff09\u3002";
         }
+        if (lower.contains("reject hostkey")
+            || lower.contains("hostkey has been changed")
+            || lower.contains("host key has been changed")) {
+            return "\u4e3b\u673a\u6307\u7eb9\u6821\u9a8c\u5931\u8d25\uff08\u670d\u52a1\u5668\u5bc6\u94a5\u53ef\u80fd\u53d1\u751f\u53d8\u66f4\uff09\u3002";
+        }
         if (lower.contains("connection refused")) {
             return "\u8fde\u63a5\u88ab\u62d2\u7edd\uff08\u7aef\u53e3\u672a\u5f00\u653e\u6216\u0020\u0073\u0073\u0068\u0064\u0020\u672a\u542f\u52a8\uff09\u3002";
         }
@@ -1567,6 +3085,9 @@ public final class SftpProtocolManager {
         }
         if (lower.contains("no such file")) {
             return "\u8fdc\u7aef\u8def\u5f84\u4e0d\u5b58\u5728\u3002";
+        }
+        if (lower.contains("sha-256") || lower.contains("\u6821\u9a8c\u5931\u8d25")) {
+            return "\u4f20\u8f93\u5b8c\u6210\u540e\u6587\u4ef6\u6821\u9a8c\u5931\u8d25\uff0c\u5df2\u62d2\u7edd\u63d0\u4ea4\u7ed3\u679c\u3002";
         }
         return text;
     }
@@ -1655,6 +3176,10 @@ public final class SftpProtocolManager {
 
     private interface SftpClientAction<T> {
         T run(@NonNull ChannelSftp channel) throws Exception;
+    }
+
+    private interface CancelProbe {
+        boolean isCancelled();
     }
 
     private static final class ClientHolder {
@@ -1829,6 +3354,51 @@ public final class SftpProtocolManager {
         }
     }
 
+    private static final class PreparedDownloadTask {
+        @NonNull
+        final DownloadFileTask task;
+        @NonNull
+        final File outputFile;
+
+        PreparedDownloadTask(@NonNull DownloadFileTask task, @NonNull File outputFile) {
+            this.task = task;
+            this.outputFile = outputFile;
+        }
+    }
+
+    private static final class DownloadTaskResult {
+        final boolean success;
+        final boolean cancelled;
+        final long transferredBytes;
+        @Nullable
+        final String errorMessage;
+
+        private DownloadTaskResult(boolean success,
+                                   boolean cancelled,
+                                   long transferredBytes,
+                                   @Nullable String errorMessage) {
+            this.success = success;
+            this.cancelled = cancelled;
+            this.transferredBytes = Math.max(0L, transferredBytes);
+            this.errorMessage = errorMessage;
+        }
+
+        @NonNull
+        static DownloadTaskResult success(long transferredBytes) {
+            return new DownloadTaskResult(true, false, transferredBytes, null);
+        }
+
+        @NonNull
+        static DownloadTaskResult cancelled() {
+            return new DownloadTaskResult(false, true, 0L, null);
+        }
+
+        @NonNull
+        static DownloadTaskResult failure(@Nullable String errorMessage) {
+            return new DownloadTaskResult(false, false, 0L, errorMessage);
+        }
+    }
+
     private static final class DownloadProgressState {
         final int totalFiles;
         final long totalBytes;
@@ -1873,6 +3443,39 @@ public final class SftpProtocolManager {
         }
     }
 
+    private static final class UploadTaskResult {
+        final boolean success;
+        final boolean cancelled;
+        final long transferredBytes;
+        @Nullable
+        final String errorMessage;
+
+        private UploadTaskResult(boolean success,
+                                 boolean cancelled,
+                                 long transferredBytes,
+                                 @Nullable String errorMessage) {
+            this.success = success;
+            this.cancelled = cancelled;
+            this.transferredBytes = Math.max(0L, transferredBytes);
+            this.errorMessage = errorMessage;
+        }
+
+        @NonNull
+        static UploadTaskResult success(long transferredBytes) {
+            return new UploadTaskResult(true, false, transferredBytes, null);
+        }
+
+        @NonNull
+        static UploadTaskResult cancelled() {
+            return new UploadTaskResult(false, true, 0L, null);
+        }
+
+        @NonNull
+        static UploadTaskResult failure(@Nullable String errorMessage) {
+            return new UploadTaskResult(false, false, 0L, errorMessage);
+        }
+    }
+
     private static final class UploadProgressState {
         final int totalFiles;
         final long totalBytes;
@@ -1895,6 +3498,170 @@ public final class SftpProtocolManager {
             this.currentFileTransferred = 0L;
             this.currentFileSize = 0L;
             this.lastDispatchAtMs = 0L;
+        }
+    }
+
+    private static final class ActiveTransferProgress {
+        @NonNull
+        String fileName;
+        long fileSize;
+        long transferredBytes;
+
+        ActiveTransferProgress(@NonNull String fileName, long fileSize, long transferredBytes) {
+            this.fileName = fileName;
+            this.fileSize = Math.max(0L, fileSize);
+            this.transferredBytes = Math.max(0L, transferredBytes);
+        }
+    }
+
+    private static final class ConcurrentTransferProgressSnapshot {
+        final int totalFiles;
+        final int completedFiles;
+        final int failedFiles;
+        final long totalBytes;
+        final long transferredBytes;
+        @NonNull
+        final String currentFile;
+        final long currentFileTransferred;
+        final long currentFileSize;
+
+        ConcurrentTransferProgressSnapshot(int totalFiles,
+                                           int completedFiles,
+                                           int failedFiles,
+                                           long totalBytes,
+                                           long transferredBytes,
+                                           @NonNull String currentFile,
+                                           long currentFileTransferred,
+                                           long currentFileSize) {
+            this.totalFiles = Math.max(0, totalFiles);
+            this.completedFiles = Math.max(0, completedFiles);
+            this.failedFiles = Math.max(0, failedFiles);
+            this.totalBytes = Math.max(0L, totalBytes);
+            this.transferredBytes = Math.max(0L, transferredBytes);
+            this.currentFile = currentFile;
+            this.currentFileTransferred = Math.max(0L, currentFileTransferred);
+            this.currentFileSize = Math.max(0L, currentFileSize);
+        }
+    }
+
+    private static final class ConcurrentTransferProgressState {
+        final int totalFiles;
+        final long totalBytes;
+        private int completedFiles;
+        private int failedFiles;
+        private long settledBytes;
+        @NonNull
+        private String currentFile = "";
+        private long currentFileTransferred;
+        private long currentFileSize;
+        private long lastDispatchAtMs;
+        @NonNull
+        private final Map<String, ActiveTransferProgress> activeTransfers = new HashMap<>();
+
+        ConcurrentTransferProgressState(int totalFiles, long totalBytes) {
+            this.totalFiles = Math.max(0, totalFiles);
+            this.totalBytes = Math.max(0L, totalBytes);
+        }
+
+        synchronized void onFileStarted(@NonNull String key, @NonNull String fileName, long fileSize) {
+            ActiveTransferProgress active = new ActiveTransferProgress(fileName, fileSize, 0L);
+            activeTransfers.put(key, active);
+            currentFile = fileName;
+            currentFileSize = active.fileSize;
+            currentFileTransferred = 0L;
+        }
+
+        synchronized void onFileProgress(@NonNull String key, @NonNull String fileName,
+                                         long fileSize, long transferredBytes) {
+            ActiveTransferProgress active = activeTransfers.get(key);
+            if (active == null) {
+                active = new ActiveTransferProgress(fileName, fileSize, transferredBytes);
+                activeTransfers.put(key, active);
+            } else {
+                active.fileName = fileName;
+                if (fileSize > 0) {
+                    active.fileSize = fileSize;
+                }
+                active.transferredBytes = Math.max(0L, transferredBytes);
+            }
+            currentFile = active.fileName;
+            currentFileSize = active.fileSize;
+            currentFileTransferred = active.transferredBytes;
+        }
+
+        synchronized void onFileSucceeded(@NonNull String key, @NonNull String fileName,
+                                          long fileSize, long transferredBytes) {
+            activeTransfers.remove(key);
+            completedFiles++;
+            settledBytes += Math.max(0L, transferredBytes);
+            currentFile = fileName;
+            currentFileSize = Math.max(0L, fileSize);
+            currentFileTransferred = currentFileSize > 0
+                ? currentFileSize
+                : Math.max(0L, transferredBytes);
+        }
+
+        synchronized void onFileFailed(@NonNull String key, @NonNull String fileName, long fileSize) {
+            activeTransfers.remove(key);
+            failedFiles++;
+            currentFile = fileName;
+            currentFileSize = Math.max(0L, fileSize);
+            currentFileTransferred = 0L;
+        }
+
+        synchronized void onFileCancelled(@NonNull String key, @NonNull String fileName, long fileSize) {
+            activeTransfers.remove(key);
+            currentFile = fileName;
+            currentFileSize = Math.max(0L, fileSize);
+            currentFileTransferred = 0L;
+        }
+
+        synchronized void onTransferFinished() {
+            activeTransfers.clear();
+            currentFile = "";
+            currentFileTransferred = 0L;
+            currentFileSize = 0L;
+        }
+
+        @Nullable
+        synchronized ConcurrentTransferProgressSnapshot snapshot(boolean force) {
+            long now = System.currentTimeMillis();
+            if (!force && now - lastDispatchAtMs < DOWNLOAD_PROGRESS_MIN_INTERVAL_MS) {
+                return null;
+            }
+            lastDispatchAtMs = now;
+
+            long transferredBytes = settledBytes;
+            for (ActiveTransferProgress active : activeTransfers.values()) {
+                if (active == null) continue;
+                transferredBytes += Math.max(0L, active.transferredBytes);
+            }
+            if (totalBytes > 0 && transferredBytes > totalBytes) {
+                transferredBytes = totalBytes;
+            }
+
+            return new ConcurrentTransferProgressSnapshot(
+                totalFiles,
+                completedFiles,
+                failedFiles,
+                totalBytes,
+                transferredBytes,
+                currentFile,
+                currentFileTransferred,
+                currentFileSize
+            );
+        }
+
+        synchronized int completedFiles() {
+            return completedFiles;
+        }
+
+        synchronized int failedFiles() {
+            return failedFiles;
+        }
+
+        synchronized long settledBytes() {
+            return settledBytes;
         }
     }
 
@@ -2054,6 +3821,30 @@ public final class SftpProtocolManager {
         @NonNull
         static CreateResult fail(@NonNull String messageCn) {
             return new CreateResult(false, "", messageCn);
+        }
+    }
+
+    public static final class DeleteResult {
+        public final boolean success;
+        @NonNull
+        public final String virtualPath;
+        @NonNull
+        public final String messageCn;
+
+        private DeleteResult(boolean success, @NonNull String virtualPath, @NonNull String messageCn) {
+            this.success = success;
+            this.virtualPath = virtualPath;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static DeleteResult ok(@NonNull String virtualPath) {
+            return new DeleteResult(true, virtualPath, "");
+        }
+
+        @NonNull
+        static DeleteResult fail(@NonNull String messageCn) {
+            return new DeleteResult(false, "", messageCn);
         }
     }
 
@@ -2253,6 +4044,119 @@ public final class SftpProtocolManager {
         }
     }
 
+    public interface RemoteTransferProgressListener {
+        void onProgress(@NonNull RemoteTransferProgress progress);
+    }
+
+    public interface RemoteTransferControl {
+        boolean isCancelled();
+    }
+
+    public static final class RemoteTransferProgress {
+        @NonNull
+        public final String stage;
+        @NonNull
+        public final String stageLabelCn;
+        public final int totalFiles;
+        public final int completedFiles;
+        public final int failedFiles;
+        public final long totalBytes;
+        public final long transferredBytes;
+        @NonNull
+        public final String currentFile;
+        public final long currentFileTransferred;
+        public final long currentFileSize;
+        @NonNull
+        public final String messageCn;
+
+        private RemoteTransferProgress(@NonNull String stage,
+                                       @NonNull String stageLabelCn,
+                                       int totalFiles,
+                                       int completedFiles,
+                                       int failedFiles,
+                                       long totalBytes,
+                                       long transferredBytes,
+                                       @NonNull String currentFile,
+                                       long currentFileTransferred,
+                                       long currentFileSize,
+                                       @NonNull String messageCn) {
+            this.stage = stage;
+            this.stageLabelCn = stageLabelCn;
+            this.totalFiles = Math.max(0, totalFiles);
+            this.completedFiles = Math.max(0, completedFiles);
+            this.failedFiles = Math.max(0, failedFiles);
+            this.totalBytes = Math.max(0L, totalBytes);
+            this.transferredBytes = Math.max(0L, transferredBytes);
+            this.currentFile = currentFile;
+            this.currentFileTransferred = Math.max(0L, currentFileTransferred);
+            this.currentFileSize = Math.max(0L, currentFileSize);
+            this.messageCn = messageCn;
+        }
+    }
+
+    public static final class RemoteTransferResult {
+        public final boolean success;
+        public final int totalFiles;
+        public final int transferredFiles;
+        public final int failedFiles;
+        public final long totalBytes;
+        public final long transferredBytes;
+        @NonNull
+        public final String messageCn;
+
+        private RemoteTransferResult(boolean success,
+                                     int totalFiles,
+                                     int transferredFiles,
+                                     int failedFiles,
+                                     long totalBytes,
+                                     long transferredBytes,
+                                     @NonNull String messageCn) {
+            this.success = success;
+            this.totalFiles = Math.max(0, totalFiles);
+            this.transferredFiles = Math.max(0, transferredFiles);
+            this.failedFiles = Math.max(0, failedFiles);
+            this.totalBytes = Math.max(0L, totalBytes);
+            this.transferredBytes = Math.max(0L, transferredBytes);
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static RemoteTransferResult ok(int totalFiles,
+                                       int transferredFiles,
+                                       int failedFiles,
+                                       long totalBytes,
+                                       long transferredBytes) {
+            return new RemoteTransferResult(true, totalFiles, transferredFiles, failedFiles,
+                totalBytes, transferredBytes, "");
+        }
+
+        @NonNull
+        static RemoteTransferResult fail(@NonNull String messageCn) {
+            return new RemoteTransferResult(false, 0, 0, 0, 0L, 0L, messageCn);
+        }
+
+        @NonNull
+        static RemoteTransferResult cancelled(int totalFiles,
+                                              int transferredFiles,
+                                              int failedFiles,
+                                              long totalBytes,
+                                              long transferredBytes) {
+            return new RemoteTransferResult(false, totalFiles, transferredFiles, failedFiles,
+                totalBytes, transferredBytes, "\u670d\u52a1\u5668\u4e92\u4f20\u5df2\u53d6\u6d88");
+        }
+
+        @NonNull
+        static RemoteTransferResult failWithStats(int totalFiles,
+                                                  int transferredFiles,
+                                                  int failedFiles,
+                                                  long totalBytes,
+                                                  long transferredBytes,
+                                                  @NonNull String messageCn) {
+            return new RemoteTransferResult(false, totalFiles, transferredFiles, failedFiles,
+                totalBytes, transferredBytes, messageCn);
+        }
+    }
+
     public static final class ProbeResult {
         public final boolean success;
         @NonNull
@@ -2277,5 +4181,3 @@ public final class SftpProtocolManager {
         }
     }
 }
-
-

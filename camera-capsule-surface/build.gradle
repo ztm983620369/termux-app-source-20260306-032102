@@ -1,0 +1,32 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace "com.termux.cameracapsulesurface"
+
+    compileSdkVersion project.properties.compileSdkVersion.toInteger()
+
+    defaultConfig {
+        minSdkVersion project.properties.minSdkVersion.toInteger()
+        targetSdkVersion project.properties.targetSdkVersion.toInteger()
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders = [TERMUX_PACKAGE_NAME: "com.termux"]
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    buildFeatures {
+        buildConfig false
+    }
+}
+
+dependencies {
+    implementation "androidx.annotation:annotation:1.9.0"
+    implementation "androidx.core:core:1.17.0"
+    implementation "dev.rikka.shizuku:api:13.1.5"
+    implementation "dev.rikka.shizuku:provider:13.1.5"
+    implementation project(":system-status-surface")
+    testImplementation "junit:junit:4.13.2"
+}

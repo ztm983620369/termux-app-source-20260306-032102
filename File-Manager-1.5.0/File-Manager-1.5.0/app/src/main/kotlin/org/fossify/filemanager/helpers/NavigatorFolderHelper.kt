@@ -10,11 +10,8 @@ import java.util.LinkedHashSet
 
 object NavigatorFolderHelper {
 
-    private const val NAV_ROOT_RELATIVE_PATH = ".termux/.navigator"
-
     fun rootPath(context: Context): String {
-        val root = context.filesDir.absolutePath.trimEnd('/')
-        return "$root/$NAV_ROOT_RELATIVE_PATH"
+        return TermuxPathScope.navigatorRootPath(context)
     }
 
     fun displayTitle(): String {
@@ -29,11 +26,14 @@ object NavigatorFolderHelper {
     fun buildNavigatorItems(context: Context): ArrayList<ListItem> {
         val coordinator = SessionFileCoordinator.getInstance()
         val selectedKey = coordinator.getSelectedSessionKey(context)
-        val termuxRoot = context.filesDir.absolutePath.trimEnd('/')
-        val homePath = clampToRoot(context.config.homeFolder, termuxRoot)
+        val homePath = TermuxPathScope.clampVisiblePath(
+            context,
+            context.config.homeFolder,
+            TermuxPathScope.termuxHomePath(context)
+        )
         val favoritePaths = context.config.favorites
-            .map { clampToRoot(it, termuxRoot) }
-            .filter { it.startsWith(termuxRoot) }
+            .map { TermuxPathScope.normalizePath(it) }
+            .filter { TermuxPathScope.isVisibleInFileManager(context, it) }
 
         val now = System.currentTimeMillis()
         val usedTargets = LinkedHashSet<String>()
@@ -57,8 +57,11 @@ object NavigatorFolderHelper {
             )
         }
 
-        addFolder("Termux", termuxRoot, selected = selectedKey.isNullOrEmpty())
         addFolder("\u672c\u5730\u5de5\u4f5c\u76ee\u5f55", homePath, selected = selectedKey.isNullOrEmpty())
+
+        if (context.config.showTermuxSystemDirs) {
+            addFolder(context.getString(org.fossify.filemanager.R.string.termux_system_dirs), TermuxPathScope.termuxRootPath(context))
+        }
 
         favoritePaths.forEach { path ->
             val label = "\u6536\u85cf / ${context.humanizePath(path)}"
@@ -98,16 +101,7 @@ object NavigatorFolderHelper {
         return null
     }
 
-    private fun clampToRoot(rawPath: String?, root: String): String {
-        val normalized = normalizePath(rawPath ?: "")
-        return if (normalized == root || normalized.startsWith("$root/")) normalized else root
-    }
-
     private fun normalizePath(rawPath: String): String {
-        var path = rawPath.trim().replace('\\', '/')
-        while (path.contains("//")) path = path.replace("//", "/")
-        if (path.endsWith("/") && path.length > 1) path = path.substring(0, path.length - 1)
-        return if (path.isEmpty()) "/" else path
+        return TermuxPathScope.normalizePath(rawPath)
     }
 }
-

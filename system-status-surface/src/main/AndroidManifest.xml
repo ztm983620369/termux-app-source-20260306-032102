@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+
+    <application>
+        <receiver
+            android:name=".SystemStatusSurfaceReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.termux.systemstatussurface.action.PUBLISH" />
+                <action android:name="com.termux.systemstatussurface.action.CANCEL" />
+                <action android:name="com.termux.systemstatussurface.action.CLEAR_ALL" />
+                <action android:name="com.termux.systemstatussurface.action.OPEN_PROMOTION_SETTINGS" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

@@ -12,7 +12,10 @@ import java.util.concurrent.atomic.AtomicInteger
 data class RecentFileEntry(
     val path: String,
     val displayName: String,
-    val openedAtMs: Long
+    val openedAtMs: Long,
+    val originType: String? = null,
+    val originPath: String? = null,
+    val originDisplayPath: String? = null
 )
 
 object RecentFileHistory {
@@ -23,9 +26,12 @@ object RecentFileHistory {
     private const val KEY_PATH = "path"
     private const val KEY_DISPLAY_NAME = "display_name"
     private const val KEY_OPENED_AT_MS = "opened_at_ms"
+    private const val KEY_ORIGIN_TYPE = "origin_type"
+    private const val KEY_ORIGIN_PATH = "origin_path"
+    private const val KEY_ORIGIN_DISPLAY_PATH = "origin_display_path"
 
     private const val DB_NAME = "recent_files.db"
-    private const val DB_VERSION = 1
+    private const val DB_VERSION = 2
     private const val TABLE_RECENT_FILES = "recent_files"
 
     private const val MAX_ENTRIES = 300
@@ -45,14 +51,28 @@ object RecentFileHistory {
     }
 
     @JvmStatic
-    fun recordOpenedFile(context: Context, path: String, displayName: String? = null) {
+    fun recordOpenedFile(
+        context: Context,
+        path: String,
+        displayName: String? = null,
+        originType: String? = null,
+        originPath: String? = null,
+        originDisplayPath: String? = null
+    ) {
         val normalizedPath = path.trim()
         if (normalizedPath.isEmpty()) return
 
         val now = System.currentTimeMillis()
         val resolvedName = displayName?.trim().takeUnless { it.isNullOrEmpty() }
             ?: File(normalizedPath).name.ifBlank { normalizedPath.substringAfterLast('/') }
-        val entry = RecentFileEntry(normalizedPath, resolvedName, now)
+        val entry = RecentFileEntry(
+            path = normalizedPath,
+            displayName = resolvedName,
+            openedAtMs = now,
+            originType = originType?.trim().takeUnless { it.isNullOrEmpty() },
+            originPath = originPath?.trim().takeUnless { it.isNullOrEmpty() },
+            originDisplayPath = originDisplayPath?.trim().takeUnless { it.isNullOrEmpty() }
+        )
 
         pendingWrites[normalizedPath] = entry
 
@@ -62,10 +82,7 @@ object RecentFileHistory {
                 val db = getDb(appContext)
                 db.beginTransactionNonExclusive()
                 try {
-                    db.execSQL(
-                        "INSERT OR REPLACE INTO $TABLE_RECENT_FILES($KEY_PATH, $KEY_DISPLAY_NAME, $KEY_OPENED_AT_MS) VALUES (?, ?, ?)",
-                        arrayOf<Any>(entry.path, entry.displayName, entry.openedAtMs)
-                    )
+                    insertOrReplaceEntry(db, entry)
                     if (writeCounter.incrementAndGet() % TRIM_EVERY_WRITES == 0) {
                         trimToMaxEntries(db)
                     }
@@ -122,20 +139,54 @@ object RecentFileHistory {
         val db = getDb(context)
         val results = ArrayList<RecentFileEntry>(limit.coerceAtLeast(8))
         db.rawQuery(
-            "SELECT $KEY_PATH, $KEY_DISPLAY_NAME, $KEY_OPENED_AT_MS FROM $TABLE_RECENT_FILES ORDER BY $KEY_OPENED_AT_MS DESC LIMIT ?",
+            "SELECT $KEY_PATH, $KEY_DISPLAY_NAME, $KEY_OPENED_AT_MS, " +
+                "$KEY_ORIGIN_TYPE, $KEY_ORIGIN_PATH, $KEY_ORIGIN_DISPLAY_PATH " +
+                "FROM $TABLE_RECENT_FILES ORDER BY $KEY_OPENED_AT_MS DESC LIMIT ?",
             arrayOf(limit.toString())
         ).use { cursor ->
             val pathIndex = cursor.getColumnIndexOrThrow(KEY_PATH)
             val nameIndex = cursor.getColumnIndexOrThrow(KEY_DISPLAY_NAME)
             val openedAtIndex = cursor.getColumnIndexOrThrow(KEY_OPENED_AT_MS)
+            val originTypeIndex = cursor.getColumnIndex(KEY_ORIGIN_TYPE)
+            val originPathIndex = cursor.getColumnIndex(KEY_ORIGIN_PATH)
+            val originDisplayPathIndex = cursor.getColumnIndex(KEY_ORIGIN_DISPLAY_PATH)
             while (cursor.moveToNext()) {
                 val path = cursor.getString(pathIndex)
                 val displayName = cursor.getString(nameIndex)
                 val openedAtMs = cursor.getLong(openedAtIndex)
-                results.add(RecentFileEntry(path, displayName, openedAtMs))
+                val originType = originTypeIndex.takeIf { it >= 0 }?.let(cursor::getString)
+                val originPath = originPathIndex.takeIf { it >= 0 }?.let(cursor::getString)
+                val originDisplayPath = originDisplayPathIndex.takeIf { it >= 0 }?.let(cursor::getString)
+                results.add(
+                    RecentFileEntry(
+                        path = path,
+                        displayName = displayName,
+                        openedAtMs = openedAtMs,
+                        originType = originType,
+                        originPath = originPath,
+                        originDisplayPath = originDisplayPath
+                    )
+                )
             }
         }
         return results
+    }
+
+    private fun insertOrReplaceEntry(db: SQLiteDatabase, entry: RecentFileEntry) {
+        db.execSQL(
+            "INSERT OR REPLACE INTO $TABLE_RECENT_FILES(" +
+                "$KEY_PATH, $KEY_DISPLAY_NAME, $KEY_OPENED_AT_MS, " +
+                "$KEY_ORIGIN_TYPE, $KEY_ORIGIN_PATH, $KEY_ORIGIN_DISPLAY_PATH" +
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+            arrayOf<Any?>(
+                entry.path,
+                entry.displayName,
+                entry.openedAtMs,
+                entry.originType,
+                entry.originPath,
+                entry.originDisplayPath
+            )
+        )
     }
 
     private fun trimToMaxEntries(db: SQLiteDatabase) {
@@ -191,7 +242,19 @@ object RecentFileHistory {
                 val displayName = obj.optString(KEY_DISPLAY_NAME).trim()
                     .ifEmpty { File(path).name.ifBlank { path.substringAfterLast('/') } }
                 val openedAtMs = obj.optLong(KEY_OPENED_AT_MS, 0L)
-                parsed.add(RecentFileEntry(path, displayName, openedAtMs))
+                val originType = obj.optString(KEY_ORIGIN_TYPE).trim().ifEmpty { null }
+                val originPath = obj.optString(KEY_ORIGIN_PATH).trim().ifEmpty { null }
+                val originDisplayPath = obj.optString(KEY_ORIGIN_DISPLAY_PATH).trim().ifEmpty { null }
+                parsed.add(
+                    RecentFileEntry(
+                        path = path,
+                        displayName = displayName,
+                        openedAtMs = openedAtMs,
+                        originType = originType,
+                        originPath = originPath,
+                        originDisplayPath = originDisplayPath
+                    )
+                )
             }
         } catch (_: Exception) {
             prefs.edit().putBoolean(KEY_DB_MIGRATED, true).apply()
@@ -206,10 +269,7 @@ object RecentFileHistory {
             db.beginTransactionNonExclusive()
             try {
                 migratedEntries.take(MAX_ENTRIES).forEach { item ->
-                    db.execSQL(
-                        "INSERT OR REPLACE INTO $TABLE_RECENT_FILES($KEY_PATH, $KEY_DISPLAY_NAME, $KEY_OPENED_AT_MS) VALUES (?, ?, ?)",
-                        arrayOf<Any>(item.path, item.displayName, item.openedAtMs)
-                    )
+                    insertOrReplaceEntry(db, item)
                 }
                 db.setTransactionSuccessful()
             } finally {
@@ -233,7 +293,10 @@ object RecentFileHistory {
                 "CREATE TABLE IF NOT EXISTS $TABLE_RECENT_FILES (" +
                     "$KEY_PATH TEXT PRIMARY KEY NOT NULL, " +
                     "$KEY_DISPLAY_NAME TEXT NOT NULL, " +
-                    "$KEY_OPENED_AT_MS INTEGER NOT NULL" +
+                    "$KEY_OPENED_AT_MS INTEGER NOT NULL, " +
+                    "$KEY_ORIGIN_TYPE TEXT, " +
+                    "$KEY_ORIGIN_PATH TEXT, " +
+                    "$KEY_ORIGIN_DISPLAY_PATH TEXT" +
                     ")"
             )
             db.execSQL(
@@ -242,7 +305,11 @@ object RecentFileHistory {
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            // No-op for v1.
+            if (oldVersion < 2) {
+                db.execSQL("ALTER TABLE $TABLE_RECENT_FILES ADD COLUMN $KEY_ORIGIN_TYPE TEXT")
+                db.execSQL("ALTER TABLE $TABLE_RECENT_FILES ADD COLUMN $KEY_ORIGIN_PATH TEXT")
+                db.execSQL("ALTER TABLE $TABLE_RECENT_FILES ADD COLUMN $KEY_ORIGIN_DISPLAY_PATH TEXT")
+            }
         }
     }
 }

@@ -87,7 +87,12 @@ import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
 import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
 import org.fossify.filemanager.helpers.SessionSelfTestRunner
-import org.fossify.filemanager.interfaces.FileManagerHost
+import org.fossify.filemanager.helpers.TermuxPathScope
+import org.fossify.filemanager.interfaces.FileManagerControllerCommands
+import org.fossify.filemanager.interfaces.FileManagerDependencies
+import org.fossify.filemanager.interfaces.FileManagerEnvironment
+import org.fossify.filemanager.interfaces.FileManagerExternalActions
+import org.fossify.filemanager.interfaces.FileManagerResultHandler
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import java.io.File
 
@@ -95,8 +100,9 @@ class FileManagerController(
     private val activity: SimpleActivity,
     private val binding: FmActivityMainBinding,
     private val intentProvider: () -> Intent,
+    private val externalActions: FileManagerExternalActions,
     private val enableEdgeToEdge: Boolean = true
-) : FileManagerHost {
+) : FileManagerEnvironment, FileManagerControllerCommands, FileManagerResultHandler {
     companion object {
         private const val BACK_PRESS_TIMEOUT = 5000
         private const val PICKED_PATH = "picked_path"
@@ -105,7 +111,8 @@ class FileManagerController(
     private var wasBackJustPressed = false
     private var mTabsToShow = ArrayList<Int>()
     private var mainFabMenu: PopupWindow? = null
-    private val termuxRootPath: String by lazy { activity.filesDir.absolutePath.trimEnd('/') }
+    private val termuxRootPath: String by lazy { TermuxPathScope.termuxRootPath(activity) }
+    private val termuxHomePath: String by lazy { TermuxPathScope.termuxHomePath(activity) }
 
     private var mStoredFontSize = 0
     private var mStoredDateFormat = ""
@@ -115,6 +122,13 @@ class FileManagerController(
     private var mSelectedSessionId: String? = null
     private var mInitialSessionApplied = false
     private var mSwitchingSession = false
+    private val fileManagerDependencies by lazy {
+        FileManagerDependencies(
+            environment = this,
+            controllerCommands = this,
+            resultHandler = this
+        )
+    }
 
     val rootView: View
         get() = binding.root
@@ -139,8 +153,7 @@ class FileManagerController(
         setupOptionsMenu()
         applyContainerColors()
         refreshMenuItems()
-        activity.config.preferTermuxStorage = true
-        val scopedHome = clampToTermuxRoot(activity.config.homeFolder)
+        val scopedHome = clampToVisibleTermuxPath(activity.config.homeFolder, termuxHomePath)
         if (activity.config.homeFolder != scopedHome) {
             activity.config.homeFolder = scopedHome
         }
@@ -246,7 +259,13 @@ class FileManagerController(
         } else if (currentFragment is ItemsFragment) {
             val currentPath = currentFragment.currentPath.trimEnd('/')
             val navigatorRoot = NavigatorFolderHelper.rootPath(activity).trimEnd('/')
-            val atRoot = currentPath.isEmpty() || currentPath == "/" || currentPath == termuxRootPath || currentPath == navigatorRoot || isVirtualWorkspaceRoot(currentPath)
+            val localRoot = TermuxPathScope.preferredLocalRoot(activity).trimEnd('/')
+            val atRoot = currentPath.isEmpty() ||
+                currentPath == "/" ||
+                currentPath == localRoot ||
+                currentPath == termuxRootPath ||
+                currentPath == navigatorRoot ||
+                isVirtualWorkspaceRoot(currentPath)
             if (atRoot) {
                 if (!wasBackJustPressed && activity.config.pressBackTwice) {
                     wasBackJustPressed = true
@@ -274,12 +293,14 @@ class FileManagerController(
         var newPath = path
         val file = File(path)
         if (file.exists() && !file.isDirectory) {
-            newPath = file.parent ?: termuxRootPath
+            newPath = file.parent ?: getPreferredStartPath()
         }
 
-        val scopedPath = clampToTermuxRoot(newPath)
+        val scopedPath = clampToVisibleTermuxPath(newPath, getPreferredStartPath())
         getItemsFragment()?.openPath(scopedPath, forceRefresh)
     }
+    override fun isTermuxScopedFileManager(): Boolean = true
+
     override fun showSessionSwitcher() {
         mSelectedSessionId = mSessionFileCoordinator.getSelectedSessionKey(activity)
         val targets = mSessionFileCoordinator.listTargets(activity)
@@ -331,7 +352,7 @@ class FileManagerController(
     override fun createDocumentConfirmed(path: String) {
         val filename = intentProvider().getStringExtra(Intent.EXTRA_TITLE) ?: ""
         if (filename.isEmpty()) {
-            InsertFilenameDialog(activity, termuxRootPath) { newFilename ->
+            InsertFilenameDialog(activity, path.ifBlank { getPreferredStartPath() }) { newFilename ->
                 finishCreateDocumentIntent(path, newFilename)
             }
         } else {
@@ -397,6 +418,12 @@ class FileManagerController(
             findItem(R.id.go_home).isVisible = false
             findItem(R.id.set_as_home).isVisible = currentFragment is ItemsFragment && !isNavigator && currentFragment.currentPath != activity.config.homeFolder
             findItem(R.id.toggle_termux_storage).isVisible = false
+            findItem(R.id.toggle_termux_system_dirs).isVisible = currentFragment is ItemsFragment && !isCreateDocumentIntent
+            findItem(R.id.toggle_termux_system_dirs).title =
+                activity.getString(
+                    if (activity.config.showTermuxSystemDirs) R.string.hide_termux_system_dirs
+                    else R.string.show_termux_system_dirs
+                )
 
             findItem(R.id.open_in_terminal).isVisible = currentFragment is ItemsFragment && !isCreateDocumentIntent && !isNavigator
 
@@ -425,8 +452,8 @@ class FileManagerController(
         }
     }
 
-    override fun openInTerminal(path: String) {
-        (activity as? FileManagerHost)?.openInTerminal(path)
+    private fun openInTerminal(path: String) {
+        externalActions.openInTerminal(path)
     }
 
     private fun setupOptionsMenu() {
@@ -458,6 +485,7 @@ class FileManagerController(
                     R.id.remove_favorite -> removeFavorite()
                     R.id.toggle_filename -> toggleFilenameVisibility()
                     R.id.toggle_termux_storage -> toggleTermuxStorage()
+                    R.id.toggle_termux_system_dirs -> toggleTermuxSystemDirs()
                     R.id.open_in_terminal -> openInTerminal(getCurrentFragment()?.currentPath ?: return@setOnMenuItemClickListener true)
                     R.id.set_as_home -> setAsHome()
                     R.id.change_view_type -> changeViewType()
@@ -476,25 +504,19 @@ class FileManagerController(
     }
 
     private fun toggleTermuxStorage() {
-        activity.config.preferTermuxStorage = true
-        openPath(termuxRootPath, forceRefresh = true)
+        openPath(getPreferredStartPath(), forceRefresh = true)
     }
 
     private fun getPreferredStartPath(): String {
-        activity.config.preferTermuxStorage = true
-        return termuxRootPath
+        return clampToVisibleTermuxPath(activity.config.homeFolder, termuxHomePath)
     }
 
     private fun isInTermuxStorage(path: String): Boolean {
-        val p = path.trimEnd('/')
-        return p == termuxRootPath || p.startsWith("$termuxRootPath/")
+        return TermuxPathScope.isInTermuxRoot(activity, path)
     }
 
-    private fun clampToTermuxRoot(path: String?): String {
-        val raw = path?.trim().orEmpty()
-        if (raw.isEmpty()) return termuxRootPath
-        val normalized = raw.trimEnd('/')
-        return if (isInTermuxStorage(normalized)) normalized else termuxRootPath
+    private fun clampToVisibleTermuxPath(path: String?, fallback: String): String {
+        return TermuxPathScope.clampVisiblePath(activity, path, fallback)
     }
 
     private fun updateMenuColors() {
@@ -576,7 +598,7 @@ class FileManagerController(
 
     private fun initFragments() {
         binding.mainViewPager.apply {
-            adapter = ViewPagerAdapter(activity, mTabsToShow, intentProvider)
+            adapter = ViewPagerAdapter(activity, mTabsToShow, intentProvider, fileManagerDependencies)
             offscreenPageLimit = 2
             addOnPageChangeListener(object : ViewPager.OnPageChangeListener {
                 override fun onPageScrollStateChanged(state: Int) {}
@@ -758,7 +780,7 @@ class FileManagerController(
     }
 
     private fun goHome() {
-        val scopedHome = clampToTermuxRoot(activity.config.homeFolder)
+        val scopedHome = clampToVisibleTermuxPath(activity.config.homeFolder, termuxHomePath)
         if (scopedHome != getCurrentFragment()!!.currentPath) {
             openPath(scopedHome)
         }
@@ -814,7 +836,7 @@ class FileManagerController(
     }
 
     private fun setAsHome() {
-        activity.config.homeFolder = clampToTermuxRoot(getCurrentFragment()!!.currentPath)
+        activity.config.homeFolder = clampToVisibleTermuxPath(getCurrentFragment()!!.currentPath, termuxHomePath)
         activity.toast(R.string.home_folder_updated)
     }
 
@@ -962,6 +984,7 @@ class FileManagerController(
             }
         }
     }
+
     private fun applySelectedSessionContext(forceRefresh: Boolean) {
         if (mSwitchingSession) return
 
@@ -981,7 +1004,7 @@ class FileManagerController(
                     if (result.messageCn.isNotBlank()) {
                         activity.toast(result.messageCn)
                     }
-                    val fallback = if (result.rootPath.isBlank()) termuxRootPath else result.rootPath
+                    val fallback = if (result.rootPath.isBlank()) getPreferredStartPath() else result.rootPath
                     openPath(fallback, forceRefresh)
                 }
             }
@@ -998,13 +1021,14 @@ class FileManagerController(
 
     private fun resolveParentPathForNavigation(rawPath: String): String {
         val current = rawPath.trimEnd('/').ifEmpty { "/" }
-        if (current == "/") return termuxRootPath
+        val localRoot = getPreferredStartPath()
+        if (current == "/" || current == localRoot) return localRoot
 
         if (isVirtualWorkspaceRoot(current)) {
             return current
         }
 
-        return File(current).parent?.trimEnd('/').orEmpty().ifEmpty { termuxRootPath }
+        return File(current).parent?.trimEnd('/').orEmpty().ifEmpty { localRoot }
     }
 
     private fun isVirtualWorkspaceRoot(current: String): Boolean {
@@ -1013,6 +1037,18 @@ class FileManagerController(
         if (!current.startsWith(virtualPrefix)) return false
         val tail = current.removePrefix(virtualPrefix)
         return tail.isNotEmpty() && !tail.contains("/")
+    }
+
+    private fun toggleTermuxSystemDirs() {
+        activity.config.showTermuxSystemDirs = !activity.config.showTermuxSystemDirs
+
+        val currentPath = getCurrentFragment()?.currentPath.orEmpty()
+        if (!TermuxPathScope.isVisibleInFileManager(activity, currentPath)) {
+            openPath(getPreferredStartPath(), forceRefresh = true)
+        } else {
+            refreshMenuItems()
+            getCurrentFragment()?.refreshFragment()
+        }
     }
 
     private fun finishCreateDocumentIntent(path: String, filename: String) {
@@ -1051,6 +1087,3 @@ class FileManagerController(
         }
     }
 }
-
-
-

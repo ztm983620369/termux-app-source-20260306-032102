@@ -61,10 +61,15 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.doOnLayout
 import androidx.lifecycle.lifecycleScope
 import com.termux.bridge.FileEditorContract
+import com.termux.bridge.FileOpenEvent
 import com.termux.bridge.FileOpenBridge
 import com.termux.bridge.FileOpenListener
 import com.termux.bridge.FileOpenRequest
 import com.termux.bridge.RecentFileHistory
+import com.termux.editorsync.EditorDocumentSyncManager
+import com.termux.editorsync.EditorSaveTrigger
+import com.termux.editorsync.EditorSyncTarget
+import com.termux.editorsync.EditorSyncTargetKind
 import io.github.rosemoe.sora.app.databinding.ActivityMainBinding
 import io.github.rosemoe.sora.app.lsp.LspTestActivity
 import io.github.rosemoe.sora.app.lsp.LspTestJavaActivity
@@ -98,6 +103,7 @@ import io.github.rosemoe.sora.widget.getComponent
 import io.github.rosemoe.sora.widget.subscribeAlways
 import io.github.rosemoe.sora.app.ide.IdeRunManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.eclipse.tm4e.core.internal.oniguruma.Oniguruma
@@ -216,7 +222,8 @@ class EditorController(
 
     private lateinit var editorEnv: EditorEnvironment
     private lateinit var vscode: VSCodeIntegration
-    private lateinit var autoSave: LinuxAutoSaveManager
+    private lateinit var documentSync: EditorDocumentSyncManager
+    private val saveStatusUi = EditorSaveStatusUi()
 
     private var lastBridgeSeqHandled: Long = 0L
     private var lastOpenRequest: FileOpenRequest? = null
@@ -230,6 +237,7 @@ class EditorController(
 
     private val prefs by lazy { activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
     private var applyToolbarTopInsetFromSystemBars: Boolean = true
+    private var suppressContentChangeCallbacks: Boolean = false
 
     // ---------------- IME accessory bar (FULL REFACTOR) ----------------
     private var barFullHeightPx: Int = 0
@@ -258,13 +266,17 @@ class EditorController(
         // Fully refactored: ultra-smooth IME bar
         setupImeAccessoryBarController()
 
-        autoSave = LinuxAutoSaveManager(
+        documentSync = EditorDocumentSyncManager(
             context = activity,
             prefs = prefs,
             scope = activity.lifecycleScope,
-            editor = binding.editor,
-            currentFilePathProvider = { lastOpenRequest?.path }
+            textSnapshotProvider = { binding.editor.text.toString() }
         )
+        lifecycleScope.launch {
+            documentSync.state.collect { snapshot ->
+                saveStatusUi.render(snapshot)
+            }
+        }
 
         val typeface = Typeface.createFromAsset(activity.assets, "JetBrainsMono-Regular.ttf")
 
@@ -335,7 +347,9 @@ class EditorController(
                     ::updateBtnState,
                     50
                 )
-                autoSave.onContentChanged()
+                if (!suppressContentChangeCallbacks) {
+                    documentSync.onContentChanged()
+                }
             }
             subscribeAlways<SideIconClickEvent> {
                 toast(R.string.tip_side_icon)
@@ -385,7 +399,7 @@ class EditorController(
         // ---- File open bridge ----
         FileOpenBridge.addListener(fileOpenListener)
         applyOpenRequest(FileEditorContract.fromIntent(intent), "intent.onCreate")
-        applyOpenRequest(FileOpenBridge.getLatestRequest(), "bridge.onCreate")
+        applyPendingBridgeRequests("bridge.onCreate")
 
         updateBtnState()
         editorEnv.applyUserPreferredTheme()
@@ -662,11 +676,7 @@ class EditorController(
     }
 
     fun onResume() {
-        val latestSeq = FileOpenBridge.getLatestSequence()
-        if (latestSeq != 0L && latestSeq != lastBridgeSeqHandled) {
-            lastBridgeSeqHandled = latestSeq
-            applyOpenRequest(FileOpenBridge.getLatestRequest(), "bridge.onResume")
-        }
+        applyPendingBridgeRequests("bridge.onResume")
     }
 
     /**
@@ -784,11 +794,9 @@ class EditorController(
                     withContext(Dispatchers.Main) {
                         if (openToken != openGeneration.get()) return@withContext
                         lastOpenOkAtMs = System.currentTimeMillis()
-                        RecentFileHistory.recordOpenedFile(
-                            activity,
-                            path,
-                            request.displayName ?: file.name
-                        )
+                        documentSync.bindDocument(buildSyncTarget(normalizedReq = request, file = file), binding.editor.text.toString())
+                        activity.invalidateOptionsMenu()
+                        recordRecentFileOpen(request, file)
                     }
                 }
                 return@launch
@@ -807,22 +815,21 @@ class EditorController(
 
             withContext(Dispatchers.Main) {
                 if (openToken != openGeneration.get()) return@withContext
+                suppressContentChangeCallbacks = true
                 binding.editor.setText(text, null)
+                documentSync.bindDocument(buildSyncTarget(normalizedReq = request, file = file), binding.editor.text.toString())
                 updateBtnState()
                 lastOpenOkAtMs = System.currentTimeMillis()
                 lastOpenError = null
                 loadedPath = path
                 loadedLastModified = fileModified
                 loadedSize = fileSize
-                autoSave.onFileOpenedFromDisk(path)
-                RecentFileHistory.recordOpenedFile(
-                    activity,
-                    path,
-                    request.displayName ?: file.name
-                )
+                activity.invalidateOptionsMenu()
+                recordRecentFileOpen(request, file)
 
                 // Apply syntax on next frame so text becomes visible earlier.
                 binding.editor.post {
+                    suppressContentChangeCallbacks = false
                     if (openToken != openGeneration.get()) return@post
                     vscode.maybeAutoApplyVSCodeSyntaxByFileName(path)
                 }
@@ -830,7 +837,42 @@ class EditorController(
         }
     }
 
-    private fun applyOpenRequest(req: FileOpenRequest?, source: String) {
+    private fun buildSyncTarget(normalizedReq: FileOpenRequest, file: File): EditorSyncTarget {
+        val isRemote = normalizedReq.originType == FileOpenRequest.ORIGIN_SFTP_VIRTUAL &&
+            !normalizedReq.originPath.isNullOrBlank()
+        return EditorSyncTarget(
+            localPath = normalizedReq.path,
+            displayName = normalizedReq.displayName ?: file.name,
+            readOnly = normalizedReq.readOnly || !file.canWrite(),
+            extension = normalizedReq.extension,
+            mimeType = normalizedReq.mimeType,
+            kind = if (isRemote) EditorSyncTargetKind.SFTP_VIRTUAL_FILE else EditorSyncTargetKind.LOCAL_FILE,
+            originPath = normalizedReq.originPath,
+            originDisplayPath = normalizedReq.originDisplayPath
+        )
+    }
+
+    private fun recordRecentFileOpen(request: FileOpenRequest, file: File) {
+        RecentFileHistory.recordOpenedFile(
+            context = activity,
+            path = request.path,
+            displayName = request.displayName ?: file.name,
+            originType = request.originType,
+            originPath = request.originPath,
+            originDisplayPath = request.originDisplayPath
+        )
+    }
+
+    private fun applyPendingBridgeRequests(source: String) {
+        val events = FileOpenBridge.getEventsAfter(lastBridgeSeqHandled)
+        if (events.isEmpty()) return
+
+        for (event in events) {
+            applyOpenRequest(event.request, source, event.sequence)
+        }
+    }
+
+    private fun applyOpenRequest(req: FileOpenRequest?, source: String, bridgeSequence: Long? = null) {
         if (req == null) return
         val normalizedPath = req.path.trim()
         if (normalizedPath.isEmpty()) return
@@ -838,18 +880,19 @@ class EditorController(
         val normalizedReq = if (normalizedPath == req.path) req else req.copy(path = normalizedPath)
         lastOpenRequest = normalizedReq
 
-        val seq = FileOpenBridge.getLatestSequence()
         if (source.startsWith("bridge")) {
-            lastBridgeSeqHandled = seq
+            val seq = bridgeSequence ?: FileOpenBridge.getLatestSequence()
+            if (seq > lastBridgeSeqHandled) {
+                lastBridgeSeqHandled = seq
+            }
         }
         title = normalizedReq.displayName ?: File(normalizedReq.path).name
         openDiskFile(normalizedReq)
     }
 
-    private val fileOpenListener = FileOpenListener { request ->
-        val seq = FileOpenBridge.getLatestSequence()
-        if (seq != 0L) lastBridgeSeqHandled = seq
-        applyOpenRequest(request, "bridge.callback")
+    private val fileOpenListener = FileOpenListener { event: FileOpenEvent ->
+        if (event.sequence <= lastBridgeSeqHandled) return@FileOpenListener
+        applyOpenRequest(event.request, "bridge.callback", event.sequence)
     }
 
     /**
@@ -874,12 +917,10 @@ class EditorController(
         menuInflater.inflate(R.menu.menu_main, menu)
         undo = menu.findItem(R.id.text_undo)
         redo = menu.findItem(R.id.text_redo)
-        menu.findItem(R.id.auto_save_enabled)?.isChecked = autoSave.isEnabled()
-        menu.findItem(R.id.save_file)?.isEnabled = runCatching {
-            val p = lastOpenRequest?.path ?: return@runCatching false
-            val f = File(p)
-            f.exists() && f.isFile && f.canWrite()
-        }.getOrDefault(false)
+        menu.findItem(R.id.auto_save_enabled)?.isChecked = documentSync.isAutoSaveEnabled()
+        menu.findItem(R.id.save_file)?.isEnabled = documentSync.state.value.canSave
+        saveStatusUi.bind(menu)
+        saveStatusUi.render(documentSync.state.value)
         return true
     }
 
@@ -989,12 +1030,13 @@ class EditorController(
             R.id.clear_logs -> clearLogs()
             R.id.auto_save_enabled -> {
                 item.isChecked = !item.isChecked
-                autoSave.setEnabled(item.isChecked)
+                documentSync.setAutoSaveEnabled(item.isChecked)
+                activity.invalidateOptionsMenu()
                 toast(if (item.isChecked) "Auto-save enabled" else "Auto-save disabled")
             }
             R.id.save_file -> {
                 lifecycleScope.launch {
-                    val r = autoSave.saveNow("manual")
+                    val r = documentSync.saveNow(EditorSaveTrigger.MANUAL)
                     if (r.ok) {
                         toast("Saved")
                     } else {
@@ -1004,7 +1046,7 @@ class EditorController(
             }
             R.id.autosave_self_test -> {
                 lifecycleScope.launch {
-                    val report = autoSave.runSelfTest()
+                    val report = documentSync.runSelfTest()
                     AlertDialog.Builder(activity)
                         .setTitle(getString(R.string.autosave_self_test))
                         .setMessage(report)
@@ -1061,7 +1103,7 @@ class EditorController(
                     return true
                 }
                 lifecycleScope.launch {
-                    val save = autoSave.saveNow("run")
+                    val save = documentSync.saveNow(EditorSaveTrigger.RUN)
                     if (!save.ok) {
                         toast("Save failed: ${save.error ?: "unknown"}")
                         return@launch
@@ -1181,8 +1223,9 @@ class EditorController(
             appendLine("lastOpen.error=${lastOpenError ?: "null"}")
             appendLine()
 
-            appendLine("autosave.enabled=${autoSave.isEnabled()}")
+            appendLine("autosave.enabled=${documentSync.isAutoSaveEnabled()}")
             appendLine("autosave.note=use menu Debug -> ${getString(R.string.autosave_self_test)}")
+            appendLine("sync.snapshot=${documentSync.state.value}")
             appendLine()
 
             appendLine("vscode.cache.size=${vscode.languageCacheSize}")

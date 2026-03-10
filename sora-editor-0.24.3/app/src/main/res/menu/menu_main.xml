@@ -183,6 +183,12 @@
         android:title="@string/run_project"
         app:showAsAction="always" />
     <item
+        android:id="@+id/save_sync_status"
+        android:title="@string/save_sync_status"
+        android:visible="false"
+        app:actionLayout="@layout/view_editor_sync_status"
+        app:showAsAction="always" />
+    <item
         android:id="@+id/bridge_self_test"
         android:title="自测"
         app:showAsAction="always" />

@@ -37,6 +37,8 @@ public final class SessionFileCoordinator {
     public void initialize(@NonNull Context context) {
         SessionRegistry.getInstance().initialize(context);
         SessionSyncTracer.getInstance().initialize(context);
+        SshHostTrustStore.getInstance().initialize(context);
+        SftpTransferJournal.getInstance().initialize(context);
         synchronized (lock) {
             if (selectionStore == null) {
                 selectionStore = new SessionSelectionStore(context);
@@ -215,6 +217,22 @@ public final class SessionFileCoordinator {
     }
 
     @NonNull
+    public SftpProtocolManager.RemoteTransferResult transferVirtualPaths(@NonNull Context context,
+                                                                         @NonNull List<String> sourceVirtualPaths,
+                                                                         @NonNull String destinationVirtualDir,
+                                                                         @Nullable SftpProtocolManager.RemoteTransferProgressListener listener,
+                                                                         @Nullable SftpProtocolManager.RemoteTransferControl control) {
+        initialize(context);
+        SftpProtocolManager.RemoteTransferResult result = SftpProtocolManager.getInstance()
+            .transferVirtualPaths(context, sourceVirtualPaths, destinationVirtualDir, listener, control);
+        if (!result.success) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "transferVirtualPaths",
+                null, "\u670d\u52a1\u5668\u4e4b\u95f4\u4e92\u4f20\u5931\u8d25", result.messageCn);
+        }
+        return result;
+    }
+
+    @NonNull
     public SftpProtocolManager.CreateResult createVirtualItem(@NonNull Context context,
                                                               @NonNull String virtualDirectoryPath,
                                                               @NonNull String name,
@@ -232,6 +250,19 @@ public final class SessionFileCoordinator {
             SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "createVirtualItem",
                 null, "\u521b\u5efa\u865a\u62df\u76ee\u6807\u5931\u8d25", result.messageCn);
             return SftpProtocolManager.CreateResult.fail(safe);
+        }
+        return result;
+    }
+
+    @NonNull
+    public SftpProtocolManager.DeleteResult deleteVirtualPath(@NonNull Context context,
+                                                              @NonNull String virtualPath) {
+        initialize(context);
+        SftpProtocolManager.DeleteResult result = SftpProtocolManager.getInstance()
+            .deleteVirtualPath(context, virtualPath);
+        if (!result.success) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "deleteVirtualPath",
+                null, "\u5220\u9664\u865a\u62df\u76ee\u6807\u5931\u8d25", result.messageCn);
         }
         return result;
     }

@@ -115,6 +115,10 @@ import org.fossify.filemanager.helpers.OPEN_AS_TEXT
 import org.fossify.filemanager.helpers.OPEN_AS_VIDEO
 import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
+import org.fossify.filemanager.helpers.TransferExecutionPlan
+import org.fossify.filemanager.helpers.TransferSelectionKind
+import org.fossify.filemanager.helpers.TransferWorkflowStage
+import org.fossify.filemanager.helpers.TransferWorkflowStateMachine
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
 import com.termux.sessionsync.FileRootResolver
@@ -135,6 +139,7 @@ class ItemsAdapter(
     private val isPickMultipleIntent: Boolean,
     private val swipeRefreshLayout: SwipeRefreshLayout?,
     canHaveIndividualViewType: Boolean = true,
+    private val showFileDate: Boolean = true,
     itemClick: (Any) -> Unit,
 ) : MyRecyclerViewAdapter(activity, recyclerView, itemClick),
     RecyclerViewFastScroller.OnPopupTextUpdate {
@@ -172,6 +177,7 @@ class ItemsAdapter(
         private const val TRANSIENT_HIGHLIGHT_DURATION_MS = 1_600L
         private const val TRANSIENT_HIGHLIGHT_RETRY_MS = 700L
         private val virtualDownloadInProgress = AtomicBoolean(false)
+        private val transferWorkflowStateMachine = TransferWorkflowStateMachine()
         private val virtualUploadInProgress = AtomicBoolean(false)
     }
 
@@ -645,130 +651,373 @@ class ItemsAdapter(
     private fun copyMoveTo(isCopyOperation: Boolean) {
         val files = getSelectedFileDirItems()
         if (files.isEmpty()) {
+            transferWorkflowStateMachine.markCancelled("empty-selection")
             return
         }
 
-        if (isCopyOperation && files.any { sessionFileCoordinator.isVirtualPath(activity, it.path) }) {
-            copyVirtualSelectionToLocal(files)
+        val sourceSnapshot = transferWorkflowStateMachine.analyzeSources(
+            paths = files.map { it.path },
+            isCopyOperation = isCopyOperation,
+            isVirtualPath = { path -> sessionFileCoordinator.isVirtualPath(activity, path) }
+        )
+
+        if (sourceSnapshot.selectionKind == TransferSelectionKind.MIXED) {
+            val message = "请分开选择本地与服务器项目后再传输。"
+            transferWorkflowStateMachine.markFailed(message)
+            activity.toast(message)
+            return
+        }
+
+        if (sourceSnapshot.selectionKind == TransferSelectionKind.NONE) {
+            transferWorkflowStateMachine.markCancelled("no-transferable-source")
+            return
+        }
+
+        if (sourceSnapshot.selectionKind == TransferSelectionKind.REMOTE_ONLY && !isCopyOperation) {
+            val message = "服务器项目暂不支持“移动到”，请使用“复制到”。"
+            transferWorkflowStateMachine.markFailed(message)
+            activity.toast(message)
             return
         }
 
         val firstFile = files[0]
         val source = firstFile.getParentPath()
+        val defaultTargetPath = resolveTransferPickerStartPath(source)
+        val targetScope = transferWorkflowStateMachine.pickerScopeFor(sourceSnapshot)
+        transferWorkflowStateMachine.onPickerOpened(sourceSnapshot)
         FilePickerDialog(
             activity = activity,
-            currPath = activity.getDefaultCopyDestinationPath(config.shouldShowHidden(), source),
+            currPath = defaultTargetPath,
             pickFile = false,
             showHidden = config.shouldShowHidden(),
             showFAB = true,
             canAddShowHiddenButton = true,
-            showFavoritesButton = true
-        ) {
-            config.lastCopyPath = it
-            if (sessionFileCoordinator.isVirtualPath(activity, it)) {
-                if (!isCopyOperation) {
-                    activity.toast("\u4e0a\u4f20\u5230\u670d\u52a1\u5668\u6682\u4e0d\u652f\u6301\u79fb\u52a8\uff0c\u8bf7\u4f7f\u7528\u201c\u590d\u5236\u5230\u201d\u3002")
-                    return@FilePickerDialog
-                }
-                if (files.any { selected -> sessionFileCoordinator.isVirtualPath(activity, selected.path) }) {
-                    activity.toast("\u8bf7\u5206\u5f00\u9009\u62e9\u672c\u5730\u4e0e\u8fdc\u7a0b\u9879\u76ee\u540e\u518d\u4e0a\u4f20\u3002")
-                    return@FilePickerDialog
-                }
-                runVirtualUpload(files, it)
-                return@FilePickerDialog
-            }
+            showFavoritesButton = true,
+            targetScope = targetScope
+        ) { pickedPath ->
+            config.lastCopyPath = pickedPath
 
-            if (activity.isPathOnRoot(it) || activity.isPathOnRoot(firstFile.path)) {
-                copyMoveRootItems(files, it, isCopyOperation)
-            } else {
-                activity.copyMoveFilesTo(
-                    fileDirItems = files,
-                    source = source,
-                    destination = it,
-                    isCopyOperation = isCopyOperation,
-                    copyPhotoVideoOnly = false,
-                    copyHidden = config.shouldShowHidden()
-                ) {
-                    if (!isCopyOperation) {
-                        files.forEach { sourceFileDir ->
-                            val sourcePath = sourceFileDir.path
-                            if (
-                                activity.isRestrictedSAFOnlyRoot(sourcePath)
-                                && activity.getDoesFilePathExist(sourcePath)
-                            ) {
-                                activity.deleteFile(sourceFileDir, true) {
-                                    listener?.refreshFragment()
-                                    activity.runOnUiThread {
-                                        finishActMode()
-                                    }
-                                }
-                            } else {
-                                val sourceFile = File(sourcePath)
-                                if (
-                                    activity.getDoesFilePathExist(source)
-                                    && activity.getIsPathDirectory(source)
-                                    && sourceFile.list()?.isEmpty() == true
-                                    && sourceFile.getProperSize(true) == 0L
-                                    && sourceFile.getFileCount(true) == 0
-                                ) {
-                                    val sourceFolder = sourceFile.toFileDirItem(activity)
-                                    activity.deleteFile(sourceFolder, true) {
-                                        listener?.refreshFragment()
-                                        activity.runOnUiThread {
+            when (
+                val executionPlan = transferWorkflowStateMachine.resolvePlan(
+                    source = sourceSnapshot,
+                    targetPath = pickedPath,
+                    isVirtualPath = { path -> sessionFileCoordinator.isVirtualPath(activity, path) }
+                )
+            ) {
+                is TransferExecutionPlan.Unsupported -> {
+                    transferWorkflowStateMachine.markFailed(executionPlan.message)
+                    activity.toast(executionPlan.message)
+                }
+
+                is TransferExecutionPlan.Upload -> {
+                    runVirtualUpload(files, executionPlan.destinationVirtualPath)
+                }
+
+                is TransferExecutionPlan.Download -> {
+                    runVirtualDownload(files, executionPlan.destinationLocalPath)
+                }
+
+                is TransferExecutionPlan.RemoteTransfer -> {
+                    runVirtualRelay(files, executionPlan.destinationVirtualPath)
+                }
+
+                is TransferExecutionPlan.LocalCopy -> {
+                    transferWorkflowStateMachine.reset()
+                    if (activity.isPathOnRoot(executionPlan.destinationPath) || activity.isPathOnRoot(firstFile.path)) {
+                        copyMoveRootItems(files, executionPlan.destinationPath, !executionPlan.isMoveOperation)
+                    } else {
+                        activity.copyMoveFilesTo(
+                            fileDirItems = files,
+                            source = source,
+                            destination = executionPlan.destinationPath,
+                            isCopyOperation = !executionPlan.isMoveOperation,
+                            copyPhotoVideoOnly = false,
+                            copyHidden = config.shouldShowHidden()
+                        ) {
+                            if (executionPlan.isMoveOperation) {
+                                files.forEach { sourceFileDir ->
+                                    val sourcePath = sourceFileDir.path
+                                    if (
+                                        activity.isRestrictedSAFOnlyRoot(sourcePath)
+                                        && activity.getDoesFilePathExist(sourcePath)
+                                    ) {
+                                        activity.deleteFile(sourceFileDir, true) {
+                                            listener?.refreshFragment()
+                                            activity.runOnUiThread {
+                                                finishActMode()
+                                            }
+                                        }
+                                    } else {
+                                        val sourceFile = File(sourcePath)
+                                        if (
+                                            activity.getDoesFilePathExist(source)
+                                            && activity.getIsPathDirectory(source)
+                                            && sourceFile.list()?.isEmpty() == true
+                                            && sourceFile.getProperSize(true) == 0L
+                                            && sourceFile.getFileCount(true) == 0
+                                        ) {
+                                            val sourceFolder = sourceFile.toFileDirItem(activity)
+                                            activity.deleteFile(sourceFolder, true) {
+                                                listener?.refreshFragment()
+                                                activity.runOnUiThread {
+                                                    finishActMode()
+                                                }
+                                            }
+                                        } else {
+                                            listener?.refreshFragment()
                                             finishActMode()
                                         }
                                     }
-                                } else {
-                                    listener?.refreshFragment()
-                                    finishActMode()
                                 }
+                            } else {
+                                listener?.refreshFragment()
+                                finishActMode()
                             }
                         }
-                    } else {
-                        listener?.refreshFragment()
-                        finishActMode()
                     }
                 }
             }
         }
     }
 
-    private fun copyVirtualSelectionToLocal(files: ArrayList<FileDirItem>) {
-        val virtualItems = files.filter { sessionFileCoordinator.isVirtualPath(activity, it.path) }
-        if (virtualItems.isEmpty()) {
-            return
+    private fun resolveTransferPickerStartPath(sourcePath: String): String {
+        val lastCopyPath = config.lastCopyPath.trimEnd('/')
+        if (lastCopyPath.isNotEmpty() && sessionFileCoordinator.isVirtualPath(activity, lastCopyPath)) {
+            return lastCopyPath
         }
 
-        if (virtualItems.size != files.size) {
-            activity.toast("\u8bf7\u5206\u5f00\u9009\u62e9\u672c\u5730\u4e0e\u8fdc\u7a0b\u9879\u76ee\u540e\u518d\u590d\u5236\u3002")
-            return
-        }
-
-        val localRoot = FileRootResolver.termuxPrivateRoot(activity)
-        var defaultDestination = activity.getDefaultCopyDestinationPath(config.shouldShowHidden(), localRoot)
+        val defaultPath = activity.getDefaultCopyDestinationPath(config.shouldShowHidden(), sourcePath)
         if (
-            sessionFileCoordinator.isVirtualPath(activity, defaultDestination)
-            || !activity.getDoesFilePathExist(defaultDestination)
+            sessionFileCoordinator.isVirtualPath(activity, defaultPath)
+            || activity.getDoesFilePathExist(defaultPath)
         ) {
-            defaultDestination = localRoot
+            return defaultPath
         }
 
-        FilePickerDialog(
-            activity = activity,
-            currPath = defaultDestination,
-            pickFile = false,
-            showHidden = config.shouldShowHidden(),
-            showFAB = true,
-            canAddShowHiddenButton = true,
-            showFavoritesButton = true
-        ) { destination ->
-            if (sessionFileCoordinator.isVirtualPath(activity, destination)) {
-                activity.toast("\u8bf7\u9009\u62e9\u672c\u5730\u76ee\u5f55\u4f5c\u4e3a\u4e0b\u8f7d\u76ee\u6807\u3002")
-                return@FilePickerDialog
+        return FileRootResolver.termuxPrivateRoot(activity)
+    }
+
+    private fun runVirtualRelay(remoteItems: List<FileDirItem>, destinationVirtualPath: String) {
+        if (activity.isDestroyed || activity.isFinishing) {
+            return
+        }
+        if (!transferWorkflowStateMachine.begin(TransferWorkflowStage.RELAYING, "remote-relay")) {
+            activity.toast("\u5df2\u6709\u4f20\u8f93\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+            return
+        }
+
+        val progressDialog = activity.getAlertDialogBuilder()
+            .setTitle("\u670d\u52a1\u5668\u4e92\u4f20\u4e2d")
+            .setMessage("\u6b63\u5728\u51c6\u5907\u4e2d\u8f6c...")
+            .setNegativeButton("\u53d6\u6d88", null)
+            .setCancelable(false)
+            .create()
+        val cancelled = AtomicBoolean(false)
+        progressDialog.setOnShowListener {
+            progressDialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+                cancelled.set(true)
+                it.isEnabled = false
+            }
+        }
+        try {
+            progressDialog.show()
+        } catch (_: Exception) {
+        }
+
+        ensureBackgroundThread {
+            try {
+                val remotePaths = ArrayList<String>(remoteItems.size)
+                remoteItems.forEach { remotePaths.add(it.path) }
+                val revealPaths = buildVirtualRevealPaths(remoteItems, destinationVirtualPath)
+                val progressTracker = TransferSpeedTracker()
+                val result = sessionFileCoordinator.transferVirtualPaths(
+                    activity,
+                    remotePaths,
+                    destinationVirtualPath,
+                    object : SftpProtocolManager.RemoteTransferProgressListener {
+                        override fun onProgress(progress: SftpProtocolManager.RemoteTransferProgress) {
+                            val message = buildPhaseProgressMessage(
+                                phaseLabel = progress.stageLabelCn,
+                                currentFile = progress.currentFile,
+                                completedFiles = progress.completedFiles,
+                                failedFiles = progress.failedFiles,
+                                totalFiles = progress.totalFiles,
+                                transferredBytes = progress.transferredBytes,
+                                totalBytes = progress.totalBytes,
+                                tracker = progressTracker,
+                                detailMessage = progress.messageCn
+                            )
+                            if (message.isEmpty()) {
+                                return
+                            }
+                            activity.runOnUiThread {
+                                if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                                    progressDialog.setMessage(message)
+                                }
+                            }
+                        }
+                    },
+                    object : SftpProtocolManager.RemoteTransferControl {
+                        override fun isCancelled(): Boolean = cancelled.get()
+                    }
+                )
+
+                activity.runOnUiThread {
+                    dismissTransferDialog(progressDialog)
+
+                    when {
+                        result.success -> {
+                            transferWorkflowStateMachine.markCompleted("relay:${result.transferredFiles}/${result.totalFiles}")
+                            activity.toast(
+                                "\u670d\u52a1\u5668\u4e92\u4f20\u5b8c\u6210\uff1a${result.transferredFiles}/${result.totalFiles}\uff0c${
+                                    result.transferredBytes.formatSize()
+                                }"
+                            )
+                        }
+
+                        isCancelledTransferMessage(result.messageCn) || cancelled.get() -> {
+                            transferWorkflowStateMachine.markCancelled(result.messageCn.ifBlank { "relay-cancelled" })
+                            activity.toast(result.messageCn.ifBlank { "\u670d\u52a1\u5668\u4e92\u4f20\u5df2\u53d6\u6d88" })
+                        }
+
+                        result.transferredFiles > 0 -> {
+                            transferWorkflowStateMachine.markFailed("relay-partial:${result.transferredFiles}/${result.totalFiles}")
+                            val reason = if (result.messageCn.isNotEmpty()) " ${result.messageCn}" else ""
+                            activity.toast(
+                                "\u670d\u52a1\u5668\u4e92\u4f20\u90e8\u5206\u5b8c\u6210\uff1a${result.transferredFiles}/${result.totalFiles}\uff0c${
+                                    result.transferredBytes.formatSize()
+                                }$reason"
+                            )
+                        }
+
+                        else -> {
+                            val failure = if (result.messageCn.isNotEmpty()) {
+                                result.messageCn
+                            } else {
+                                "\u670d\u52a1\u5668\u4e92\u4f20\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u4e24\u7aef\u670d\u52a1\u5668\u8fde\u63a5\u4e0e\u8ba4\u8bc1\u72b6\u6001\u3002"
+                            }
+                            transferWorkflowStateMachine.markFailed(failure)
+                            activity.toast(failure)
+                        }
+                    }
+
+                    if (result.transferredFiles > 0 && revealPaths.isNotEmpty()) {
+                        listener?.openPathAndHighlight(destinationVirtualPath, revealPaths)
+                    } else {
+                        listener?.refreshFragment()
+                    }
+                    finishActMode()
+                }
+            } catch (t: Throwable) {
+                activity.runOnUiThread {
+                    dismissTransferDialog(progressDialog)
+                    val msg = t.message?.trim().orEmpty()
+                    if (msg.isNotEmpty()) {
+                        transferWorkflowStateMachine.markFailed(msg)
+                        activity.toast("\u670d\u52a1\u5668\u4e92\u4f20\u5f02\u5e38\uff1a$msg")
+                    } else {
+                        transferWorkflowStateMachine.markFailed("relay-exception")
+                        activity.toast("\u670d\u52a1\u5668\u4e92\u4f20\u5f02\u5e38\uff0c\u8bf7\u91cd\u8bd5\u3002")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun dismissTransferDialog(progressDialog: androidx.appcompat.app.AlertDialog) {
+        if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+            try {
+                progressDialog.dismiss()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun buildPhaseProgressMessage(
+        phaseLabel: String,
+        currentFile: String,
+        completedFiles: Int,
+        failedFiles: Int,
+        totalFiles: Int,
+        transferredBytes: Long,
+        totalBytes: Long,
+        tracker: TransferSpeedTracker,
+        detailMessage: String = ""
+    ): String {
+        val speedBytesPerSecond = tracker.updateAndGetSpeed(transferredBytes)
+        if (!tracker.shouldRefresh(totalBytes, transferredBytes)) {
+            return ""
+        }
+
+        val finishedCount = completedFiles + failedFiles
+        val percent = if (totalBytes > 0L) {
+            ((transferredBytes * 100L) / totalBytes).coerceIn(0L, 100L)
+        } else {
+            0L
+        }
+        val sizeText = if (totalBytes > 0L) {
+            "${transferredBytes.formatSize()} / ${totalBytes.formatSize()}"
+        } else {
+            "${transferredBytes.formatSize()} / ?"
+        }
+        val speedText = if (speedBytesPerSecond > 0L) {
+            "${speedBytesPerSecond.formatSize()}/s"
+        } else {
+            "--"
+        }
+        val fileLabel = if (currentFile.isNotEmpty()) currentFile else "\u51c6\u5907\u4e2d..."
+        return StringBuilder()
+            .append(phaseLabel).append('\n')
+            .append("\u5f53\u524d\uff1a").append(fileLabel).append('\n')
+            .append("\u8fdb\u5ea6\uff1a").append(finishedCount).append('/').append(totalFiles)
+            .append(" (").append(percent).append("%)").append('\n')
+            .append("\u5927\u5c0f\uff1a").append(sizeText).append('\n')
+            .append("\u901f\u5ea6\uff1a").append(speedText)
+            .apply {
+                if (detailMessage.isNotBlank()) {
+                    append('\n').append("\u72b6\u6001\uff1a").append(detailMessage)
+                }
+            }
+            .toString()
+    }
+
+    private class TransferSpeedTracker {
+        private var lastUiUpdateAt = 0L
+        private var lastSpeedAt = 0L
+        private var lastSpeedBytes = 0L
+        private var lastComputedSpeed = 0L
+
+        fun updateAndGetSpeed(transferredBytes: Long): Long {
+            val now = SystemClock.elapsedRealtime()
+            if (lastSpeedAt == 0L) {
+                lastSpeedAt = now
+                lastSpeedBytes = transferredBytes
+                lastComputedSpeed = 0L
+                return lastComputedSpeed
             }
 
-            config.lastCopyPath = destination
-            runVirtualDownload(virtualItems, destination)
+            val deltaMs = now - lastSpeedAt
+            if (deltaMs >= 260L || transferredBytes < lastSpeedBytes) {
+                val deltaBytes = transferredBytes - lastSpeedBytes
+                lastComputedSpeed = if (deltaMs > 0L && deltaBytes > 0L) {
+                    deltaBytes * 1000L / deltaMs
+                } else {
+                    0L
+                }
+                lastSpeedAt = now
+                lastSpeedBytes = transferredBytes
+                return lastComputedSpeed
+            }
+            return lastComputedSpeed
+        }
+
+        fun shouldRefresh(totalBytes: Long, transferredBytes: Long): Boolean {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastUiUpdateAt < 100L && transferredBytes < totalBytes) {
+                return false
+            }
+            lastUiUpdateAt = now
+            return true
         }
     }
 
@@ -776,7 +1025,12 @@ class ItemsAdapter(
         if (activity.isDestroyed || activity.isFinishing) {
             return
         }
+        if (!transferWorkflowStateMachine.begin(TransferWorkflowStage.DOWNLOADING, "download")) {
+            activity.toast("\u5df2\u6709\u4f20\u8f93\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+            return
+        }
         if (!virtualDownloadInProgress.compareAndSet(false, true)) {
+            transferWorkflowStateMachine.markFailed("download-busy")
             activity.toast("\u5df2\u6709\u4e0b\u8f7d\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
             return
         }
@@ -889,6 +1143,7 @@ class ItemsAdapter(
 
                     when {
                         result.success -> {
+                            transferWorkflowStateMachine.markCompleted("download:${result.downloadedFiles}/${result.totalFiles}")
                             activity.toast(
                                 "\u4e0b\u8f7d\u5b8c\u6210\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
                                     result.downloadedBytes.formatSize()
@@ -896,7 +1151,21 @@ class ItemsAdapter(
                             )
                         }
 
+                        isCancelledTransferMessage(result.messageCn) -> {
+                            transferWorkflowStateMachine.markCancelled(result.messageCn)
+                            if (result.downloadedFiles > 0) {
+                                activity.toast(
+                                    "\u4e0b\u8f7d\u5df2\u53d6\u6d88\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
+                                        result.downloadedBytes.formatSize()
+                                    }"
+                                )
+                            } else {
+                                activity.toast(result.messageCn)
+                            }
+                        }
+
                         result.downloadedFiles > 0 -> {
+                            transferWorkflowStateMachine.markFailed("download-partial:${result.downloadedFiles}/${result.totalFiles}")
                             val reason = if (result.messageCn.isNotEmpty()) " ${result.messageCn}" else ""
                             activity.toast(
                                 "\u90e8\u5206\u5b8c\u6210\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
@@ -911,6 +1180,7 @@ class ItemsAdapter(
                             } else {
                                 "\u4e0b\u8f7d\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u7f51\u7edc\u6216\u8ba4\u8bc1\u4fe1\u606f\u3002"
                             }
+                            transferWorkflowStateMachine.markFailed(failure)
                             activity.toast(failure)
                         }
                     }
@@ -932,8 +1202,10 @@ class ItemsAdapter(
                     }
                     val msg = t.message?.trim().orEmpty()
                     if (msg.isNotEmpty()) {
+                        transferWorkflowStateMachine.markFailed(msg)
                         activity.toast("\u4e0b\u8f7d\u5f02\u5e38\uff1a$msg")
                     } else {
+                        transferWorkflowStateMachine.markFailed("download-exception")
                         activity.toast("\u4e0b\u8f7d\u5f02\u5e38\uff0c\u8bf7\u91cd\u8bd5\u3002")
                     }
                 }
@@ -947,7 +1219,12 @@ class ItemsAdapter(
         if (activity.isDestroyed || activity.isFinishing) {
             return
         }
+        if (!transferWorkflowStateMachine.begin(TransferWorkflowStage.UPLOADING, "upload")) {
+            activity.toast("\u5df2\u6709\u4f20\u8f93\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+            return
+        }
         if (!virtualUploadInProgress.compareAndSet(false, true)) {
+            transferWorkflowStateMachine.markFailed("upload-busy")
             activity.toast("\u5df2\u6709\u4e0a\u4f20\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
             return
         }
@@ -1060,6 +1337,7 @@ class ItemsAdapter(
 
                     when {
                         result.success -> {
+                            transferWorkflowStateMachine.markCompleted("upload:${result.uploadedFiles}/${result.totalFiles}")
                             activity.toast(
                                 "\u4e0a\u4f20\u5b8c\u6210\uff1a${result.uploadedFiles}/${result.totalFiles}\uff0c${
                                     result.uploadedBytes.formatSize()
@@ -1067,7 +1345,21 @@ class ItemsAdapter(
                             )
                         }
 
+                        isCancelledTransferMessage(result.messageCn) -> {
+                            transferWorkflowStateMachine.markCancelled(result.messageCn)
+                            if (result.uploadedFiles > 0) {
+                                activity.toast(
+                                    "\u4e0a\u4f20\u5df2\u53d6\u6d88\uff1a${result.uploadedFiles}/${result.totalFiles}\uff0c${
+                                        result.uploadedBytes.formatSize()
+                                    }"
+                                )
+                            } else {
+                                activity.toast(result.messageCn)
+                            }
+                        }
+
                         result.uploadedFiles > 0 -> {
+                            transferWorkflowStateMachine.markFailed("upload-partial:${result.uploadedFiles}/${result.totalFiles}")
                             val reason = if (result.messageCn.isNotEmpty()) " ${result.messageCn}" else ""
                             activity.toast(
                                 "\u90e8\u5206\u5b8c\u6210\uff1a${result.uploadedFiles}/${result.totalFiles}\uff0c${
@@ -1082,6 +1374,7 @@ class ItemsAdapter(
                             } else {
                                 "\u4e0a\u4f20\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u7f51\u7edc\u6216\u8ba4\u8bc1\u4fe1\u606f\u3002"
                             }
+                            transferWorkflowStateMachine.markFailed(failure)
                             activity.toast(failure)
                         }
                     }
@@ -1103,8 +1396,10 @@ class ItemsAdapter(
                     }
                     val msg = t.message?.trim().orEmpty()
                     if (msg.isNotEmpty()) {
+                        transferWorkflowStateMachine.markFailed(msg)
                         activity.toast("\u4e0a\u4f20\u5f02\u5e38\uff1a$msg")
                     } else {
+                        transferWorkflowStateMachine.markFailed("upload-exception")
                         activity.toast("\u4e0a\u4f20\u5f02\u5e38\uff0c\u8bf7\u91cd\u8bd5\u3002")
                     }
                 }
@@ -1112,6 +1407,10 @@ class ItemsAdapter(
                 virtualUploadInProgress.set(false)
             }
         }
+    }
+
+    private fun isCancelledTransferMessage(message: String): Boolean {
+        return message.contains("\u5df2\u53d6\u6d88")
     }
 
     private fun copyMoveRootItems(
@@ -1713,8 +2012,12 @@ class ItemsAdapter(
                     itemDate?.beGone()
                 } else {
                     itemDetails?.text = listItem.size.formatSize()
-                    itemDate?.beVisible()
-                    itemDate?.text = listItem.modified.formatDate(activity, dateFormat, timeFormat)
+                    if (showFileDate) {
+                        itemDate?.beVisible()
+                        itemDate?.text = listItem.modified.formatDate(activity, dateFormat, timeFormat)
+                    } else {
+                        itemDate?.beGone()
+                    }
 
                     val drawable = fileDrawables.getOrElse(
                         key = fileName.substringAfterLast(".").lowercase(Locale.getDefault()),

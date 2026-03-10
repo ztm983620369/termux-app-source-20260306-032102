@@ -2,6 +2,7 @@ package org.fossify.filemanager.activities
 
 import android.app.Activity
 import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
@@ -15,12 +16,14 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.PopupWindow
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.viewpager.widget.ViewPager
 import com.stericson.RootTools.RootTools
 import org.fossify.commons.dialogs.RadioGroupDialog
 import org.fossify.commons.extensions.appLockManager
 import org.fossify.commons.extensions.beGoneIf
 import org.fossify.commons.extensions.checkWhatsNew
+import org.fossify.commons.extensions.getAlertDialogBuilder
 import org.fossify.commons.extensions.getColoredDrawableWithColor
 import org.fossify.commons.extensions.getContrastColor
 import org.fossify.commons.extensions.getFilePublicUri
@@ -74,6 +77,8 @@ import org.fossify.filemanager.fragments.RecentsFragment
 import org.fossify.filemanager.fragments.StorageFragment
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
 import org.fossify.filemanager.helpers.RootHelpers
+import org.fossify.filemanager.helpers.SessionSelfTestRunner
+import org.fossify.filemanager.interfaces.FileManagerDependencies
 import org.fossify.filemanager.interfaces.FileManagerHost
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import java.io.File
@@ -91,11 +96,20 @@ class MainActivity : SimpleActivity(), FileManagerHost {
     private var wasBackJustPressed = false
     private var mTabsToShow = ArrayList<Int>()
     private var mainFabMenu: PopupWindow? = null
+    private var selfTestProgressDialog: AlertDialog? = null
+    private var selfTestRunning = false
 
     private var mStoredFontSize = 0
     private var mStoredDateFormat = ""
     private var mStoredTimeFormat = ""
     private var mStoredShowTabs = 0
+    private val fileManagerDependencies by lazy {
+        FileManagerDependencies(
+            environment = this,
+            controllerCommands = this,
+            resultHandler = this
+        )
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -167,6 +181,12 @@ class MainActivity : SimpleActivity(), FileManagerHost {
         config.lastUsedViewPagerPage = binding.mainViewPager.currentItem
     }
 
+    override fun onDestroy() {
+        selfTestProgressDialog?.dismiss()
+        selfTestProgressDialog = null
+        super.onDestroy()
+    }
+
     override fun onBackPressedCompat(): Boolean {
         val currentFragment = getCurrentFragment()
         if (binding.mainMenu.isSearchOpen) {
@@ -201,6 +221,8 @@ class MainActivity : SimpleActivity(), FileManagerHost {
         return false
     }
 
+    override fun isTermuxScopedFileManager(): Boolean = false
+
     override fun refreshMenuItems() {
         val currentFragment = getCurrentFragment() ?: return
         val isCreateDocumentIntent = intent.action == Intent.ACTION_CREATE_DOCUMENT
@@ -232,6 +254,7 @@ class MainActivity : SimpleActivity(), FileManagerHost {
 
             findItem(R.id.more_apps_from_us).isVisible = !resources.getBoolean(R.bool.hide_google_relations)
             findItem(R.id.settings).isVisible = !isCreateDocumentIntent
+            findItem(R.id.self_test).isVisible = !isCreateDocumentIntent
             findItem(R.id.about).isVisible = !isCreateDocumentIntent
         }
     }
@@ -273,12 +296,71 @@ class MainActivity : SimpleActivity(), FileManagerHost {
                     R.id.column_count -> changeColumnCount()
                     R.id.more_apps_from_us -> launchMoreAppsFromUsIntent()
                     R.id.settings -> launchSettings()
+                    R.id.self_test -> runIndustrialSelfTest()
                     R.id.about -> launchAbout()
                     else -> return@setOnMenuItemClickListener false
                 }
                 return@setOnMenuItemClickListener true
             }
         }
+    }
+
+    private fun runIndustrialSelfTest() {
+        if (selfTestRunning) {
+            toast(R.string.industrial_self_test_running)
+            return
+        }
+
+        selfTestRunning = true
+        selfTestProgressDialog = getAlertDialogBuilder()
+            .setTitle(R.string.industrial_self_test_title)
+            .setMessage(R.string.industrial_self_test_running_message)
+            .setCancelable(false)
+            .create()
+        selfTestProgressDialog?.show()
+
+        ensureBackgroundThread {
+            val report = SessionSelfTestRunner.run(applicationContext)
+            runOnUiThread {
+                selfTestRunning = false
+                selfTestProgressDialog?.dismiss()
+                selfTestProgressDialog = null
+                if (isDestroyed || isFinishing) {
+                    return@runOnUiThread
+                }
+                showIndustrialSelfTestReport(report)
+            }
+        }
+    }
+
+    private fun showIndustrialSelfTestReport(report: SessionSelfTestRunner.Report) {
+        getAlertDialogBuilder()
+            .setTitle(
+                if (report.success) {
+                    R.string.industrial_self_test_title
+                } else {
+                    R.string.industrial_self_test_failed_title
+                }
+            )
+            .setMessage(report.summary)
+            .setPositiveButton(R.string.copy) { _, _ ->
+                val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(
+                    ClipData.newPlainText(getString(R.string.industrial_self_test_title), report.content)
+                )
+                toast(R.string.industrial_self_test_report_copied)
+            }
+            .setNeutralButton(R.string.industrial_self_test_open_report_folder) { _, _ ->
+                val reportFile = File(report.reportPath)
+                val parent = reportFile.parentFile
+                if (parent != null && parent.exists()) {
+                    openPath(parent.absolutePath, forceRefresh = true)
+                } else {
+                    toast(R.string.unknown_error_occurred)
+                }
+            }
+            .setNegativeButton(android.R.string.ok, null)
+            .show()
     }
 
     private fun toggleTermuxStorage() {
@@ -388,7 +470,7 @@ class MainActivity : SimpleActivity(), FileManagerHost {
 
     private fun initFragments() {
         binding.mainViewPager.apply {
-            adapter = ViewPagerAdapter(this@MainActivity, mTabsToShow, { intent })
+            adapter = ViewPagerAdapter(this@MainActivity, mTabsToShow, { intent }, fileManagerDependencies)
             offscreenPageLimit = 2
             addOnPageChangeListener(object : ViewPager.OnPageChangeListener {
                 override fun onPageScrollStateChanged(state: Int) {}

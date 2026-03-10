@@ -9,6 +9,7 @@ import android.net.Uri;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.termux.app.SftpTransferRecoveryService;
 import com.termux.shared.data.IntentUtils;
 import com.termux.shared.logger.Logger;
 import com.termux.shared.termux.TermuxUtils;
@@ -53,6 +54,7 @@ public class SystemEventReceiver extends BroadcastReceiver {
 
     public synchronized void onActionBootCompleted(@NonNull Context context, @NonNull Intent intent) {
         TermuxShellManager.onActionBootCompleted(context, intent);
+        SftpTransferRecoveryService.startIfNeeded(context);
     }
 
     public synchronized void onActionPackageUpdated(@NonNull Context context, @NonNull Intent intent) {

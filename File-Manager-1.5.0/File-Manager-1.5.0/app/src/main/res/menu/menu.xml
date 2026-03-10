@@ -45,6 +45,12 @@
         android:title="@string/toggle_termux_storage"
         app:showAsAction="always" />
     <item
+        android:id="@+id/toggle_termux_system_dirs"
+        android:showAsAction="never"
+        android:title="@string/show_termux_system_dirs"
+        android:visible="false"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/open_in_terminal"
         android:title="@string/open_in_terminal"
         app:showAsAction="never" />
@@ -75,7 +81,7 @@
         app:showAsAction="never" />
     <item
         android:id="@+id/self_test"
-        android:title="Self test"
+        android:title="@string/industrial_self_test_title"
         app:showAsAction="never" />
     <item
         android:id="@+id/about"

@@ -91,6 +91,7 @@
     <string name="enable_soft_keyboard">启用软键盘</string>
     <string name="hide_soft_kbd_if_hard_kbd_available">物理键盘连接时隐藏软键盘</string>
     <string name="auto_save_enabled">自动保存</string>
+    <string name="save_sync_status">保存同步状态</string>
     <string name="save_file">保存</string>
     <string name="autosave_self_test">自动保存自测</string>
     <string name="copy_text">复制</string>

@@ -6,6 +6,9 @@
     <string name="toggle_termux_storage">Switch storage</string>
     <string name="switch_to_termux">Switch to Termux</string>
     <string name="switch_to_internal_storage">Switch to internal storage</string>
+    <string name="show_termux_system_dirs">Show Termux system dirs</string>
+    <string name="hide_termux_system_dirs">Hide Termux system dirs</string>
+    <string name="termux_system_dirs">Termux system dirs</string>
     <string name="open_in_terminal">Open in terminal</string>
     <string name="set_as_home_folder">Set as home folder</string>
     <string name="home_folder_updated">Home folder updated</string>
@@ -44,6 +47,12 @@
 
     <!-- File Editor -->
     <string name="file_editor">File Editor</string>
+    <string name="industrial_self_test_title">Industrial self-test</string>
+    <string name="industrial_self_test_failed_title">Industrial self-test finished with failures</string>
+    <string name="industrial_self_test_running">Industrial self-test is already running</string>
+    <string name="industrial_self_test_running_message">Running active checks against your saved servers. Please wait and keep the app alive.</string>
+    <string name="industrial_self_test_report_copied">Self-test report copied</string>
+    <string name="industrial_self_test_open_report_folder">Open report folder</string>
 
     <!-- Storage analysis -->
     <string name="storage_analysis">Storage analysis</string>

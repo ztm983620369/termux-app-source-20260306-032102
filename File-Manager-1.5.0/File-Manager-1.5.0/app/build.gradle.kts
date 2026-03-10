@@ -38,6 +38,7 @@ android {
 dependencies {
     implementation(project(":fossify-commons"))
     implementation(project(":file-bridge"))
+    implementation(project(":editor-sync-core"))
     implementation(project(":session-sync-core"))
     implementation("androidx.documentfile:documentfile:1.1.0")
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.2.0")

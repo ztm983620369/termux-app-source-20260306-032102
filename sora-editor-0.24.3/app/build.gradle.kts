@@ -95,6 +95,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
     implementation(project(":file-bridge"))
+    implementation(project(":editor-sync-core"))
     implementation(project(":termux-shared"))
 
     // Lua language server

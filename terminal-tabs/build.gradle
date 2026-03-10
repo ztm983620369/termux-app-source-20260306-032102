@@ -4,10 +4,11 @@ android {
     namespace "com.termux.terminaltabs"
     compileSdkVersion project.properties.compileSdkVersion.toInteger()
 
-    dependencies {
-        implementation "androidx.annotation:annotation:1.9.0"
-        implementation "androidx.core:core:1.13.1"
-    }
+dependencies {
+    implementation "androidx.annotation:annotation:1.9.0"
+    implementation "androidx.core:core:1.13.1"
+    testImplementation "junit:junit:4.13.2"
+}
 
     defaultConfig {
         minSdkVersion project.properties.minSdkVersion.toInteger()

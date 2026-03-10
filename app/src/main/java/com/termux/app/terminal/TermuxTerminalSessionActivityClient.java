@@ -45,6 +45,13 @@ import com.termux.terminal.TerminalColors;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
 import com.termux.terminal.TextStyle;
+import com.termux.terminalsessioncore.SshTmuxSessionStateMachine;
+import com.termux.terminalsessioncore.TerminalSessionTabStateMachine;
+import com.termux.terminalsessionruntime.RemoteTmuxListResult;
+import com.termux.terminalsessionruntime.SshTmuxOperationResult;
+import com.termux.terminalsessionruntime.SshTmuxRuntimeBridge;
+import com.termux.terminalsessionruntime.SshTmuxRuntimeEngine;
+import com.termux.terminalsessionruntime.SshTmuxRuntimeStateMachine;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -80,6 +87,12 @@ import org.json.JSONObject;
 public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionClientBase {
 
     private final TermuxActivity mActivity;
+    private final SshTmuxRuntimeEngine mSshTmuxRuntimeEngine;
+    @Nullable
+    private volatile SshTmuxRuntimeStateMachine.Snapshot mLastSshTmuxRuntimeSnapshot;
+    private final Object mRuntimeStateLock = new Object();
+    private final Map<String, SshTmuxRuntimeStateMachine.Snapshot> mRuntimeSnapshotBySessionHandle = new HashMap<>();
+    private final Map<String, String> mRuntimeSessionHandleByOperationId = new HashMap<>();
 
     private static final int MAX_SESSIONS = 8;
     private static final String SSH_PERSIST_PREFS = "ssh_persistence_prefs";
@@ -113,7 +126,6 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     private static final long SSH_BG_KEEP_ALIVE_SECONDS = 30L;
     private static final AtomicInteger SSH_BG_THREAD_COUNTER = new AtomicInteger(1);
     private static final ExecutorService SSH_BG_EXECUTOR = createSshBackgroundExecutor();
-    private final Map<String, String> mSshBootstrapCommandByHandle = new HashMap<>();
     private final AtomicBoolean mEnsuringPinnedSshSessions = new AtomicBoolean(false);
     private final AtomicBoolean mEnsurePinnedSshSessionsRetryScheduled = new AtomicBoolean(false);
     private final AtomicBoolean mEnsurePinnedSshSessionsPending = new AtomicBoolean(false);
@@ -124,6 +136,113 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     public TermuxTerminalSessionActivityClient(TermuxActivity activity) {
         this.mActivity = activity;
+        this.mSshTmuxRuntimeEngine = new SshTmuxRuntimeEngine(new SshTmuxRuntimeBridge() {
+            @NonNull
+            @Override
+            public Context getApplicationContext() {
+                return mActivity.getApplicationContext();
+            }
+
+            @Nullable
+            @Override
+            public TerminalSession getCurrentSession() {
+                return mActivity.getCurrentSession();
+            }
+
+            @Override
+            public void setCurrentSession(@Nullable TerminalSession session) {
+                TermuxTerminalSessionActivityClient.this.setCurrentSession(session);
+            }
+
+            @NonNull
+            @Override
+            public String getDefaultWorkingDirectory() {
+                return mActivity.getProperties().getDefaultWorkingDirectory();
+            }
+
+            @Override
+            public void onTermuxSessionListUpdated() {
+                termuxSessionListNotifyUpdated();
+            }
+
+            @Override
+            public void runOnUiThread(@NonNull Runnable runnable) {
+                mActivity.runOnUiThread(runnable);
+            }
+
+            @Override
+            public void postDelayedOnUi(@NonNull Runnable runnable, long delayMs) {
+                View anchor = mActivity.getTerminalView();
+                if (anchor != null) anchor.postDelayed(runnable, delayMs);
+                else mActivity.runOnUiThread(runnable);
+            }
+
+            @Nullable
+            @Override
+            public TermuxSession getTermuxSession(int index) {
+                TermuxService service = mActivity.getTermuxService();
+                return service == null ? null : service.getTermuxSession(index);
+            }
+
+            @Override
+            public int getTermuxSessionsSize() {
+                TermuxService service = mActivity.getTermuxService();
+                return service == null ? 0 : service.getTermuxSessionsSize();
+            }
+
+            @NonNull
+            @Override
+            public ArrayList<TermuxSession> getTermuxSessionsSnapshot() {
+                TermuxService service = mActivity.getTermuxService();
+                return service == null ? new ArrayList<>() : new ArrayList<>(service.getTermuxSessions());
+            }
+
+            @Nullable
+            @Override
+            public TermuxSession getTermuxSessionForTerminalSession(@Nullable TerminalSession session) {
+                TermuxService service = mActivity.getTermuxService();
+                return service == null ? null : service.getTermuxSessionForTerminalSession(session);
+            }
+
+            @Nullable
+            @Override
+            public TermuxSession getTermuxSessionForShellName(@Nullable String shellName) {
+                TermuxService service = mActivity.getTermuxService();
+                return service == null ? null : service.getTermuxSessionForShellName(shellName);
+            }
+
+            @Nullable
+            @Override
+            public TerminalSession getTerminalSessionForHandle(@Nullable String handle) {
+                TermuxService service = mActivity.getTermuxService();
+                return service == null ? null : service.getTerminalSessionForHandle(handle);
+            }
+
+            @Nullable
+            @Override
+            public TermuxSession createTermuxSession(@Nullable String executablePath, @Nullable String[] arguments,
+                                                     @Nullable String stdin, @NonNull String workingDirectory,
+                                                     boolean isFailSafe, @Nullable String sessionName) {
+                TermuxService service = mActivity.getTermuxService();
+                return service == null ? null :
+                    service.createTermuxSession(executablePath, arguments, stdin, workingDirectory, isFailSafe, sessionName);
+            }
+
+            @Override
+            public void removeTermuxSession(@NonNull TerminalSession session) {
+                TermuxService service = mActivity.getTermuxService();
+                if (service != null) service.removeTermuxSession(session);
+            }
+
+            @Override
+            public void onRuntimeStateChanged(@NonNull SshTmuxRuntimeStateMachine.Snapshot snapshot) {
+                trackRuntimeSnapshot(snapshot);
+                if (snapshot.phase == SshTmuxRuntimeStateMachine.Phase.FAILED) {
+                    Logger.logWarn(LOG_TAG, "SSH/tmux runtime failed: " + snapshot.detail);
+                }
+                mActivity.runOnUiThread(TermuxTerminalSessionActivityClient.this::termuxSessionListNotifyUpdated);
+            }
+        });
     }
 
     @NonNull
@@ -256,9 +375,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @Override
     public void onSessionFinished(@NonNull TerminalSession finishedSession) {
-        forgetSshBootstrapCommand(finishedSession);
+        clearRuntimeStateForSessionHandle(finishedSession.mHandle);
+        mSshTmuxRuntimeEngine.onTerminalSessionFinished(finishedSession);
         TermuxService service = mActivity.getTermuxService();
-        boolean shouldReconcilePinnedState = clearLockedHandleForSessionHandle(finishedSession.mHandle);
 
         if (service == null || service.wantsToStop()) {
             // The service wants to stop as soon as possible.
@@ -300,9 +419,6 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             }
         }
 
-        if (shouldReconcilePinnedState) {
-            scheduleEnsurePinnedSshSessionsRetry(false);
-        }
     }
 
     @Override
@@ -477,7 +593,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     private void renameSession(TerminalSession sessionToRename, String text) {
         if (sessionToRename == null) return;
-        sessionToRename.mSessionName = text;
+
+        if (mSshTmuxRuntimeEngine.renamePinnedSession(sessionToRename, text)) {
+            return;
+        }
+
+        sessionToRename.mSessionName = TextUtils.isEmpty(text) ? null : text;
         TermuxService service = mActivity.getTermuxService();
         if (service != null) {
             TermuxSession termuxSession = service.getTermuxSessionForTerminalSession(sessionToRename);
@@ -895,26 +1016,18 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     private void loadTmuxSessionsAndShowPersistenceDialog(@NonNull SshProfile profile,
                                                           @NonNull SshLaunchConfig config) {
         mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_loading_tmux), false);
-        runSshBackgroundTask("tmux-list-sessions", () -> {
-            CommandResult listResult = runBashCommandSync(buildTmuxListSessionsCommand(config.sshCommand));
-            String combinedOutput = getCombinedOutput(listResult);
-            boolean tmuxMissing = combinedOutput.contains("__TMUX_MISSING__");
-            boolean listDone = combinedOutput.contains(TMUX_LIST_DONE);
-            ArrayList<RemoteTmuxSessionInfo> sessions = parseTmuxSessionList(combinedOutput);
+        mSshTmuxRuntimeEngine.loadRemoteTmuxSessions(config.sshCommand, result -> {
+            if (result.tmuxMissing) {
+                showTmuxMissingForProfileDialog(profile, config);
+                return;
+            }
 
-            mActivity.runOnUiThread(() -> {
-                if (tmuxMissing) {
-                    showTmuxMissingForProfileDialog(profile, config);
-                    return;
-                }
+            if (!result.listDone && result.sessions.isEmpty()) {
+                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_list_failed), true);
+                return;
+            }
 
-                if (!listDone && sessions.isEmpty()) {
-                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_list_failed), true);
-                    return;
-                }
-
-                showSshPersistenceTmuxDialog(profile, config, sessions);
-            });
+            showSshPersistenceTmuxDialog(profile, config, toAppRemoteTmuxSessions(result.sessions));
         });
     }
 
@@ -925,17 +1038,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             .setMessage(mActivity.getString(R.string.msg_ssh_persistence_tmux_missing_with_cmd, installCommand))
             .setPositiveButton(R.string.action_ssh_persistence_install, (dialog, which) -> {
                 mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_installing_tmux), true);
-                runSshBackgroundTask("tmux-install-from-manager", () -> {
-                    CommandResult installResult = runBashCommandSync(installCommand);
-                    CommandResult verifyResult = runBashCommandSync(buildTmuxCheckCommand(config.sshCommand));
-                    boolean hasTmux = verifyResult.stdout.contains("__TMUX_OK__");
-                    mActivity.runOnUiThread(() -> {
-                        if (installResult.isSuccess() && hasTmux) {
-                            showSshPersistenceManagerDialog(profile);
-                        } else {
-                            mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_install_failed), true);
-                        }
-                    });
+                mSshTmuxRuntimeEngine.installTmux(config.sshCommand, result -> {
+                    if (result.code == SshTmuxOperationResult.Code.SUCCESS) {
+                        showSshPersistenceManagerDialog(profile);
+                    } else {
+                        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_install_failed), true);
+                    }
                 });
             })
             .setNegativeButton(android.R.string.cancel, null)
@@ -1002,8 +1110,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
         TextView title = new TextView(mActivity);
         title.setText(isCurrent
-            ? mActivity.getString(R.string.msg_ssh_persistence_current_badge) + " · " + info.name
-            : info.name);
+            ? mActivity.getString(R.string.msg_ssh_persistence_current_badge) + " · " + info.displayName
+            : info.displayName);
         title.setTextSize(15f);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         card.addView(title);
@@ -1013,6 +1121,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             ? R.string.msg_ssh_persistence_tty_attached
             : R.string.msg_ssh_persistence_tty_detached);
         String subtitleText = mActivity.getString(R.string.msg_ssh_persistence_tty_windows, info.windows) + "  ·  " + attached;
+        if (!TextUtils.equals(info.displayName, info.name)) {
+            subtitleText = subtitleText + "  ·  " + info.name;
+        }
         if (isCurrent) {
             subtitleText = subtitleText + "  ·  " + mActivity.getString(R.string.msg_ssh_persistence_tty_current);
         }
@@ -1034,7 +1145,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         Button connectBtn = createProfileActionButton(R.string.action_ssh_persistence_connect, false);
         connectBtn.setOnClickListener(v -> {
             if (dialogRef[0] != null) dialogRef[0].dismiss();
-            connectToPersistentTmuxSession(config, info.name);
+            connectToPersistentTmuxSession(config, info.name, info.displayName);
         });
         row.addView(connectBtn);
 
@@ -1066,7 +1177,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         EditText input = new EditText(mActivity);
         input.setHint(R.string.hint_ssh_persistence_new_session_name);
         input.setSingleLine(true);
-        input.setText("termux-persist-" + Long.toHexString(System.currentTimeMillis()));
+        input.setText(config.sessionName);
         input.setSelection(input.getText() == null ? 0 : input.getText().length());
 
         new AlertDialog.Builder(mActivity)
@@ -1074,45 +1185,62 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             .setView(input)
             .setPositiveButton(R.string.action_ssh_persistence_new, (dialog, which) -> {
                 String rawName = input.getText() == null ? "" : input.getText().toString().trim();
-                String tmuxSession = sanitizeTmuxSessionName(rawName);
-                if (TextUtils.isEmpty(tmuxSession)) tmuxSession = "termux-persist-" + Long.toHexString(System.currentTimeMillis());
-                createRemoteTmuxSessionAndConnect(profile, config, tmuxSession);
+                createRemoteTmuxSessionAndConnect(profile, config, rawName);
             })
             .setNegativeButton(android.R.string.cancel, (dialog, which) -> showSshPersistenceManagerDialog(profile))
             .show();
     }
 
     private void createRemoteTmuxSessionAndConnect(@NonNull SshProfile profile, @NonNull SshLaunchConfig config,
-                                                   @NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
-        runSshBackgroundTask("tmux-create-session", () -> {
-            CommandResult createResult = runBashCommandSync(buildTmuxCreateSessionCommand(config.sshCommand, safeTmuxSession));
-            String combinedOutput = getCombinedOutput(createResult);
-            boolean tmuxMissing = combinedOutput.contains("__TMUX_MISSING__");
-            boolean created = combinedOutput.contains(TMUX_SESSION_CREATED);
-            boolean exists = combinedOutput.contains(TMUX_SESSION_EXISTS);
-
-            mActivity.runOnUiThread(() -> {
-                if (tmuxMissing) {
+                                                   @Nullable String requestedDisplayName) {
+        TerminalSession anchorSession = mActivity.getCurrentSession();
+        mSshTmuxRuntimeEngine.createRemoteTmuxSessionAndConnect(
+            anchorSession, config.sshCommand, config.sessionName, requestedDisplayName, result -> {
+                if (result.code == SshTmuxOperationResult.Code.TMUX_MISSING) {
                     showTmuxMissingForProfileDialog(profile, config);
                     return;
                 }
 
-                if (created || exists) {
-                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_created_connecting, safeTmuxSession), false);
-                    connectToPersistentTmuxSession(config, safeTmuxSession);
+                if (result.code == SshTmuxOperationResult.Code.SUCCESS) {
+                    mActivity.showToast(mActivity.getString(
+                        R.string.msg_ssh_persistence_created_connecting, result.displayName), false);
                     return;
                 }
 
-                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_create_failed, summarizeCommandResult(createResult)), true);
+                mActivity.showToast(mActivity.getString(
+                    R.string.msg_ssh_persistence_create_failed, summarizeCommandResult(toCommandResult(result.commandResult))), true);
                 showSshPersistenceManagerDialog(profile);
             });
+    }
+
+    private void createRemoteTmuxSessionAndConnect(@NonNull SshProfile profile, @NonNull SshLaunchConfig config,
+                                                   @NonNull String tmuxSession, @NonNull String displayName) {
+        createRemoteTmuxSessionAndConnect(profile, config, displayName);
+    }
+
+    private void destroyRemoteTmuxSession(@NonNull SshProfile profile, @NonNull SshLaunchConfig config,
+                                          @NonNull String tmuxSession) {
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        mSshTmuxRuntimeEngine.destroyRemoteTmuxSession(config.sshCommand, safeTmuxSession, safeTmuxSession, result -> {
+            if (result.code == SshTmuxOperationResult.Code.TMUX_MISSING) {
+                showTmuxMissingForProfileDialog(profile, config);
+                return;
+            }
+
+            if (result.code == SshTmuxOperationResult.Code.SUCCESS) {
+                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_destroyed, safeTmuxSession), false);
+            } else {
+                mActivity.showToast(mActivity.getString(
+                    R.string.msg_ssh_persistence_destroy_failed, summarizeCommandResult(toCommandResult(result.commandResult))), true);
+            }
+
+            showSshPersistenceManagerDialog(profile);
         });
     }
 
     private void showDestroyTmuxSessionConfirmDialog(@NonNull SshProfile profile, @NonNull SshLaunchConfig config,
                                                      @NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
         new AlertDialog.Builder(mActivity)
             .setMessage(mActivity.getString(R.string.msg_ssh_persistence_destroy_confirm, safeTmuxSession))
             .setPositiveButton(android.R.string.ok, (dialog, which) ->
@@ -1121,49 +1249,29 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             .show();
     }
 
-    private void destroyRemoteTmuxSession(@NonNull SshProfile profile, @NonNull SshLaunchConfig config,
-                                          @NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
-        runSshBackgroundTask("tmux-destroy-session", () -> {
-            CommandResult destroyResult = runBashCommandSync(buildTmuxKillSessionCommand(config.sshCommand, safeTmuxSession));
-            String combinedOutput = getCombinedOutput(destroyResult);
-            boolean tmuxMissing = combinedOutput.contains("__TMUX_MISSING__");
-            boolean destroyed = combinedOutput.contains(TMUX_SESSION_KILLED) || combinedOutput.contains(TMUX_SESSION_NOT_FOUND);
-
-            mActivity.runOnUiThread(() -> {
-                if (tmuxMissing) {
-                    showTmuxMissingForProfileDialog(profile, config);
-                    return;
-                }
-
-                if (destroyed) {
-                    cleanupPersistenceRecordsForRemoteTmux(config.sshCommand, safeTmuxSession);
-                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_destroyed, safeTmuxSession), false);
-                } else {
-                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_destroy_failed, summarizeCommandResult(destroyResult)), true);
-                }
-
-                showSshPersistenceManagerDialog(profile);
-            });
-        });
-    }
-
-    private void connectToPersistentTmuxSession(@NonNull SshLaunchConfig config, @NonNull String tmuxSession) {
+    private void connectToPersistentTmuxSession(@NonNull SshLaunchConfig config, @NonNull String tmuxSession,
+                                                @NonNull String displayName) {
         TerminalSession anchorSession = mActivity.getCurrentSession();
         if (anchorSession == null) {
             mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_launch_failed), true);
             return;
         }
 
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
-        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_connecting_tmux, safeTmuxSession), false);
-        enableSshPersistence(anchorSession, config.sshCommand, safeTmuxSession, false);
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        String normalizedDisplayName = normalizeDisplayName(displayName, safeTmuxSession);
+        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_connecting_tmux, normalizedDisplayName), false);
+        mSshTmuxRuntimeEngine.connectToPersistentTmuxSession(
+            anchorSession, config.sshCommand, safeTmuxSession, normalizedDisplayName, result -> {
+                if (result.code != SshTmuxOperationResult.Code.SUCCESS) {
+                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_tmux_check_failed), true);
+                }
+            });
     }
 
     private void cleanupPersistenceRecordsForRemoteTmux(@NonNull String sshCommand, @NonNull String tmuxSession) {
         synchronized (mSshPersistRecordsLock) {
             String normalizedSshCommand = sanitizeSshBootstrapCommand(sshCommand);
-            String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
+            String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
             ArrayList<SshPersistenceRecord> records = loadSshPersistenceRecords();
             boolean changed = false;
             for (int i = records.size() - 1; i >= 0; i--) {
@@ -1175,6 +1283,17 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             }
             if (changed) saveSshPersistenceRecords(records);
         }
+    }
+
+    private void applyPinnedSessionDisplayName(@Nullable TerminalSession session, @Nullable String displayName) {
+        if (session == null) return;
+        session.mSessionName = normalizeDisplayName(displayName, session.getTitle());
+    }
+
+    private void syncPinnedSessionDisplayNameAsync(@NonNull SshPersistenceRecord record) {
+        runSshBackgroundTask("tmux-sync-display-name", () ->
+            runBashCommandSync(buildTmuxDisplaySyncRemoteExecCommand(
+                record.sshCommand, record.tmuxSession, record.displayName)));
     }
 
     @NonNull
@@ -1194,12 +1313,15 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             String[] parts = payload.split("\\|", -1);
             if (parts.length < 3) continue;
 
-            String sessionName = sanitizeTmuxSessionName(parts[0]);
+            String sessionName = normalizeTmuxSessionName(parts[0]);
             if (TextUtils.isEmpty(sessionName) || seen.contains(sessionName)) continue;
 
+            String encodedDisplayName = parts.length > 3 ? parts[3] : "";
+            SshTmuxSessionStateMachine.Snapshot snapshot = SshTmuxSessionStateMachine.resolveExistingRemote(
+                sessionName, encodedDisplayName, null, null, sessionName);
             int windows = parsePositiveInt(parts[1], 1);
             boolean attached = "1".equals(parts[2].trim());
-            sessions.add(new RemoteTmuxSessionInfo(sessionName, windows, attached));
+            sessions.add(new RemoteTmuxSessionInfo(snapshot.remoteSessionName, snapshot.displayName, windows, attached));
             seen.add(sessionName);
         }
         return sessions;
@@ -1453,11 +1575,13 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     private static final class RemoteTmuxSessionInfo {
         @NonNull final String name;
+        @NonNull final String displayName;
         final int windows;
         final boolean attached;
 
-        RemoteTmuxSessionInfo(@NonNull String name, int windows, boolean attached) {
+        RemoteTmuxSessionInfo(@NonNull String name, @NonNull String displayName, int windows, boolean attached) {
             this.name = name;
+            this.displayName = displayName;
             this.windows = windows <= 0 ? 1 : windows;
             this.attached = attached;
         }
@@ -1500,29 +1624,56 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     private void rememberSshBootstrapCommand(@Nullable TerminalSession session, @Nullable String sshCommand) {
-        if (session == null || TextUtils.isEmpty(session.mHandle)) return;
-        synchronized (mSshBootstrapCommandByHandle) {
-            if (TextUtils.isEmpty(sshCommand)) {
-                mSshBootstrapCommandByHandle.remove(session.mHandle);
-            } else {
-                mSshBootstrapCommandByHandle.put(session.mHandle, sshCommand.trim());
-            }
-        }
+        mSshTmuxRuntimeEngine.rememberSshBootstrapCommand(session, sshCommand);
     }
 
     @Nullable
     private String getRememberedSshBootstrapCommand(@Nullable TerminalSession session) {
-        if (session == null || TextUtils.isEmpty(session.mHandle)) return null;
-        synchronized (mSshBootstrapCommandByHandle) {
-            return mSshBootstrapCommandByHandle.get(session.mHandle);
-        }
+        return mSshTmuxRuntimeEngine.getRememberedSshBootstrapCommand(session);
     }
 
     private void forgetSshBootstrapCommand(@Nullable TerminalSession session) {
-        if (session == null || TextUtils.isEmpty(session.mHandle)) return;
-        synchronized (mSshBootstrapCommandByHandle) {
-            mSshBootstrapCommandByHandle.remove(session.mHandle);
+        mSshTmuxRuntimeEngine.forgetSshBootstrapCommand(session);
+    }
+
+    @NonNull
+    private ArrayList<RemoteTmuxSessionInfo> toAppRemoteTmuxSessions(
+        @NonNull ArrayList<com.termux.terminalsessionruntime.RemoteTmuxSessionInfo> sessions) {
+        ArrayList<RemoteTmuxSessionInfo> converted = new ArrayList<>(sessions.size());
+        for (com.termux.terminalsessionruntime.RemoteTmuxSessionInfo session : sessions) {
+            converted.add(new RemoteTmuxSessionInfo(
+                session.name, session.displayName, session.windows, session.attached));
         }
+        return converted;
+    }
+
+    @NonNull
+    private ArrayList<SshPersistenceRecord> toAppSshPersistenceRecords(
+        @NonNull ArrayList<com.termux.terminalsessionruntime.SshPersistenceRecord> records) {
+        ArrayList<SshPersistenceRecord> converted = new ArrayList<>(records.size());
+        for (com.termux.terminalsessionruntime.SshPersistenceRecord record : records) {
+            converted.add(new SshPersistenceRecord(
+                record.id, record.sshCommand, record.tmuxSession,
+                record.displayName, record.shellName, record.lockedHandle));
+        }
+        return converted;
+    }
+
+    @NonNull
+    private ArrayList<com.termux.terminalsessionruntime.SshPersistenceRecord> toRuntimeSshPersistenceRecords(
+        @NonNull ArrayList<SshPersistenceRecord> records) {
+        ArrayList<com.termux.terminalsessionruntime.SshPersistenceRecord> converted = new ArrayList<>(records.size());
+        for (SshPersistenceRecord record : records) {
+            converted.add(new com.termux.terminalsessionruntime.SshPersistenceRecord(
+                record.id, record.sshCommand, record.tmuxSession,
+                record.displayName, record.shellName, record.lockedHandle));
+        }
+        return converted;
+    }
+
+    @NonNull
+    private CommandResult toCommandResult(@NonNull com.termux.terminalsessionruntime.ShellCommandResult result) {
+        return new CommandResult(result.exitCode, result.stdout, result.stderr);
     }
 
     private ArrayList<String> buildSshProfileLabels(@NonNull ArrayList<SshProfile> profiles) {
@@ -1649,14 +1800,16 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         @NonNull final String id;
         @NonNull final String sshCommand;
         @NonNull final String tmuxSession;
+        @NonNull final String displayName;
         @NonNull final String shellName;
         @Nullable final String lockedHandle;
 
         SshPersistenceRecord(@NonNull String id, @NonNull String sshCommand, @NonNull String tmuxSession,
-                             @NonNull String shellName, @Nullable String lockedHandle) {
+                             @NonNull String displayName, @NonNull String shellName, @Nullable String lockedHandle) {
             this.id = id;
             this.sshCommand = sshCommand;
             this.tmuxSession = tmuxSession;
+            this.displayName = displayName;
             this.shellName = shellName;
             this.lockedHandle = lockedHandle;
         }
@@ -1670,11 +1823,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             if (id.isEmpty()) id = UUID.randomUUID().toString();
 
             String tmuxSession = json.optString("tmuxSession", "").trim();
+            String displayName = json.optString("displayName", "").trim();
             String shellName = json.optString("shellName", "").trim();
             String lockedHandle = json.optString("lockedHandle", "").trim();
             if (lockedHandle.isEmpty()) lockedHandle = null;
 
-            return new SshPersistenceRecord(id, sshCommand, tmuxSession, shellName, lockedHandle);
+            return new SshPersistenceRecord(id, sshCommand, tmuxSession, displayName, shellName, lockedHandle);
         }
 
         @NonNull
@@ -1684,6 +1838,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                 json.put("id", id);
                 json.put("sshCommand", sshCommand);
                 json.put("tmuxSession", tmuxSession);
+                json.put("displayName", displayName);
                 json.put("shellName", shellName);
                 json.put("lockedHandle", lockedHandle == null ? JSONObject.NULL : lockedHandle);
             } catch (Exception ignored) {
@@ -1694,70 +1849,11 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @NonNull
     private ArrayList<SshPersistenceRecord> loadSshPersistenceRecords() {
-        synchronized (mSshPersistRecordsLock) {
-            if (mSshPersistRecordsCache != null) {
-                return new ArrayList<>(mSshPersistRecordsCache);
-            }
-
-            ArrayList<SshPersistenceRecord> records = new ArrayList<>();
-            SharedPreferences p = getSshPersistPrefs();
-            if (p == null) {
-                mSshPersistRecordsCache = new ArrayList<>();
-                return records;
-            }
-
-            String raw = p.getString(KEY_SSH_PERSIST_RECORDS_JSON, "[]");
-            if (!TextUtils.isEmpty(raw)) {
-                try {
-                    JSONArray array = new JSONArray(raw);
-                    for (int i = 0; i < array.length(); i++) {
-                        JSONObject item = array.optJSONObject(i);
-                        if (item == null) continue;
-                        SshPersistenceRecord parsed = SshPersistenceRecord.fromJson(item);
-                        if (parsed == null) continue;
-                        records.add(normalizeSshPersistenceRecord(parsed));
-                    }
-                } catch (Exception ignored) {
-                }
-            }
-
-            if (!records.isEmpty()) {
-                ArrayList<SshPersistenceRecord> deduped = dedupeSshPersistenceRecords(records);
-                if (!areSshPersistenceRecordsEqual(records, deduped)) {
-                    saveSshPersistenceRecordsLocked(deduped, p);
-                } else {
-                    mSshPersistRecordsCache = new ArrayList<>(deduped);
-                }
-                return new ArrayList<>(deduped);
-            }
-
-            // Legacy single-lock migration: keep old users' lock after upgrade.
-            if (p.getBoolean(KEY_SSH_PERSIST_ENABLED, false)) {
-                String sshCommand = p.getString(KEY_SSH_COMMAND, null);
-                if (!TextUtils.isEmpty(sshCommand)) {
-                    String id = UUID.randomUUID().toString();
-                    String tmuxSession = sanitizeTmuxSessionName(p.getString(KEY_SSH_TMUX_SESSION, DEFAULT_SSH_TMUX_SESSION));
-                    String shellName = p.getString(KEY_SSH_SHELL_NAME, null);
-                    if (TextUtils.isEmpty(shellName)) shellName = buildSshPersistShellName(id);
-                    String lockedHandle = p.getString(KEY_SSH_LOCKED_HANDLE, null);
-                    records.add(new SshPersistenceRecord(id, sshCommand.trim(), tmuxSession, shellName, lockedHandle));
-                    records = dedupeSshPersistenceRecords(records);
-                    saveSshPersistenceRecordsLocked(records, p);
-                    return new ArrayList<>(records);
-                }
-            }
-
-            mSshPersistRecordsCache = new ArrayList<>();
-            return records;
-        }
+        return toAppSshPersistenceRecords(mSshTmuxRuntimeEngine.loadRecords());
     }
 
     private void saveSshPersistenceRecords(@NonNull ArrayList<SshPersistenceRecord> records) {
-        synchronized (mSshPersistRecordsLock) {
-            SharedPreferences p = getSshPersistPrefs();
-            if (p == null) return;
-            saveSshPersistenceRecordsLocked(records, p);
-        }
+        mSshTmuxRuntimeEngine.saveRecords(toRuntimeSshPersistenceRecords(records));
     }
 
     private void saveSshPersistenceRecordsLocked(@NonNull ArrayList<SshPersistenceRecord> records,
@@ -1779,12 +1875,14 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         String id = record.id.trim();
         if (id.isEmpty()) id = UUID.randomUUID().toString();
 
-        String tmuxSession = sanitizeTmuxSessionName(record.tmuxSession);
+        String tmuxSession = normalizeTmuxSessionName(record.tmuxSession);
+        String displayName = SshTmuxSessionStateMachine.resolveExistingRemote(
+            tmuxSession, null, record.displayName, null, null).displayName;
         String shellName = record.shellName == null ? "" : record.shellName.trim();
         if (shellName.isEmpty()) shellName = buildSshPersistShellName(id);
 
         String sshCommand = sanitizeSshBootstrapCommand(record.sshCommand == null ? "" : record.sshCommand.trim());
-        return new SshPersistenceRecord(id, sshCommand, tmuxSession, shellName, record.lockedHandle);
+        return new SshPersistenceRecord(id, sshCommand, tmuxSession, displayName, shellName, record.lockedHandle);
     }
 
     @NonNull
@@ -1810,7 +1908,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     @NonNull
     private String buildSshPersistenceRemoteKey(@Nullable String sshCommand, @Nullable String tmuxSession) {
         return sanitizeSshBootstrapCommand(sshCommand == null ? "" : sshCommand) + "\n" +
-            sanitizeTmuxSessionName(tmuxSession == null ? "" : tmuxSession);
+            normalizeTmuxSessionName(tmuxSession == null ? "" : tmuxSession);
     }
 
     private int findSshPersistenceRecordIndexByRemote(@NonNull ArrayList<SshPersistenceRecord> records,
@@ -1853,7 +1951,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             usedShellNames.add(shellName);
 
             normalizedList.add(new SshPersistenceRecord(
-                id, record.sshCommand, record.tmuxSession, shellName, record.lockedHandle));
+                id, record.sshCommand, record.tmuxSession, record.displayName, shellName, record.lockedHandle));
         }
 
         return normalizedList;
@@ -1871,14 +1969,16 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         SshPersistenceRecord secondary = primary == left ? right : left;
 
         String shellName = !TextUtils.isEmpty(primary.shellName) ? primary.shellName : secondary.shellName;
+        String displayName = !TextUtils.isEmpty(primary.displayName) ? primary.displayName : secondary.displayName;
         String lockedHandle = !TextUtils.isEmpty(primary.lockedHandle) ? primary.lockedHandle : secondary.lockedHandle;
 
         return new SshPersistenceRecord(
-            primary.id, primary.sshCommand, primary.tmuxSession, shellName, lockedHandle);
+            primary.id, primary.sshCommand, primary.tmuxSession, displayName, shellName, lockedHandle);
     }
 
     private int scoreSshPersistenceRecord(@NonNull SshPersistenceRecord record) {
         int score = 0;
+        if (!TextUtils.isEmpty(record.displayName)) score += 1;
         if (!TextUtils.isEmpty(record.shellName)) score += 1;
         if (!TextUtils.isEmpty(record.lockedHandle)) score += 2;
         return score;
@@ -1893,6 +1993,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             if (!TextUtils.equals(a.id, b.id)) return false;
             if (!TextUtils.equals(a.sshCommand, b.sshCommand)) return false;
             if (!TextUtils.equals(a.tmuxSession, b.tmuxSession)) return false;
+            if (!TextUtils.equals(a.displayName, b.displayName)) return false;
             if (!TextUtils.equals(a.shellName, b.shellName)) return false;
             if (!TextUtils.equals(a.lockedHandle, b.lockedHandle)) return false;
         }
@@ -2030,9 +2131,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     private void showPinnedSessionActionDialog(@NonNull TerminalSession session,
                                                @NonNull SshPersistenceRecord record) {
+        String targetLabel = normalizeDisplayName(record.displayName, record.tmuxSession);
         new AlertDialog.Builder(mActivity)
             .setTitle(R.string.title_ssh_persistence_session_actions)
-            .setMessage(mActivity.getString(R.string.msg_ssh_persistence_session_target, record.tmuxSession))
+            .setMessage(mActivity.getString(R.string.msg_ssh_persistence_session_target, targetLabel))
             .setPositiveButton(R.string.action_ssh_persistence_close_front,
                 (dialog, which) -> closePinnedSessionForeground(session))
             .setNegativeButton(R.string.action_ssh_persistence_close_back,
@@ -2051,28 +2153,18 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                                               @NonNull SshPersistenceRecord fallbackRecord) {
         SshPersistenceRecord removed = removeSshPersistenceRecordForSession(session);
         SshPersistenceRecord record = normalizeSshPersistenceRecord(removed != null ? removed : fallbackRecord);
-        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_closing_background, record.tmuxSession), false);
+        String targetLabel = normalizeDisplayName(record.displayName, record.tmuxSession);
+        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_closing_background, targetLabel), false);
 
-        runSshBackgroundTask("tmux-close-background", () -> {
-            CommandResult destroyResult = runBashCommandSync(
-                buildTmuxKillSessionCommand(record.sshCommand, record.tmuxSession));
-            String combinedOutput = getCombinedOutput(destroyResult);
-            boolean destroyed = combinedOutput.contains(TMUX_SESSION_KILLED) ||
-                combinedOutput.contains(TMUX_SESSION_NOT_FOUND);
-
-            if (destroyed) {
-                cleanupPersistenceRecordsForRemoteTmux(record.sshCommand, record.tmuxSession);
+        mSshTmuxRuntimeEngine.destroyRemoteTmuxSession(
+            record.sshCommand, record.tmuxSession, record.displayName, session.mHandle, result -> {
+            if (result.code == SshTmuxOperationResult.Code.SUCCESS) {
+                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_destroyed, targetLabel), false);
+            } else {
+                mActivity.showToast(mActivity.getString(
+                    R.string.msg_ssh_persistence_destroy_failed, summarizeCommandResult(toCommandResult(result.commandResult))), true);
             }
-
-            mActivity.runOnUiThread(() -> {
-                if (destroyed) {
-                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_destroyed, record.tmuxSession), false);
-                } else {
-                    mActivity.showToast(mActivity.getString(
-                        R.string.msg_ssh_persistence_destroy_failed, summarizeCommandResult(destroyResult)), true);
-                }
-                closeTerminalSessionFromTabAction(session);
-            });
+            closeTerminalSessionFromTabAction(session);
         });
     }
 
@@ -2118,27 +2210,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @NonNull
     public Set<String> getPinnedSessionHandleSnapshot() {
-        HashSet<String> pinnedHandles = new HashSet<>();
-        TermuxService service = mActivity.getTermuxService();
-        if (service == null) return pinnedHandles;
-
-        ArrayList<SshPersistenceRecord> records = loadSshPersistenceRecords();
-        if (records.isEmpty()) return pinnedHandles;
-
-        int size = service.getTermuxSessionsSize();
-        for (int i = 0; i < size; i++) {
-            TermuxSession termuxSession = service.getTermuxSession(i);
-            if (termuxSession == null) continue;
-
-            TerminalSession terminalSession = termuxSession.getTerminalSession();
-            if (terminalSession == null || TextUtils.isEmpty(terminalSession.mHandle)) continue;
-
-            if (isSshSessionPinned(terminalSession, records)) {
-                pinnedHandles.add(terminalSession.mHandle);
-            }
-        }
-
-        return pinnedHandles;
+        return mSshTmuxRuntimeEngine.getPinnedSessionHandleSnapshot();
     }
 
     @Nullable
@@ -2160,12 +2232,114 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @Nullable
     public String getPinnedTmuxSessionForSession(@Nullable TerminalSession session) {
-        if (session == null) return null;
-        ArrayList<SshPersistenceRecord> records = loadSshPersistenceRecords();
-        int index = findSshPersistenceRecordIndexForSession(session, records);
-        if (index < 0 || index >= records.size()) return null;
-        String tmuxSession = sanitizeTmuxSessionName(records.get(index).tmuxSession);
-        return TextUtils.isEmpty(tmuxSession) ? null : tmuxSession;
+        return mSshTmuxRuntimeEngine.getPinnedTmuxSessionForSession(session);
+    }
+
+    @Nullable
+    public String getPinnedDisplayNameForSession(@Nullable TerminalSession session) {
+        return mSshTmuxRuntimeEngine.getPinnedDisplayNameForSession(session);
+    }
+
+    @NonNull
+    public TerminalSessionTabStateMachine.RuntimeState getRuntimeStateForSession(@Nullable TerminalSession session,
+                                                                                 @Nullable String pinnedTmuxSession,
+                                                                                 @Nullable String pinnedDisplayName,
+                                                                                 boolean hasRemoteTransport,
+                                                                                 boolean selected) {
+        if (session == null || TextUtils.isEmpty(session.mHandle)) {
+            return TerminalSessionTabStateMachine.RuntimeState.IDLE;
+        }
+        SshTmuxRuntimeStateMachine.Snapshot snapshot;
+        synchronized (mRuntimeStateLock) {
+            snapshot = mRuntimeSnapshotBySessionHandle.get(session.mHandle);
+        }
+        if (snapshot == null) {
+            return TerminalSessionTabStateMachine.RuntimeState.IDLE;
+        }
+        if (snapshot.phase == SshTmuxRuntimeStateMachine.Phase.FAILED) {
+            return TerminalSessionTabStateMachine.RuntimeState.FAILED;
+        }
+        if (snapshot.phase == SshTmuxRuntimeStateMachine.Phase.RETRY_SCHEDULED) {
+            return TerminalSessionTabStateMachine.RuntimeState.RETRY_SCHEDULED;
+        }
+
+        return TerminalSessionTabStateMachine.RuntimeState.BUSY;
+    }
+
+    private void trackRuntimeSnapshot(@NonNull SshTmuxRuntimeStateMachine.Snapshot snapshot) {
+        mLastSshTmuxRuntimeSnapshot = snapshot;
+
+        String operationId = normalizeRuntimeOperationId(snapshot.operationId);
+        if (operationId == null) return;
+
+        synchronized (mRuntimeStateLock) {
+            String previousHandle = mRuntimeSessionHandleByOperationId.get(operationId);
+            String currentHandle = normalizeRuntimeSessionHandle(snapshot.sessionHandle);
+            String resolvedHandle = currentHandle != null ? currentHandle : previousHandle;
+
+            if (snapshot.phase == SshTmuxRuntimeStateMachine.Phase.IDLE) {
+                removeRuntimeSnapshotForHandleLocked(previousHandle, operationId);
+                if (!TextUtils.equals(currentHandle, previousHandle)) {
+                    removeRuntimeSnapshotForHandleLocked(currentHandle, operationId);
+                }
+                mRuntimeSessionHandleByOperationId.remove(operationId);
+                return;
+            }
+
+            if (!TextUtils.equals(previousHandle, resolvedHandle)) {
+                removeRuntimeSnapshotForHandleLocked(previousHandle, operationId);
+            }
+
+            if (resolvedHandle == null) {
+                return;
+            }
+
+            mRuntimeSessionHandleByOperationId.put(operationId, resolvedHandle);
+            mRuntimeSnapshotBySessionHandle.put(resolvedHandle, snapshot);
+        }
+    }
+
+    private void clearRuntimeStateForSessionHandle(@Nullable String sessionHandle) {
+        String normalizedHandle = normalizeRuntimeSessionHandle(sessionHandle);
+        if (normalizedHandle == null) return;
+
+        synchronized (mRuntimeStateLock) {
+            mRuntimeSnapshotBySessionHandle.remove(normalizedHandle);
+
+            ArrayList<String> staleOperationIds = new ArrayList<>();
+            for (Map.Entry<String, String> entry : mRuntimeSessionHandleByOperationId.entrySet()) {
+                if (TextUtils.equals(normalizedHandle, entry.getValue())) {
+                    staleOperationIds.add(entry.getKey());
+                }
+            }
+
+            for (String operationId : staleOperationIds) {
+                mRuntimeSessionHandleByOperationId.remove(operationId);
+            }
+        }
+    }
+
+    private void removeRuntimeSnapshotForHandleLocked(@Nullable String sessionHandle, @NonNull String operationId) {
+        if (sessionHandle == null) return;
+        SshTmuxRuntimeStateMachine.Snapshot existing = mRuntimeSnapshotBySessionHandle.get(sessionHandle);
+        if (existing == null) return;
+        if (TextUtils.equals(operationId, normalizeRuntimeOperationId(existing.operationId))) {
+            mRuntimeSnapshotBySessionHandle.remove(sessionHandle);
+        }
+    }
+
+    @Nullable
+    private String normalizeRuntimeOperationId(@Nullable String operationId) {
+        if (TextUtils.isEmpty(operationId)) return null;
+        String normalized = operationId.trim();
+        return normalized.isEmpty() ? null : normalized;
+    }
+
+    @Nullable
+    private String normalizeRuntimeSessionHandle(@Nullable String sessionHandle) {
+        if (TextUtils.isEmpty(sessionHandle)) return null;
+        String normalized = sessionHandle.trim();
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private int findSshPersistenceRecordIndexForSession(@Nullable TerminalSession session,
@@ -2195,7 +2369,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (shellMatches.isEmpty()) return -1;
         if (shellMatches.size() == 1) return shellMatches.get(0);
 
-        String bootstrapByHandle = mSshBootstrapCommandByHandle.get(session.mHandle);
+        String bootstrapByHandle = getRememberedSshBootstrapCommand(session);
         if (!TextUtils.isEmpty(bootstrapByHandle)) {
             String normalizedBootstrap = sanitizeSshBootstrapCommand(bootstrapByHandle);
             for (Integer idx : shellMatches) {
@@ -2237,7 +2411,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (start >= end) return null;
         String value = script.substring(start, end).trim();
         if (TextUtils.isEmpty(value)) return null;
-        return sanitizeTmuxSessionName(value);
+        return unquoteShellToken(value);
     }
 
     @Nullable
@@ -2254,7 +2428,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     private boolean disableSshPersistenceForSession(@Nullable TerminalSession session) {
-        return removeSshPersistenceRecordForSession(session) != null;
+        return mSshTmuxRuntimeEngine.disableSshPersistenceForSession(session);
     }
 
     private boolean clearLockedHandleForSessionHandle(@Nullable String handle) {
@@ -2266,7 +2440,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                 SshPersistenceRecord record = records.get(i);
                 if (!TextUtils.equals(handle, record.lockedHandle)) continue;
                 records.set(i, new SshPersistenceRecord(
-                    record.id, record.sshCommand, record.tmuxSession, record.shellName, null));
+                    record.id, record.sshCommand, record.tmuxSession, record.displayName, record.shellName, null));
                 changed = true;
             }
             if (changed) saveSshPersistenceRecords(records);
@@ -2275,49 +2449,11 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     public boolean ensurePinnedSshSession(boolean switchToSession) {
-        return ensurePinnedSshSessions(switchToSession) > 0;
+        return mSshTmuxRuntimeEngine.ensurePinnedSshSession(switchToSession);
     }
 
     public int ensurePinnedSshSessions(boolean switchToAny) {
-        if (!mEnsuringPinnedSshSessions.compareAndSet(false, true)) {
-            mEnsurePinnedSshSessionsPending.set(true);
-            if (switchToAny) mEnsurePinnedSshSessionsPendingSwitchToAny.set(true);
-            return 0;
-        }
-        try {
-            ArrayList<SshPersistenceRecord> records = loadSshPersistenceRecords();
-            TermuxService service = mActivity.getTermuxService();
-            if (service == null) return 0;
-            cleanupOrphanedSshPersistentSessions(service, records);
-            collapseDuplicateManagedSshPersistentSessions(service, records);
-            if (records.isEmpty()) return 0;
-
-            ArrayList<SshPersistenceRecord> updated = new ArrayList<>(records.size());
-            boolean switched = false;
-            int ensuredCount = 0;
-
-            for (SshPersistenceRecord record : records) {
-                SshPersistenceRecord ensured = ensurePinnedSshSessionRecord(service, record, switchToAny && !switched);
-                if (ensured == null) continue;
-                updated.add(ensured);
-                ensuredCount++;
-
-                if (switchToAny && !switched && !TextUtils.isEmpty(ensured.lockedHandle)) {
-                    TerminalSession maybe = service.getTerminalSessionForHandle(ensured.lockedHandle);
-                    if (maybe != null) switched = true;
-                }
-            }
-
-            saveSshPersistenceRecords(updated);
-            termuxSessionListNotifyUpdated();
-            return ensuredCount;
-        } finally {
-            mEnsuringPinnedSshSessions.set(false);
-            if (mEnsurePinnedSshSessionsPending.compareAndSet(true, false)) {
-                boolean pendingSwitchToAny = mEnsurePinnedSshSessionsPendingSwitchToAny.getAndSet(false);
-                scheduleEnsurePinnedSshSessionsRetry(pendingSwitchToAny);
-            }
-        }
+        return mSshTmuxRuntimeEngine.ensurePinnedSshSessions(switchToAny);
     }
 
     @Nullable
@@ -2326,7 +2462,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                                                               boolean switchToSession) {
         SshPersistenceRecord normalized = normalizeSshPersistenceRecord(record);
         if (TextUtils.isEmpty(normalized.sshCommand)) return null;
-        String safeTmuxSession = sanitizeTmuxSessionName(normalized.tmuxSession);
+        String safeTmuxSession = normalizeTmuxSessionName(normalized.tmuxSession);
 
         if (!TextUtils.isEmpty(normalized.lockedHandle)) {
             TerminalSession existingByHandle = service.getTerminalSessionForHandle(normalized.lockedHandle);
@@ -2336,9 +2472,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                     service.removeTermuxSession(existingByHandle);
                     scheduleEnsurePinnedSshSessionsRetry(switchToSession);
                     return new SshPersistenceRecord(normalized.id, normalized.sshCommand,
-                        normalized.tmuxSession, normalized.shellName, null);
+                        normalized.tmuxSession, normalized.displayName, normalized.shellName, null);
                 } else {
                     rememberSshBootstrapCommand(existingByHandle, normalized.sshCommand);
+                    applyPinnedSessionDisplayName(existingByHandle, normalized.displayName);
                     if (switchToSession) setCurrentSession(existingByHandle);
                     return normalized;
                 }
@@ -2353,19 +2490,20 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                     service.removeTermuxSession(existingSession);
                     scheduleEnsurePinnedSshSessionsRetry(switchToSession);
                     return new SshPersistenceRecord(normalized.id, normalized.sshCommand,
-                        normalized.tmuxSession, normalized.shellName, null);
+                        normalized.tmuxSession, normalized.displayName, normalized.shellName, null);
                 } else {
                     rememberSshBootstrapCommand(existingSession, normalized.sshCommand);
+                    applyPinnedSessionDisplayName(existingSession, normalized.displayName);
                     if (switchToSession) setCurrentSession(existingSession);
                     return new SshPersistenceRecord(normalized.id, normalized.sshCommand,
-                        normalized.tmuxSession, normalized.shellName, existingSession.mHandle);
+                        normalized.tmuxSession, normalized.displayName, normalized.shellName, existingSession.mHandle);
                 }
             }
         }
 
         if (service.getTermuxSessionsSize() >= MAX_SESSIONS) return normalized;
 
-        String reconnectLoopScript = buildReconnectLoopCommand(normalized.sshCommand, normalized.tmuxSession);
+        String reconnectLoopScript = buildReconnectLoopCommand(normalized.sshCommand, normalized.tmuxSession, normalized.displayName);
         String bash = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/bash";
         if (!new File(bash).exists()) return normalized;
 
@@ -2377,9 +2515,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         TerminalSession createdSession = created.getTerminalSession();
         if (createdSession != null) {
             rememberSshBootstrapCommand(createdSession, normalized.sshCommand);
+            applyPinnedSessionDisplayName(createdSession, normalized.displayName);
             if (switchToSession) setCurrentSession(createdSession);
             return new SshPersistenceRecord(normalized.id, normalized.sshCommand,
-                normalized.tmuxSession, normalized.shellName, createdSession.mHandle);
+                normalized.tmuxSession, normalized.displayName, normalized.shellName, createdSession.mHandle);
         }
 
         return normalized;
@@ -2395,14 +2534,15 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (!loopScript.contains("while true; do") || !loopScript.contains("[ssh-persist]")) return false;
 
         // Recreate if tmux target changed or if script matches known-bad generations.
-        if (!loopScript.contains("tmux attach-session -t " + safeTmuxSession)) return true;
+        String target = buildTmuxTargetArg(safeTmuxSession);
+        if (!loopScript.contains("tmux attach-session -t " + target)) return true;
         if (countMatches(loopScript, "while true; do") > 1) return true;
-        if (loopScript.contains("tmux has-session -t " + safeTmuxSession + " 2>/dev/null || tmux new-session -d -s " + safeTmuxSession +
-            "; tmux set-option -t " + safeTmuxSession)) return true;
+        if (loopScript.contains("tmux has-session -t " + target + " 2>/dev/null || tmux new-session -d -s " + target +
+            "; tmux set-option -t " + target)) return true;
         return loopScript.contains("capture-pane -p -t \"\"") ||
             loopScript.contains("pane=;") ||
             loopScript.contains("; ; tmux") ||
-            loopScript.contains("set-option -t " + safeTmuxSession + " mouse off");
+            loopScript.contains("set-option -t " + target + " mouse off");
     }
 
     @Nullable
@@ -2455,7 +2595,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         for (SshPersistenceRecord record : records) {
             if (TextUtils.isEmpty(record.shellName)) continue;
             managedShellNames.add(record.shellName);
-            tmuxByShellName.put(record.shellName, sanitizeTmuxSessionName(record.tmuxSession));
+            tmuxByShellName.put(record.shellName, normalizeTmuxSessionName(record.tmuxSession));
         }
         if (managedShellNames.isEmpty()) return;
 
@@ -2515,7 +2655,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     private void maybeAutoRestorePinnedSshSessions() {
-        ensurePinnedSshSessions(mActivity.getCurrentSession() == null);
+        mSshTmuxRuntimeEngine.maybeAutoRestorePinnedSshSessions();
     }
 
     private void scheduleEnsurePinnedSshSessionsRetry(boolean switchToAny) {
@@ -2541,36 +2681,43 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_command_required), true);
             return;
         }
-        final String tmuxSession = generatePersistentTmuxSessionName(targetSession, sshCommand);
-
         mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_checking_tmux), false);
+        mSshTmuxRuntimeEngine.prepareSshLock(targetSession, sshCommand, attachCurrentSessionToTmux, result -> {
+            if (result.code == SshTmuxOperationResult.Code.SUCCESS) {
+                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_locked), true);
+                return;
+            }
 
-        runSshBackgroundTask("tmux-check-before-lock", () -> {
-            CommandResult check = runBashCommandSync(buildTmuxCheckCommand(sshCommand));
-            boolean hasTmux = check.stdout.contains("__TMUX_OK__");
-            boolean missingTmux = check.stdout.contains("__TMUX_MISSING__");
+            if (result.code == SshTmuxOperationResult.Code.TMUX_MISSING) {
+                final String installCommand = buildTmuxInstallCommand(sshCommand);
+                new AlertDialog.Builder(mActivity)
+                    .setTitle(R.string.title_ssh_persistence_tmux_missing)
+                    .setMessage(mActivity.getString(R.string.msg_ssh_persistence_tmux_missing_with_cmd, installCommand))
+                    .setPositiveButton(R.string.action_ssh_persistence_install, (dialog, which) -> {
+                        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_installing_tmux), true);
+                        mSshTmuxRuntimeEngine.installTmuxAndEnable(
+                            targetSession, sshCommand, result.tmuxSession, result.displayName,
+                            attachCurrentSessionToTmux, installResult -> {
+                                if (installResult.code == SshTmuxOperationResult.Code.SUCCESS) {
+                                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_locked), true);
+                                } else {
+                                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_install_failed), true);
+                                }
+                            });
+                    })
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show();
+                return;
+            }
 
-            mActivity.runOnUiThread(() -> {
-                if (hasTmux) {
-                    enableSshPersistence(targetSession, sshCommand, tmuxSession, attachCurrentSessionToTmux);
-                } else if (missingTmux) {
-                    final String installCommand = buildTmuxInstallCommand(sshCommand);
-                    new AlertDialog.Builder(mActivity)
-                        .setTitle(R.string.title_ssh_persistence_tmux_missing)
-                        .setMessage(mActivity.getString(R.string.msg_ssh_persistence_tmux_missing_with_cmd, installCommand))
-                        .setPositiveButton(R.string.action_ssh_persistence_install, (dialog, which) ->
-                            runTmuxInstallAndEnable(targetSession, sshCommand, tmuxSession, installCommand, attachCurrentSessionToTmux))
-                        .setNegativeButton(android.R.string.cancel, null)
-                        .show();
-                } else {
-                    showTmuxCheckFailedDialog(targetSession, sshCommand, check, attachCurrentSessionToTmux);
-                }
-            });
+            showTmuxCheckFailedDialog(targetSession, sshCommand,
+                toCommandResult(result.commandResult), attachCurrentSessionToTmux);
         });
     }
 
     private void runTmuxInstallAndEnable(@NonNull TerminalSession targetSession, @NonNull String sshCommand,
-                                         @NonNull String tmuxSession, @NonNull String installCommand,
+                                         @NonNull String tmuxSession, @NonNull String displayName,
+                                         @NonNull String installCommand,
                                          boolean attachCurrentSessionToTmux) {
         mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_installing_tmux), true);
 
@@ -2580,7 +2727,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             boolean hasTmux = verifyResult.stdout.contains("__TMUX_OK__");
             mActivity.runOnUiThread(() -> {
                 if (installResult.isSuccess() && hasTmux) {
-                    enableSshPersistence(targetSession, sshCommand, tmuxSession, attachCurrentSessionToTmux);
+                    enableSshPersistence(targetSession, sshCommand, tmuxSession, displayName, attachCurrentSessionToTmux);
                 } else {
                     mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_install_failed), true);
                 }
@@ -2641,12 +2788,14 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     private void enableSshPersistence(@NonNull TerminalSession targetSession, @NonNull String sshCommand,
-                                      @NonNull String tmuxSession, boolean attachCurrentSessionToTmux) {
+                                      @NonNull String tmuxSession, @NonNull String displayName,
+                                      boolean attachCurrentSessionToTmux) {
         sshCommand = sanitizeSshBootstrapCommand(sshCommand);
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        String normalizedDisplayName = normalizeDisplayName(displayName, safeTmuxSession);
         boolean lockCurrentSession = attachCurrentSessionToTmux && targetSession.isRunning();
         if (lockCurrentSession) {
-            attachSessionToTmux(targetSession, safeTmuxSession);
+            attachSessionToTmux(targetSession, safeTmuxSession, normalizedDisplayName);
         }
 
         ArrayList<SshPersistenceRecord> records = loadSshPersistenceRecords();
@@ -2659,10 +2808,13 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             (existingIndex >= 0 ? records.get(existingIndex).lockedHandle : null);
 
         SshPersistenceRecord record = normalizeSshPersistenceRecord(new SshPersistenceRecord(
-            recordId, sshCommand, safeTmuxSession, shellName, lockedHandle
+            recordId, sshCommand, safeTmuxSession, normalizedDisplayName, shellName, lockedHandle
         ));
         upsertSshPersistenceRecord(record);
-        if (lockCurrentSession) rememberSshBootstrapCommand(targetSession, sshCommand);
+        if (lockCurrentSession) {
+            rememberSshBootstrapCommand(targetSession, sshCommand);
+            applyPinnedSessionDisplayName(targetSession, normalizedDisplayName);
+        }
 
         if (!lockCurrentSession) {
             TermuxService service = mActivity.getTermuxService();
@@ -2692,9 +2844,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         termuxSessionListNotifyUpdated();
     }
 
-    private void attachSessionToTmux(@NonNull TerminalSession targetSession, @NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
-        targetSession.write(buildTmuxEnsureAndAttachCommand(safeTmuxSession) + "\r");
+    private void attachSessionToTmux(@NonNull TerminalSession targetSession, @NonNull String tmuxSession,
+                                     @NonNull String displayName) {
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        targetSession.write(buildTmuxEnsureAndAttachCommand(safeTmuxSession, displayName) + "\r");
     }
 
     private void disableSshPersistence() {
@@ -3170,30 +3323,37 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     private String buildTmuxListSessionsCommand(@NonNull String sshCommand) {
         String remoteList =
             "if command -v tmux >/dev/null 2>&1; then " +
-                "tmux list-sessions -F '__TMUX_ITEM__|#{session_name}|#{session_windows}|#{session_attached}' 2>/dev/null || true; " +
+                "tmux list-sessions -F '__TMUX_ITEM__|#{session_name}|#{session_windows}|#{session_attached}|#{" +
+                SshTmuxSessionStateMachine.TMUX_DISPLAY_NAME_OPTION + "}' 2>/dev/null || true; " +
                 "echo __TMUX_LIST_DONE__; " +
             "else echo __TMUX_MISSING__; exit 42; fi";
         return buildSshRemoteExecCommand(sshCommand, remoteList);
     }
 
     @NonNull
-    private String buildTmuxCreateSessionCommand(@NonNull String sshCommand, @NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
+    private String buildTmuxCreateSessionCommand(@NonNull String sshCommand, @NonNull String tmuxSession,
+                                                 @NonNull String displayName) {
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        String target = buildTmuxTargetArg(safeTmuxSession);
         String remoteCreate =
             "if command -v tmux >/dev/null 2>&1; then " +
-                "if tmux has-session -t " + safeTmuxSession + " 2>/dev/null; then echo __TMUX_EXISTS__; exit 5; fi; " +
-                "tmux new-session -d -s " + safeTmuxSession + " && echo __TMUX_CREATED__; " +
+                "if tmux has-session -t " + target + " 2>/dev/null; then echo __TMUX_EXISTS__; exit 5; fi; " +
+                "if tmux new-session -d -s " + target + "; then " +
+                    buildTmuxDisplaySyncCommand(safeTmuxSession, displayName) + "; " +
+                    "echo __TMUX_CREATED__; " +
+                "else exit $?; fi; " +
             "else echo __TMUX_MISSING__; exit 42; fi";
         return buildSshRemoteExecCommand(sshCommand, remoteCreate);
     }
 
     @NonNull
     private String buildTmuxKillSessionCommand(@NonNull String sshCommand, @NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        String target = buildTmuxTargetArg(safeTmuxSession);
         String remoteDestroy =
             "if command -v tmux >/dev/null 2>&1; then " +
-                "if tmux has-session -t " + safeTmuxSession + " 2>/dev/null; then " +
-                    "tmux kill-session -t " + safeTmuxSession + " && echo __TMUX_KILLED__; " +
+                "if tmux has-session -t " + target + " 2>/dev/null; then " +
+                    "tmux kill-session -t " + target + " && echo __TMUX_KILLED__; " +
                 "else echo __TMUX_NOT_FOUND__; exit 3; fi; " +
             "else echo __TMUX_MISSING__; exit 42; fi";
         return buildSshRemoteExecCommand(sshCommand, remoteDestroy);
@@ -3217,18 +3377,21 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @NonNull
-    private String buildReconnectLoopCommand(@NonNull String sshCommand, @NonNull String tmuxSession) {
+    private String buildReconnectLoopCommand(@NonNull String sshCommand, @NonNull String tmuxSession,
+                                             @NonNull String displayName) {
         sshCommand = sanitizeSshBootstrapCommand(sshCommand);
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        String target = buildTmuxTargetArg(safeTmuxSession);
         String remoteEnsure =
             "if command -v tmux >/dev/null 2>&1; then " +
-                "tmux has-session -t " + safeTmuxSession + " 2>/dev/null || tmux new-session -d -s " + safeTmuxSession + "; " +
+                "if ! tmux has-session -t " + target + " 2>/dev/null; then tmux new-session -d -s " + target + " || exit $?; fi; " +
+                buildTmuxDisplaySyncCommand(safeTmuxSession, displayName) + "; " +
                 "echo __TMUX_READY__; " +
             "else echo __TMUX_MISSING__; exit 42; fi";
         String remoteAttach =
             "if command -v tmux >/dev/null 2>&1; then " +
-                "if tmux has-session -t " + safeTmuxSession + " 2>/dev/null; then " +
-                    buildTmuxAttachOnlyCommand(safeTmuxSession) + "; " +
+                "if tmux has-session -t " + target + " 2>/dev/null; then " +
+                    buildTmuxAttachOnlyCommand(safeTmuxSession, displayName) + "; " +
                 "else echo __TMUX_GONE__; exit 43; fi; " +
             "else echo __TMUX_MISSING__; exit 42; fi";
         String quotedRemoteEnsure = quoteArg(remoteEnsure);
@@ -3254,22 +3417,25 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @NonNull
-    private String buildTmuxAttachOnlyCommand(@NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
-        return "tmux set-option -t " + safeTmuxSession + " mouse on >/dev/null 2>&1; " +
-            "tmux set-window-option -t " + safeTmuxSession + " alternate-screen off >/dev/null 2>&1; " +
-            "tmux set-option -t " + safeTmuxSession + " history-limit " + SSH_PERSIST_TMUX_PRELOAD_LINES + " >/dev/null 2>&1; " +
+    private String buildTmuxAttachOnlyCommand(@NonNull String tmuxSession, @NonNull String displayName) {
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        String target = buildTmuxTargetArg(safeTmuxSession);
+        return buildTmuxDisplaySyncCommand(safeTmuxSession, displayName) + "; " +
+            "tmux set-option -t " + target + " mouse on >/dev/null 2>&1; " +
+            "tmux set-window-option -t " + target + " alternate-screen off >/dev/null 2>&1; " +
+            "tmux set-option -t " + target + " history-limit " + SSH_PERSIST_TMUX_PRELOAD_LINES + " >/dev/null 2>&1; " +
             // Dump recent pane output before attach so local transcript has cache immediately.
-            "pane=$(tmux display-message -p -t " + safeTmuxSession + " '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); " +
+            "pane=$(tmux display-message -p -t " + target + " '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); " +
             "[ -n \"$pane\" ] && tmux capture-pane -p -t \"$pane\" -S -" + SSH_PERSIST_TMUX_PRELOAD_LINES + " 2>/dev/null || true; " +
-            "tmux attach-session -t " + safeTmuxSession;
+            "tmux attach-session -t " + target;
     }
 
     @NonNull
-    private String buildTmuxEnsureAndAttachCommand(@NonNull String tmuxSession) {
-        String safeTmuxSession = sanitizeTmuxSessionName(tmuxSession);
-        return "tmux has-session -t " + safeTmuxSession + " 2>/dev/null || tmux new-session -d -s " + safeTmuxSession +
-            "; " + buildTmuxAttachOnlyCommand(safeTmuxSession);
+    private String buildTmuxEnsureAndAttachCommand(@NonNull String tmuxSession, @NonNull String displayName) {
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        String target = buildTmuxTargetArg(safeTmuxSession);
+        return "tmux has-session -t " + target + " 2>/dev/null || tmux new-session -d -s " + target +
+            "; " + buildTmuxAttachOnlyCommand(safeTmuxSession, displayName);
     }
 
     @NonNull
@@ -3278,11 +3444,55 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @NonNull
-    private String sanitizeTmuxSessionName(@Nullable String raw) {
-        String value = raw == null ? "" : raw.trim();
-        if (value.isEmpty()) return DEFAULT_SSH_TMUX_SESSION;
-        value = value.replaceAll("[^A-Za-z0-9._-]", "-");
+    private String normalizeTmuxSessionName(@Nullable String raw) {
+        String value = SshTmuxSessionStateMachine.normalizeRemoteSessionName(raw);
         return value.isEmpty() ? DEFAULT_SSH_TMUX_SESSION : value;
+    }
+
+    @NonNull
+    private String normalizeDisplayName(@Nullable String raw, @Nullable String fallback) {
+        return SshTmuxSessionStateMachine.normalizeDisplayName(raw, fallback);
+    }
+
+    @NonNull
+    private String sanitizeTmuxSessionName(@Nullable String raw) {
+        return normalizeTmuxSessionName(raw);
+    }
+
+    @NonNull
+    private String buildTmuxTargetArg(@Nullable String tmuxSession) {
+        return quoteArg(normalizeTmuxSessionName(tmuxSession));
+    }
+
+    @NonNull
+    private String buildTmuxDisplaySyncCommand(@NonNull String tmuxSession, @Nullable String displayName) {
+        String encoded = SshTmuxSessionStateMachine.encodeDisplayNameHex(normalizeDisplayName(displayName, tmuxSession));
+        return "tmux set-option -q -t " + buildTmuxTargetArg(tmuxSession) + " " +
+            SshTmuxSessionStateMachine.TMUX_DISPLAY_NAME_OPTION + " " + quoteArg(encoded) + " >/dev/null 2>&1";
+    }
+
+    @NonNull
+    private String buildTmuxDisplaySyncRemoteExecCommand(@NonNull String sshCommand, @NonNull String tmuxSession,
+                                                         @Nullable String displayName) {
+        String target = buildTmuxTargetArg(tmuxSession);
+        String remoteSync =
+            "if command -v tmux >/dev/null 2>&1; then " +
+                "if tmux has-session -t " + target + " 2>/dev/null; then " +
+                    buildTmuxDisplaySyncCommand(tmuxSession, displayName) + "; " +
+                "else echo __TMUX_NOT_FOUND__; exit 3; fi; " +
+            "else echo __TMUX_MISSING__; exit 42; fi";
+        return buildSshRemoteExecCommand(sshCommand, remoteSync);
+    }
+
+    @NonNull
+    private String unquoteShellToken(@Nullable String raw) {
+        String value = raw == null ? "" : raw.trim();
+        if (value.isEmpty()) return normalizeTmuxSessionName(null);
+        if (value.startsWith("'") && value.endsWith("'") && value.length() >= 2) {
+            value = value.substring(1, value.length() - 1);
+            value = value.replace("'\"'\"'", "'");
+        }
+        return normalizeTmuxSessionName(value);
     }
 
     private boolean isReconnectLoopSession(@Nullable TermuxSession termuxSession) {
@@ -3326,21 +3536,13 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @NonNull
-    private String generatePersistentTmuxSessionName(@NonNull TerminalSession session, @NonNull String sshCommand) {
-        StringBuilder sb = new StringBuilder("termux-persist-");
-        sb.append(Long.toHexString(System.currentTimeMillis()));
-
-        if (!TextUtils.isEmpty(session.mHandle)) {
-            String handle = session.mHandle.replaceAll("[^A-Za-z0-9]", "");
-            if (!handle.isEmpty()) {
-                if (handle.length() > 8) handle = handle.substring(handle.length() - 8);
-                sb.append("-").append(handle);
-            }
-        }
-
-        int hash = Math.abs(sshCommand.hashCode());
-        sb.append("-").append(Integer.toHexString(hash));
-        return sanitizeTmuxSessionName(sb.toString());
+    private SshTmuxSessionStateMachine.Snapshot generatePersistentTmuxSessionPlan(@NonNull TerminalSession session,
+                                                                                  @NonNull String sshCommand) {
+        String fallback = !TextUtils.isEmpty(session.mSessionName) &&
+            !SshTmuxSessionStateMachine.looksLikeOpaqueInternalName(session.mSessionName)
+            ? session.mSessionName
+            : session.getTitle();
+        return SshTmuxSessionStateMachine.planNewManagedSession(null, fallback, sshCommand, session.mHandle);
     }
 
     private SharedPreferences getSshPersistPrefs() {
@@ -3529,5 +3731,3 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
 }
-
-

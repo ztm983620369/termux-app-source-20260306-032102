@@ -14,6 +14,7 @@ public final class FileRootResolver {
     public static final String SFTP_MOUNT_RELATIVE_ROOT = ".termux/sftp-mounts";
     public static final String SFTP_VIRTUAL_RELATIVE_ROOT = ".termux/sftp-virtual";
     public static final String SFTP_CACHE_RELATIVE_ROOT = ".termux/sftp-cache";
+    public static final String SFTP_TRANSFER_RELATIVE_ROOT = ".termux/sftp-transfer";
 
     private FileRootResolver() {
     }
@@ -41,6 +42,11 @@ public final class FileRootResolver {
     @NonNull
     public static String resolveCacheRoot(@NonNull Context context, @NonNull SessionEntry entry) {
         return termuxPrivateRoot(context) + "/" + SFTP_CACHE_RELATIVE_ROOT + "/" + sessionPathKey(entry);
+    }
+
+    @NonNull
+    public static String resolveTransferRoot(@NonNull Context context) {
+        return termuxPrivateRoot(context) + "/" + SFTP_TRANSFER_RELATIVE_ROOT;
     }
 
     @NonNull

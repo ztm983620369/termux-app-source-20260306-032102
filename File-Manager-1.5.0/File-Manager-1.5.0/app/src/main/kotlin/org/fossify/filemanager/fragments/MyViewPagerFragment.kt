@@ -3,6 +3,8 @@ package org.fossify.filemanager.fragments
 import android.content.Context
 import android.util.AttributeSet
 import android.widget.RelativeLayout
+import com.termux.bridge.FileOpenBridge
+import com.termux.bridge.FileOpenRequest
 import org.fossify.commons.extensions.*
 import org.fossify.commons.helpers.VIEW_TYPE_LIST
 import org.fossify.commons.models.FileDirItem
@@ -15,12 +17,13 @@ import org.fossify.filemanager.databinding.StorageFragmentBinding
 import org.fossify.filemanager.extensions.isPathOnRoot
 import org.fossify.filemanager.extensions.tryOpenPathIntent
 import org.fossify.filemanager.helpers.RootHelpers
-import org.fossify.filemanager.interfaces.FileManagerHost
+import org.fossify.filemanager.interfaces.FileManagerDependencies
 
 abstract class MyViewPagerFragment<BINDING : MyViewPagerFragment.InnerBinding>(context: Context, attributeSet: AttributeSet) :
     RelativeLayout(context, attributeSet) {
     protected var activity: SimpleActivity? = null
     protected var currentViewType = VIEW_TYPE_LIST
+    protected lateinit var fileManagerDependencies: FileManagerDependencies
 
     var currentPath = ""
     var isGetContentIntent = false
@@ -30,17 +33,34 @@ abstract class MyViewPagerFragment<BINDING : MyViewPagerFragment.InnerBinding>(c
     protected var isCreateDocumentIntent = false
     protected lateinit var innerBinding: BINDING
 
-    protected fun clickedPath(path: String) {
+    protected val fileManagerEnvironment
+        get() = fileManagerDependencies.environment
+
+    protected val fileManagerControllerCommands
+        get() = fileManagerDependencies.controllerCommands
+
+    protected val fileManagerResultHandler
+        get() = fileManagerDependencies.resultHandler
+
+    fun bindDependencies(dependencies: FileManagerDependencies) {
+        fileManagerDependencies = dependencies
+    }
+
+    protected fun clickedPath(path: String, openRequest: FileOpenRequest? = null) {
         if (isGetContentIntent || isCreateDocumentIntent) {
-            (activity as? FileManagerHost)?.pickedPath(path)
+            fileManagerResultHandler.pickedPath(path)
         } else if (isGetRingtonePicker) {
             if (path.isAudioFast()) {
-                (activity as? FileManagerHost)?.pickedRingtone(path)
+                fileManagerResultHandler.pickedRingtone(path)
             } else {
                 activity?.toast(R.string.select_audio_file)
             }
         } else {
-            activity?.tryOpenPathIntent(path, false)
+            if (openRequest != null) {
+                FileOpenBridge.dispatch(openRequest)
+            } else {
+                activity?.tryOpenPathIntent(path, false)
+            }
         }
     }
 

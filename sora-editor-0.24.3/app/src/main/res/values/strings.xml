@@ -91,6 +91,7 @@
     <string name="enable_soft_keyboard">Enable soft keyboard</string>
     <string name="hide_soft_kbd_if_hard_kbd_available">Hide soft kbd if hard kbd available</string>
     <string name="auto_save_enabled">Auto save</string>
+    <string name="save_sync_status">Save sync status</string>
     <string name="save_file">Save</string>
     <string name="autosave_self_test">Auto save self-test</string>
     <string name="copy_text">Copy</string>

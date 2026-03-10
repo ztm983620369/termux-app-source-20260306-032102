@@ -76,12 +76,14 @@ import com.termux.shared.termux.shell.command.runner.terminal.TermuxSession;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TextStyle;
 import com.termux.terminaltabs.TerminalTabsBar;
+import com.termux.terminalsessioncore.TerminalSessionTabStateMachine;
 import com.termux.terminal.TerminalSessionClient;
 import com.termux.view.TerminalView;
 import com.termux.view.TerminalViewClient;
 import com.termux.bridge.FileOpenBridge;
 import com.termux.bridge.FileOpenListener;
 import com.termux.bridge.FileEditorContract;
+import com.termux.bridge.FileOpenEvent;
 import com.termux.bridge.FileOpenRequest;
 import com.termux.ui.nav.UiShellNavBridge;
 import java.io.BufferedReader;
@@ -717,6 +719,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     @Override
+    public boolean isTermuxScopedFileManager() {
+        return true;
+    }
+
+    @Override
     public void showSessionSwitcher() {
         if (mFileManagerController != null) {
             mFileManagerController.showSessionSwitcher();
@@ -1289,7 +1296,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
 
         Function0<Intent> intentProvider = () -> getFileManagerIntent();
-        mFileManagerController = new FileManagerController(this, mFileManagerBinding, intentProvider, false);
+        mFileManagerController = new FileManagerController(this, mFileManagerBinding, intentProvider, this, false);
         mFileManagerController.attachTo((ViewGroup) mFilesPage);
         mFileManagerController.onCreate(null);
 
@@ -1328,7 +1335,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
 
     @Override
-    public void onOpenFile(final FileOpenRequest request) {
+    public void onOpenFile(final FileOpenEvent event) {
+        if (event == null) return;
+        final FileOpenRequest request = event.getRequest();
         if (request == null) return;
         Runnable action = () -> {
             if (mBottomNavTab != TAB_EDITOR) {
@@ -1550,18 +1559,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             TerminalSession session = termuxSession.getTerminalSession();
             if (session == null) continue;
 
-            String title;
-            if (!TextUtils.isEmpty(session.mSessionName)) {
-                title = session.mSessionName;
-            } else if (!TextUtils.isEmpty(session.getTitle())) {
-                title = session.getTitle();
-            } else {
-                title = "terminal";
-            }
-
+            boolean selected = session == current;
             boolean locked = !TextUtils.isEmpty(session.mHandle) &&
                 pinnedSessionHandles.contains(session.mHandle);
-            tabs.add(new TerminalTabsBar.Tab(session.mHandle, title, session == current, locked));
+            String pinnedDisplayName = locked && mTermuxTerminalSessionActivityClient != null
+                ? mTermuxTerminalSessionActivityClient.getPinnedDisplayNameForSession(session)
+                : null;
 
             String sshCommand = mTermuxTerminalSessionActivityClient == null
                 ? null
@@ -1577,13 +1580,46 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 }
             }
 
+            TerminalSessionTabStateMachine.RuntimeState runtimeState =
+                mTermuxTerminalSessionActivityClient == null
+                    ? TerminalSessionTabStateMachine.RuntimeState.IDLE
+                    : mTermuxTerminalSessionActivityClient.getRuntimeStateForSession(
+                        session, tmuxSession, pinnedDisplayName, !TextUtils.isEmpty(sshCommand), selected);
+
+            int exitStatus = session.isRunning() ? 0 : session.getExitStatus();
+            TerminalSessionTabStateMachine.Snapshot tabSnapshot = TerminalSessionTabStateMachine.resolve(
+                new TerminalSessionTabStateMachine.Input(
+                    selected,
+                    locked,
+                    session.isRunning(),
+                    exitStatus,
+                    pinnedDisplayName,
+                    session.mSessionName,
+                    session.getTitle(),
+                    toTerminalTabTransport(transport),
+                    runtimeState
+                )
+            );
+
+            String title = tabSnapshot.title;
+            tabs.add(new TerminalTabsBar.Tab(
+                session.mHandle,
+                title,
+                tabSnapshot.selected,
+                tabSnapshot.locked,
+                tabSnapshot.closable,
+                toTerminalTabTone(tabSnapshot.accentTone),
+                getTerminalTabBadgeText(tabSnapshot.badgeKind),
+                buildTerminalTabContentDescription(tabSnapshot)
+            ));
+
             String sessionId = TextUtils.isEmpty(session.mHandle) ? "session-" + i : session.mHandle;
             syncEntries.add(new SessionEntry.Builder(sessionId, title)
                 .setTransport(transport)
                 .setTerminalHandle(session.mHandle)
                 .setSshCommand(sshCommand)
                 .setTmuxSession(tmuxSession)
-                .setActive(session == current)
+                .setActive(selected)
                 .setRunning(session.isRunning())
                 .setUpdatedAtMs(nowMs)
                 .build());
@@ -1603,6 +1639,77 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
         SessionRegistry.getInstance().publish(this,
             new SessionSnapshot(syncEntries, activeSessionId, nowMs));
+    }
+
+    @NonNull
+    private TerminalSessionTabStateMachine.TransportKind toTerminalTabTransport(@NonNull SessionTransport transport) {
+        switch (transport) {
+            case SSH:
+                return TerminalSessionTabStateMachine.TransportKind.SSH;
+            case SSH_PERSIST:
+                return TerminalSessionTabStateMachine.TransportKind.SSH_PERSIST;
+            case LOCAL:
+            default:
+                return TerminalSessionTabStateMachine.TransportKind.LOCAL;
+        }
+    }
+
+    @NonNull
+    private TerminalTabsBar.StatusTone toTerminalTabTone(@NonNull TerminalSessionTabStateMachine.AccentTone accentTone) {
+        switch (accentTone) {
+            case ACTIVE:
+                return TerminalTabsBar.StatusTone.ACTIVE;
+            case REMOTE:
+                return TerminalTabsBar.StatusTone.REMOTE;
+            case PERSISTENT:
+                return TerminalTabsBar.StatusTone.PERSISTENT;
+            case BUSY:
+                return TerminalTabsBar.StatusTone.BUSY;
+            case SUCCESS:
+                return TerminalTabsBar.StatusTone.SUCCESS;
+            case ERROR:
+                return TerminalTabsBar.StatusTone.ERROR;
+            case NEUTRAL:
+            default:
+                return TerminalTabsBar.StatusTone.NEUTRAL;
+        }
+    }
+
+    @Nullable
+    private String getTerminalTabBadgeText(@NonNull TerminalSessionTabStateMachine.BadgeKind badgeKind) {
+        switch (badgeKind) {
+            case SSH:
+                return "SSH";
+            case PIN:
+                return "PIN";
+            case BUSY:
+                return "SYNC";
+            case RETRY:
+                return "RETRY";
+            case DONE:
+                return "DONE";
+            case ERROR:
+                return "ERR";
+            case NONE:
+            default:
+                return null;
+        }
+    }
+
+    @NonNull
+    private String buildTerminalTabContentDescription(@NonNull TerminalSessionTabStateMachine.Snapshot tabSnapshot) {
+        StringBuilder sb = new StringBuilder(tabSnapshot.title);
+        String badge = getTerminalTabBadgeText(tabSnapshot.badgeKind);
+        if (!TextUtils.isEmpty(badge)) {
+            sb.append(" ").append(badge);
+        }
+        if (tabSnapshot.selected) {
+            sb.append(" current");
+        }
+        if (tabSnapshot.locked) {
+            sb.append(" locked");
+        }
+        return sb.toString();
     }
 
     private void scheduleCoalescedSessionListUiUpdate() {

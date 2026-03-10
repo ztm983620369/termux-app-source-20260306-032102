@@ -2,12 +2,17 @@ package org.fossify.filemanager.fragments
 
 import android.content.Context
 import android.util.AttributeSet
+import com.termux.bridge.FileOpenRequest
+import com.termux.bridge.RecentFileEntry
 import com.termux.bridge.RecentFileHistory
+import com.termux.sessionsync.SessionFileCoordinator
 import org.fossify.commons.extensions.areSystemAnimationsEnabled
 import org.fossify.commons.extensions.beVisibleIf
 import org.fossify.commons.extensions.getFilenameFromPath
+import org.fossify.commons.extensions.getMimeType
 import org.fossify.commons.extensions.normalizeString
 import org.fossify.commons.extensions.showErrorToast
+import org.fossify.commons.extensions.toast
 import org.fossify.commons.helpers.VIEW_TYPE_GRID
 import org.fossify.commons.helpers.VIEW_TYPE_LIST
 import org.fossify.commons.helpers.ensureBackgroundThread
@@ -18,9 +23,8 @@ import org.fossify.filemanager.activities.SimpleActivity
 import org.fossify.filemanager.adapters.ItemsAdapter
 import org.fossify.filemanager.databinding.RecentsFragmentBinding
 import org.fossify.filemanager.extensions.config
-import org.fossify.filemanager.extensions.isPathInHiddenFolder
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
-import org.fossify.filemanager.interfaces.FileManagerHost
+import org.fossify.filemanager.helpers.TermuxPathScope
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
 import java.io.File
@@ -31,8 +35,15 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
         private const val RECENTS_LIMIT = 200
     }
 
+    private data class RecentListResult(
+        val items: ArrayList<ListItem>,
+        val entriesByPath: LinkedHashMap<String, RecentFileEntry>
+    )
+
+    private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
     private var filesIgnoringSearch = ArrayList<ListItem>()
     private var lastSearchedText = ""
+    private var recentEntriesByPath = linkedMapOf<String, RecentFileEntry>()
     private var zoomListener: MyRecyclerView.MyZoomListener? = null
     private var storedItems = ArrayList<ListItem>()
     private lateinit var binding: RecentsFragmentBinding
@@ -54,14 +65,15 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
 
     override fun refreshFragment() {
         ensureBackgroundThread {
-            getRecents { recents ->
+            getRecents { result ->
                 binding.apply {
                     recentsSwipeRefresh.isRefreshing = false
-                    recentsList.beVisibleIf(recents.isNotEmpty())
-                    recentsPlaceholder.beVisibleIf(recents.isEmpty())
+                    recentsList.beVisibleIf(result.items.isNotEmpty())
+                    recentsPlaceholder.beVisibleIf(result.items.isEmpty())
                 }
-                filesIgnoringSearch = recents
-                addItems(recents, false)
+                recentEntriesByPath = result.entriesByPath
+                filesIgnoringSearch = result.items
+                addItems(result.items, false)
 
                 if (context != null && currentViewType != context!!.config.getFolderViewType("")) {
                     setupLayoutManager()
@@ -78,8 +90,8 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
         storedItems = recents
         val existingAdapter = binding.recentsList.adapter as? ItemsAdapter
         if (existingAdapter == null || forceRefresh) {
-            ItemsAdapter(activity as SimpleActivity, storedItems, this, binding.recentsList, isPickMultipleIntent, binding.recentsSwipeRefresh, false) {
-                clickedPath((it as FileDirItem).path)
+            ItemsAdapter(activity as SimpleActivity, storedItems, this, binding.recentsList, isPickMultipleIntent, binding.recentsSwipeRefresh, false, false) {
+                handleRecentClick((it as FileDirItem).path)
             }.apply {
                 setupZoomListener(zoomListener)
                 binding.recentsList.adapter = this
@@ -157,24 +169,81 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
         }
     }
 
-    private fun getRecents(callback: (recents: ArrayList<ListItem>) -> Unit) {
+    private fun handleRecentClick(path: String) {
+        val context = context ?: return
+        val entry = recentEntriesByPath[path]
+        if (entry == null) {
+            clickedPath(path)
+            return
+        }
+
+        val remoteOriginPath = entry.remoteOriginPath()
+        if (remoteOriginPath == null) {
+            clickedPath(path)
+            return
+        }
+
+        binding.recentsSwipeRefresh.isRefreshing = true
+        ensureBackgroundThread {
+            val result = sessionFileCoordinator.materializeVirtualFile(context.applicationContext, remoteOriginPath)
+            activity?.runOnUiThread {
+                binding.recentsSwipeRefresh.isRefreshing = false
+                if (!result.success) {
+                    activity?.toast(result.messageCn)
+                    return@runOnUiThread
+                }
+
+                val localPath = result.localPath
+                val displayName = entry.displayName.ifBlank { remoteOriginPath.getFilenameFromPath() }
+                val extension = displayName.substringAfterLast('.', "").lowercase().ifBlank { null }
+                val originDisplayPath = entry.originDisplayPath
+                    ?.takeIf { it.isNotBlank() }
+                    ?: sessionFileCoordinator.getDisplayPath(context, remoteOriginPath)
+                clickedPath(
+                    localPath,
+                    FileOpenRequest(
+                        path = localPath,
+                        displayName = displayName,
+                        readOnly = false,
+                        extension = extension,
+                        mimeType = localPath.getMimeType(),
+                        originType = entry.originType,
+                        originPath = remoteOriginPath,
+                        originDisplayPath = originDisplayPath
+                    )
+                )
+            }
+        }
+    }
+
+    private fun getRecents(callback: (result: RecentListResult) -> Unit) {
         val context = context ?: return
         val listItems = arrayListOf<ListItem>()
+        val recentEntries = LinkedHashMap<String, RecentFileEntry>()
 
         try {
+            val isTermuxScoped = fileManagerEnvironment.isTermuxScopedFileManager()
             RecentFileHistory.getRecentFiles(context, RECENTS_LIMIT).forEach { entry ->
-                val path = entry.path
-                val file = File(path)
-                if (!file.exists() || !file.isFile) {
-                    RecentFileHistory.removePath(context, path)
+                val listPath = entry.listPath()
+                if (!TermuxPathScope.isVisibleInFileManager(context, listPath, isTermuxScoped)) {
                     return@forEach
                 }
 
-                if (wantedMimeTypes.any { isProperMimeType(it, path, false) }) {
-                    val name = entry.displayName.ifBlank { path.getFilenameFromPath() }
-                    val size = file.length()
+                val isRemote = entry.remoteOriginPath() != null
+                val file = File(entry.path)
+                if (!isRemote) {
+                    if (!file.exists() || !file.isFile) {
+                        RecentFileHistory.removePath(context, entry.path)
+                        return@forEach
+                    }
+                }
+
+                if (wantedMimeTypes.any { isProperMimeType(it, listPath, false) }) {
+                    val name = entry.displayName.ifBlank { listPath.getFilenameFromPath() }
+                    val size = if (file.exists() && file.isFile) file.length() else 0L
                     val modified = entry.openedAtMs
-                    listItems.add(ListItem(path, name, false, 0, size, modified, false, false))
+                    listItems.add(ListItem(listPath, name, false, 0, size, modified, false, false))
+                    recentEntries[listPath] = entry
                 }
             }
         } catch (e: Exception) {
@@ -182,8 +251,17 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
         }
 
         activity?.runOnUiThread {
-            callback(listItems)
+            callback(RecentListResult(listItems, recentEntries))
         }
+    }
+
+    private fun RecentFileEntry.remoteOriginPath(): String? {
+        val normalizedOriginPath = originPath?.trim().takeUnless { it.isNullOrEmpty() } ?: return null
+        return if (originType == FileOpenRequest.ORIGIN_SFTP_VIRTUAL) normalizedOriginPath else null
+    }
+
+    private fun RecentFileEntry.listPath(): String {
+        return remoteOriginPath() ?: path
     }
 
     private fun getRecyclerAdapter() = binding.recentsList.adapter as? ItemsAdapter
@@ -195,20 +273,20 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
     private fun increaseColumnCount() {
         if (currentViewType == VIEW_TYPE_GRID) {
             context!!.config.fileColumnCnt += 1
-            (activity as? FileManagerHost)?.updateFragmentColumnCounts()
+            fileManagerControllerCommands.updateFragmentColumnCounts()
         }
     }
 
     private fun reduceColumnCount() {
         if (currentViewType == VIEW_TYPE_GRID) {
             context!!.config.fileColumnCnt -= 1
-            (activity as? FileManagerHost)?.updateFragmentColumnCounts()
+            fileManagerControllerCommands.updateFragmentColumnCounts()
         }
     }
 
     override fun columnCountChanged() {
         (binding.recentsList.layoutManager as MyGridLayoutManager).spanCount = context!!.config.fileColumnCnt
-        (activity as? FileManagerHost)?.refreshMenuItems()
+        fileManagerControllerCommands.refreshMenuItems()
         getRecyclerAdapter()?.apply {
             notifyItemRangeChanged(0, listItems.size)
         }
@@ -223,7 +301,7 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
     }
 
     override fun selectedPaths(paths: ArrayList<String>) {
-        (activity as? FileManagerHost)?.pickedPaths(paths)
+        fileManagerResultHandler.pickedPaths(paths)
     }
 
     override fun deleteFiles(files: ArrayList<FileDirItem>) {

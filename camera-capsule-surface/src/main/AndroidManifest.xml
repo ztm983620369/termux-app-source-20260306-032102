@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <uses-sdk tools:overrideLibrary="rikka.shizuku.api" />
+
+    <application>
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${TERMUX_PACKAGE_NAME}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <activity
+            android:name=".CameraCapsuleSurfaceCommandActivity"
+            android:enabled="true"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:finishOnTaskLaunch="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="com.termux.cameracapsulesurface.action.PUBLISH" />
+                <action android:name="com.termux.cameracapsulesurface.action.CANCEL" />
+                <action android:name="com.termux.cameracapsulesurface.action.CLEAR_ALL" />
+                <action android:name="com.termux.cameracapsulesurface.action.RESTORE" />
+                <action android:name="com.termux.cameracapsulesurface.action.OPEN_OVERLAY_SETTINGS" />
+                <action android:name="com.termux.cameracapsulesurface.action.SHOW_DEMO" />
+                <action android:name="com.termux.cameracapsulesurface.action.REQUEST_SHIZUKU_PERMISSION" />
+                <action android:name="com.termux.cameracapsulesurface.action.RESTORE_STATUS_BAR" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".CameraCapsuleSurfacePermissionActivity"
+            android:enabled="true"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:finishOnTaskLaunch="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="com.termux.cameracapsulesurface.action.REQUEST_SHIZUKU_PERMISSION" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".CameraCapsuleSurfaceReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.termux.cameracapsulesurface.action.PUBLISH" />
+                <action android:name="com.termux.cameracapsulesurface.action.CANCEL" />
+                <action android:name="com.termux.cameracapsulesurface.action.CLEAR_ALL" />
+                <action android:name="com.termux.cameracapsulesurface.action.RESTORE" />
+                <action android:name="com.termux.cameracapsulesurface.action.OPEN_OVERLAY_SETTINGS" />
+                <action android:name="com.termux.cameracapsulesurface.action.SHOW_DEMO" />
+                <action android:name="com.termux.cameracapsulesurface.action.REQUEST_SHIZUKU_PERMISSION" />
+                <action android:name="com.termux.cameracapsulesurface.action.RESTORE_STATUS_BAR" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".CameraCapsuleSurfaceBootReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".CameraCapsuleSurfaceService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="camera_capsule_overlay_surface" />
+        </service>
+    </application>
+
+</manifest>
