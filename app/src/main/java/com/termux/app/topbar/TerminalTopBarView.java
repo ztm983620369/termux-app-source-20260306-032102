@@ -1,4 +1,4 @@
-package com.termux.terminaltabs;
+package com.termux.app.topbar;
 
 import android.content.Context;
 import android.graphics.Color;
@@ -21,52 +21,43 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.core.graphics.ColorUtils;
 
+import com.termux.R;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 
-public class TerminalTabsBar extends LinearLayout {
+public class TerminalTopBarView extends LinearLayout {
 
     public interface OnTabSelectedListener {
-        void onTabSelected(int index, @NonNull Tab tab);
+        void onTabSelected(int index, @NonNull Item item);
     }
 
     public interface OnTabLongPressListener {
-        void onTabLongPress(int index, @NonNull Tab tab);
+        void onTabLongPress(int index, @NonNull Item item);
     }
 
     public interface OnAddLongPressListener {
         void onAddLongPress();
     }
 
-    public enum StatusTone {
-        NEUTRAL,
-        ACTIVE,
-        REMOTE,
-        PERSISTENT,
-        BUSY,
-        SUCCESS,
-        ERROR
+    public interface OnTabCloseListener {
+        void onTabClose(int index);
     }
 
-    public static final class Tab {
-        @NonNull
-        public final String key;
-        @NonNull
-        public final String title;
+    public static final class Item {
+        @NonNull public final String key;
+        @NonNull public final String title;
         public final boolean selected;
         public final boolean locked;
         public final boolean closable;
-        @NonNull
-        public final StatusTone tone;
-        @Nullable
-        public final String badgeText;
-        @Nullable
-        public final String contentDescription;
+        @NonNull public final TerminalTopBarStateMachine.Tone tone;
+        @Nullable public final String badgeText;
+        @Nullable public final String contentDescription;
 
-        public Tab(@NonNull String key, @NonNull String title, boolean selected, boolean locked,
-                   boolean closable, @NonNull StatusTone tone,
-                   @Nullable String badgeText, @Nullable String contentDescription) {
+        public Item(@NonNull String key, @NonNull String title, boolean selected, boolean locked,
+                    boolean closable, @NonNull TerminalTopBarStateMachine.Tone tone,
+                    @Nullable String badgeText, @Nullable String contentDescription) {
             this.key = key;
             this.title = title;
             this.selected = selected;
@@ -82,31 +73,28 @@ public class TerminalTabsBar extends LinearLayout {
     private LinearLayout mTabsContainer;
     private TextView mAddButton;
 
-    @Nullable
-    private OnTabSelectedListener mOnTabSelectedListener;
-    @Nullable
-    private OnTabLongPressListener mOnTabLongPressListener;
-    @Nullable
-    private Runnable mOnAddClickListener;
-    @Nullable
-    private OnAddLongPressListener mOnAddLongPressListener;
+    @Nullable private OnTabSelectedListener mOnTabSelectedListener;
+    @Nullable private OnTabLongPressListener mOnTabLongPressListener;
+    @Nullable private Runnable mOnAddClickListener;
+    @Nullable private OnAddLongPressListener mOnAddLongPressListener;
+    @Nullable private OnTabCloseListener mOnTabCloseListener;
 
-    private final List<Tab> mTabs = new ArrayList<>();
+    private final List<Item> mItems = new ArrayList<>();
     private int mLastSelectedIndex = -1;
     private int mTabMoveThresholdPx;
     private int mLongPressTimeoutMs;
 
-    public TerminalTabsBar(Context context) {
+    public TerminalTopBarView(Context context) {
         super(context);
         init(context);
     }
 
-    public TerminalTabsBar(Context context, @Nullable AttributeSet attrs) {
+    public TerminalTopBarView(Context context, @Nullable AttributeSet attrs) {
         super(context, attrs);
         init(context);
     }
 
-    public TerminalTabsBar(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
+    public TerminalTopBarView(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
         super(context, attrs, defStyleAttr);
         init(context);
     }
@@ -114,13 +102,12 @@ public class TerminalTabsBar extends LinearLayout {
     private void init(Context context) {
         setOrientation(HORIZONTAL);
         setBackgroundColor(0xFF121212);
-        LayoutInflater.from(context).inflate(R.layout.view_terminal_tabs_bar, this, true);
-        mScrollView = findViewById(R.id.terminal_tabs_scroll);
-        mTabsContainer = findViewById(R.id.terminal_tabs_container);
+        LayoutInflater.from(context).inflate(R.layout.view_terminal_top_bar, this, true);
+        mScrollView = findViewById(R.id.terminal_top_bar_scroll);
+        mTabsContainer = findViewById(R.id.terminal_top_bar_container);
         ViewConfiguration viewConfiguration = ViewConfiguration.get(context);
         mTabMoveThresholdPx = viewConfiguration.getScaledTouchSlop();
         mLongPressTimeoutMs = ViewConfiguration.getLongPressTimeout();
-        // Add button is now dynamically added to the container
     }
 
     public void setOnTabSelectedListener(@Nullable OnTabSelectedListener listener) {
@@ -139,27 +126,21 @@ public class TerminalTabsBar extends LinearLayout {
         mOnAddLongPressListener = listener;
     }
 
-    public void setTabs(@NonNull List<Tab> tabs) {
-        mTabs.clear();
-        mTabs.addAll(tabs);
-        updateTabsIncremental();
-    }
-
-    public interface OnTabCloseListener {
-        void onTabClose(int index);
-    }
-
-    private OnTabCloseListener mOnTabCloseListener;
-
     public void setOnTabCloseListener(@Nullable OnTabCloseListener listener) {
         mOnTabCloseListener = listener;
     }
 
-    private void updateTabsIncremental() {
+    public void setItems(@NonNull List<Item> items) {
+        mItems.clear();
+        mItems.addAll(items);
+        updateItems();
+    }
+
+    private void updateItems() {
         ensureAddButton();
 
         int selectedIndex = -1;
-        int targetTabCount = mTabs.size();
+        int targetCount = mItems.size();
         LinkedHashMap<String, TabViewHolder> holdersByKey = new LinkedHashMap<>();
         ArrayList<TabViewHolder> recycledHolders = new ArrayList<>();
 
@@ -177,13 +158,12 @@ public class TerminalTabsBar extends LinearLayout {
             }
         }
 
-        ArrayList<View> orderedTabViews = new ArrayList<>(targetTabCount);
+        ArrayList<View> orderedViews = new ArrayList<>(targetCount);
+        for (int i = 0; i < targetCount; i++) {
+            Item item = mItems.get(i);
+            if (item.selected) selectedIndex = i;
 
-        for (int i = 0; i < targetTabCount; i++) {
-            Tab tab = mTabs.get(i);
-            if (tab.selected) selectedIndex = i;
-
-            TabViewHolder holder = TextUtils.isEmpty(tab.key) ? null : holdersByKey.remove(tab.key);
+            TabViewHolder holder = TextUtils.isEmpty(item.key) ? null : holdersByKey.remove(item.key);
             if (holder == null && !recycledHolders.isEmpty()) {
                 holder = recycledHolders.remove(recycledHolders.size() - 1);
             }
@@ -191,12 +171,12 @@ public class TerminalTabsBar extends LinearLayout {
                 holder = createTabViewHolder();
             }
 
-            bindTabView(holder, tab, i);
-            orderedTabViews.add(holder.root);
+            bindTabView(holder, item, i);
+            orderedViews.add(holder.root);
         }
 
         mTabsContainer.removeAllViews();
-        for (View tabView : orderedTabViews) {
+        for (View tabView : orderedViews) {
             mTabsContainer.addView(tabView, createTabLayoutParams());
         }
         mTabsContainer.addView(mAddButton, createAddButtonLayoutParams());
@@ -216,18 +196,18 @@ public class TerminalTabsBar extends LinearLayout {
         return (TabViewHolder) tag;
     }
 
-    private void bindTabView(@NonNull TabViewHolder holder, @NonNull Tab tab, int index) {
+    private void bindTabView(@NonNull TabViewHolder holder, @NonNull Item item, int index) {
         holder.index = index;
-        holder.key = tab.key;
-        holder.titleView.setText(tab.title);
-        holder.root.setBackground(createTabBackground(tab.selected, tab.tone));
-        holder.root.setAlpha(tab.selected ? 1.0f : 0.88f);
-        holder.root.setContentDescription(TextUtils.isEmpty(tab.contentDescription) ? tab.title : tab.contentDescription);
-        holder.titleView.setTextColor(tab.selected ? Color.WHITE : 0xFFE6E6E6);
-        holder.statusDot.setBackground(createStatusDotBackground(tab.tone));
-        bindBadgeView(holder.badgeView, tab);
-        holder.closeBtn.setVisibility(tab.closable ? View.VISIBLE : View.GONE);
-        holder.closeBtn.setTextColor(tab.selected ? 0xFFF2F2F2 : 0xFFBDBDBD);
+        holder.key = item.key;
+        holder.titleView.setText(item.title);
+        holder.root.setBackground(createTabBackground(item.selected, item.tone));
+        holder.root.setAlpha(item.selected ? 1.0f : 0.88f);
+        holder.root.setContentDescription(TextUtils.isEmpty(item.contentDescription) ? item.title : item.contentDescription);
+        holder.titleView.setTextColor(item.selected ? Color.WHITE : 0xFFE6E6E6);
+        holder.statusDot.setBackground(createStatusDotBackground(item.tone));
+        bindBadgeView(holder.badgeView, item);
+        holder.closeBtn.setVisibility(item.closable ? View.VISIBLE : View.GONE);
+        holder.closeBtn.setTextColor(item.selected ? 0xFFF2F2F2 : 0xFFBDBDBD);
     }
 
     @NonNull
@@ -272,7 +252,8 @@ public class TerminalTabsBar extends LinearLayout {
         closeBtn.setPadding(dp(4), 0, dp(8), 0);
         closeBtn.setClickable(true);
         closeBtn.setFocusable(true);
-        tabLayout.addView(closeBtn, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT));
+        tabLayout.addView(closeBtn, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT));
 
         TabViewHolder holder = new TabViewHolder(tabLayout, statusDot, titleView, badgeView, closeBtn);
         tabLayout.setTag(holder);
@@ -300,11 +281,11 @@ public class TerminalTabsBar extends LinearLayout {
                 if (v.getParent() != null) v.getParent().requestDisallowInterceptTouchEvent(false);
                 v.removeCallbacks(holder.longPressRunnable);
                 if (action == MotionEvent.ACTION_UP) {
-                    TerminalTabTouchStateMachine.ReleaseAction releaseAction = holder.touchStateMachine.onUp();
-                    if (releaseAction == TerminalTabTouchStateMachine.ReleaseAction.CONSUME) {
+                    TerminalTopBarTouchStateMachine.ReleaseAction releaseAction = holder.touchStateMachine.onUp();
+                    if (releaseAction == TerminalTopBarTouchStateMachine.ReleaseAction.CONSUME) {
                         return true;
                     }
-                    if (releaseAction == TerminalTabTouchStateMachine.ReleaseAction.CLICK) {
+                    if (releaseAction == TerminalTopBarTouchStateMachine.ReleaseAction.CLICK) {
                         v.performClick();
                     }
                 } else {
@@ -317,8 +298,8 @@ public class TerminalTabsBar extends LinearLayout {
 
         tabLayout.setOnClickListener(v -> {
             if (mOnTabSelectedListener != null &&
-                holder.index >= 0 && holder.index < mTabs.size()) {
-                mOnTabSelectedListener.onTabSelected(holder.index, mTabs.get(holder.index));
+                holder.index >= 0 && holder.index < mItems.size()) {
+                mOnTabSelectedListener.onTabSelected(holder.index, mItems.get(holder.index));
             }
         });
 
@@ -332,7 +313,7 @@ public class TerminalTabsBar extends LinearLayout {
         mAddButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         mAddButton.setGravity(Gravity.CENTER);
         mAddButton.setTextColor(Color.WHITE);
-        mAddButton.setBackground(createTabBackground(false, StatusTone.NEUTRAL));
+        mAddButton.setBackground(createTabBackground(false, TerminalTopBarStateMachine.Tone.NEUTRAL));
         mAddButton.setMinimumWidth(dp(48));
         mAddButton.setOnClickListener(v -> {
             if (mOnAddClickListener != null) mOnAddClickListener.run();
@@ -354,68 +335,38 @@ public class TerminalTabsBar extends LinearLayout {
 
     @NonNull
     private LinearLayout.LayoutParams createAddButtonLayoutParams() {
-        LinearLayout.LayoutParams lpAdd = new LinearLayout.LayoutParams(0, dp(30));
-        lpAdd.weight = 1f;
-        lpAdd.setMargins(dp(1), dp(2), dp(1), dp(2));
-        return lpAdd;
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(30));
+        lp.weight = 1f;
+        lp.setMargins(dp(1), dp(2), dp(1), dp(2));
+        return lp;
     }
 
-    private final class TabViewHolder {
-        @NonNull final LinearLayout root;
-        @NonNull final View statusDot;
-        @NonNull final TextView titleView;
-        @NonNull final TextView badgeView;
-        @NonNull final TextView closeBtn;
-        int index = -1;
-        @Nullable String key;
-        @NonNull final TerminalTabTouchStateMachine touchStateMachine;
-        @NonNull final Runnable longPressRunnable;
-
-        TabViewHolder(@NonNull LinearLayout root, @NonNull View statusDot, @NonNull TextView titleView,
-                      @NonNull TextView badgeView, @NonNull TextView closeBtn) {
-            this.root = root;
-            this.statusDot = statusDot;
-            this.titleView = titleView;
-            this.badgeView = badgeView;
-            this.closeBtn = closeBtn;
-            this.touchStateMachine = new TerminalTabTouchStateMachine(mTabMoveThresholdPx);
-            this.longPressRunnable = () -> {
-                if (!touchStateMachine.onLongPressTimeout()) return;
-                root.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-                if (mOnTabLongPressListener != null && index >= 0 && index < mTabs.size()) {
-                    mOnTabLongPressListener.onTabLongPress(index, mTabs.get(index));
-                }
-            };
-        }
-    }
-
-    private void bindBadgeView(@NonNull TextView badgeView, @NonNull Tab tab) {
-        if (TextUtils.isEmpty(tab.badgeText)) {
+    private void bindBadgeView(@NonNull TextView badgeView, @NonNull Item item) {
+        if (TextUtils.isEmpty(item.badgeText)) {
             badgeView.setVisibility(View.GONE);
             badgeView.setText(null);
             badgeView.setBackground(null);
             return;
         }
 
-        int toneColor = getToneColor(tab.tone);
+        int toneColor = getToneColor(item.tone);
         badgeView.setVisibility(View.VISIBLE);
-        badgeView.setText(tab.badgeText);
+        badgeView.setText(item.badgeText);
         badgeView.setTextColor(toneColor);
-        badgeView.setBackground(createBadgeBackground(toneColor, tab.selected));
+        badgeView.setBackground(createBadgeBackground(toneColor, item.selected));
     }
 
-    private GradientDrawable createTabBackground(boolean selected, @NonNull StatusTone tone) {
+    private GradientDrawable createTabBackground(boolean selected, @NonNull TerminalTopBarStateMachine.Tone tone) {
         GradientDrawable drawable = new GradientDrawable();
         drawable.setShape(GradientDrawable.RECTANGLE);
         float radius = dp(4);
         drawable.setCornerRadii(new float[]{radius, radius, radius, radius, radius, radius, radius, radius});
-
         drawable.setColor(getToneFillColor(tone, selected));
         drawable.setStroke(dp(1), getToneStrokeColor(tone, selected));
         return drawable;
     }
 
-    private GradientDrawable createStatusDotBackground(@NonNull StatusTone tone) {
+    private GradientDrawable createStatusDotBackground(@NonNull TerminalTopBarStateMachine.Tone tone) {
         GradientDrawable drawable = new GradientDrawable();
         drawable.setShape(GradientDrawable.OVAL);
         drawable.setColor(getToneColor(tone));
@@ -431,7 +382,7 @@ public class TerminalTabsBar extends LinearLayout {
         return drawable;
     }
 
-    private int getToneFillColor(@NonNull StatusTone tone, boolean selected) {
+    private int getToneFillColor(@NonNull TerminalTopBarStateMachine.Tone tone, boolean selected) {
         switch (tone) {
             case ACTIVE:
                 return selected ? 0xFF353535 : 0xFF242424;
@@ -451,12 +402,12 @@ public class TerminalTabsBar extends LinearLayout {
         }
     }
 
-    private int getToneStrokeColor(@NonNull StatusTone tone, boolean selected) {
+    private int getToneStrokeColor(@NonNull TerminalTopBarStateMachine.Tone tone, boolean selected) {
         int toneColor = getToneColor(tone);
         return ColorUtils.setAlphaComponent(toneColor, selected ? 255 : 204);
     }
 
-    private int getToneColor(@NonNull StatusTone tone) {
+    private int getToneColor(@NonNull TerminalTopBarStateMachine.Tone tone) {
         switch (tone) {
             case ACTIVE:
                 return 0xFFBDBDBD;
@@ -485,5 +436,34 @@ public class TerminalTabsBar extends LinearLayout {
 
     private int dp(int value) {
         return Math.round(getResources().getDisplayMetrics().density * value);
+    }
+
+    private final class TabViewHolder {
+        @NonNull final LinearLayout root;
+        @NonNull final View statusDot;
+        @NonNull final TextView titleView;
+        @NonNull final TextView badgeView;
+        @NonNull final TextView closeBtn;
+        int index = -1;
+        @Nullable String key;
+        @NonNull final TerminalTopBarTouchStateMachine touchStateMachine;
+        @NonNull final Runnable longPressRunnable;
+
+        TabViewHolder(@NonNull LinearLayout root, @NonNull View statusDot, @NonNull TextView titleView,
+                      @NonNull TextView badgeView, @NonNull TextView closeBtn) {
+            this.root = root;
+            this.statusDot = statusDot;
+            this.titleView = titleView;
+            this.badgeView = badgeView;
+            this.closeBtn = closeBtn;
+            this.touchStateMachine = new TerminalTopBarTouchStateMachine(mTabMoveThresholdPx);
+            this.longPressRunnable = () -> {
+                if (!touchStateMachine.onLongPressTimeout()) return;
+                root.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                if (mOnTabLongPressListener != null && index >= 0 && index < mItems.size()) {
+                    mOnTabLongPressListener.onTabLongPress(index, mItems.get(index));
+                }
+            };
+        }
     }
 }

@@ -11,6 +11,7 @@ import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
@@ -39,14 +40,14 @@ import android.widget.RelativeLayout;
 import com.termux.BuildConfig;
 import com.termux.R;
 import com.termux.app.api.file.FileReceiverActivity;
+import com.termux.app.topbar.TerminalTopBarController;
+import com.termux.app.topbar.TerminalTopBarView;
 import com.termux.app.terminal.TermuxActivityRootView;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
+import com.termux.app.terminal.TermuxTerminalSessionSurfaceBridge;
+import com.termux.app.terminal.TermuxTerminalTopBarBridge;
 import com.termux.app.terminal.io.TermuxTerminalExtraKeys;
 import com.google.android.material.bottomnavigation.BottomNavigationView;
-import com.termux.sessionsync.SessionEntry;
-import com.termux.sessionsync.SessionRegistry;
-import com.termux.sessionsync.SessionSnapshot;
-import com.termux.sessionsync.SessionTransport;
 import com.termux.shared.activities.ReportActivity;
 import com.termux.shared.activity.ActivityUtils;
 import com.termux.shared.activity.media.AppCompatActivityUtils;
@@ -60,7 +61,6 @@ import com.termux.app.activities.SettingsActivity;
 import com.termux.shared.termux.crash.TermuxCrashUtils;
 import com.termux.shared.termux.settings.preferences.TermuxAppSharedPreferences;
 import com.termux.app.terminal.TermuxSessionsListViewController;
-import com.termux.app.terminal.io.TerminalToolbarViewPager;
 import com.termux.app.terminal.TermuxTerminalViewClient;
 import com.termux.shared.termux.extrakeys.ExtraKeysView;
 import com.termux.shared.termux.interact.TextInputDialogUtils;
@@ -75,11 +75,10 @@ import com.termux.shared.view.ViewUtils;
 import com.termux.shared.termux.shell.command.runner.terminal.TermuxSession;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TextStyle;
-import com.termux.terminaltabs.TerminalTabsBar;
-import com.termux.terminalsessioncore.TerminalSessionTabStateMachine;
 import com.termux.terminal.TerminalSessionClient;
 import com.termux.view.TerminalView;
 import com.termux.view.TerminalViewClient;
+import com.termux.terminalsessionsurface.TerminalSessionSurfaceView;
 import com.termux.bridge.FileOpenBridge;
 import com.termux.bridge.FileOpenListener;
 import com.termux.bridge.FileEditorContract;
@@ -114,8 +113,6 @@ import androidx.viewpager.widget.ViewPager;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.Set;
 
 /**
  * A terminal emulator activity.
@@ -140,6 +137,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
      * The {@link TerminalView} shown in  {@link TermuxActivity} that displays the terminal.
      */
     TerminalView mTerminalView;
+
+    @Nullable
+    private TerminalView mContextMenuTerminalView;
 
     /**
      *  The {@link TerminalViewClient} interface implementation to allow for communication between
@@ -259,7 +259,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private int mBottomNavPrimaryTab = TAB_TERMINAL;
     private int mNonTerminalWindowBackgroundColor = 0xFFFFFFFF;
     private View mTerminalContainer;
-    private TerminalTabsBar mTerminalTabsBar;
+    private TerminalSessionSurfaceView mTerminalSessionSurfaceView;
+    private TerminalTopBarView mTerminalTopBarView;
+    private TerminalTopBarController mTerminalTopBarController;
+    private TermuxTerminalSessionSurfaceBridge mTermuxTerminalSessionSurfaceBridge;
+    private TermuxTerminalTopBarBridge mTermuxTerminalTopBarBridge;
+    private boolean mSurfaceSelectionDispatchInProgress = false;
+    private boolean mTerminalSessionSurfaceHasSnapshot = false;
     private boolean mBottomNavFixedOnImeEnabled = true;
     private boolean mSessionListUiUpdateScheduled = false;
     private int mSessionUiBatchDepth = 0;
@@ -270,7 +276,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mTermuxSessionListViewController != null) {
             mTermuxSessionListViewController.notifyDataSetChanged();
         }
-        updateTerminalTabsBar();
+        refreshTerminalSessionSurface();
+        refreshTerminalTopBar();
     };
 
     private static final String ARG_FILE_MANAGER_STATE = "file_manager_state";
@@ -373,7 +380,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         registerUiReceiver();
         registerUiRequestFileObserver();
 
-        registerForContextMenu(mTerminalView);
+        updateTerminalContextMenuRegistration(mTerminalView);
 
         FileReceiverActivity.updateFileReceiverActivityComponentsState(this);
 
@@ -465,7 +472,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mSuppressTerminalContextMenuUntilUptimeMs = SystemClock.uptimeMillis() + 2000;
             getWindow().getDecorView().post(() -> mSuppressTerminalContextMenuOnce = false);
 
-            EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+            EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
 
             closeContextMenu();
@@ -475,13 +482,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 closeOptionsMenu();
             });
         } else if (mBottomNavTab == TAB_FILES) {
-            EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+            EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
             if (mTerminalView != null) mTerminalView.clearFocus();
             if (mTermuxTerminalViewClient != null) mTermuxTerminalViewClient.cancelPendingShowSoftKeyboard();
             KeyboardUtils.hideSoftKeyboard(this, getWindow().getDecorView());
         } else if (mBottomNavTab == TAB_EDITOR) {
-            EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+            EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
             if (mTerminalView != null) mTerminalView.clearFocus();
             if (mTermuxTerminalViewClient != null) mTermuxTerminalViewClient.cancelPendingShowSoftKeyboard();
@@ -942,7 +949,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
 
         if (tab == TAB_FILES) {
-            EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+            EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
             if (mTerminalView != null) mTerminalView.clearFocus();
 
@@ -956,7 +963,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
 
         if (tab == TAB_EDITOR) {
-            EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+            EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
             if (mTerminalView != null) mTerminalView.clearFocus();
             if (mTermuxTerminalViewClient != null) mTermuxTerminalViewClient.cancelPendingShowSoftKeyboard();
@@ -981,7 +988,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             pauseEditor();
             if (tab == TAB_TERMINAL && mTerminalView != null && mTermuxTerminalViewClient != null) {
                 mTermuxTerminalViewClient.requestTerminalViewFocus(false);
-                updateTerminalTabsBar();
+                refreshTerminalTopBar();
             }
         }
 
@@ -1475,63 +1482,155 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         mTermuxTerminalViewClient = new TermuxTerminalViewClient(this, mTermuxTerminalSessionActivityClient);
 
         // Set termux terminal view
-        mTerminalView = findViewById(R.id.terminal_view);
         mTerminalContainer = findViewById(R.id.terminal_container);
-        mTerminalTabsBar = findViewById(R.id.terminal_tabs_bar);
-        if (mTerminalTabsBar != null) {
-            mTerminalTabsBar.setOnAddClickListener(() -> {
-                if (mTermuxTerminalSessionActivityClient != null) {
-                    mTermuxTerminalSessionActivityClient.addNewLocalSession(null);
-                    updateTerminalTabsBar();
+        mTerminalSessionSurfaceView = findViewById(R.id.terminal_session_surface);
+        mTerminalTopBarView = findViewById(R.id.terminal_top_bar);
+        if (mTerminalSessionSurfaceView != null) {
+            mTermuxTerminalSessionSurfaceBridge = new TermuxTerminalSessionSurfaceBridge(
+                new TermuxTerminalSessionSurfaceBridge.Host() {
+                    @Nullable
+                    @Override
+                    public TermuxService getTermuxService() {
+                        return TermuxActivity.this.getTermuxService();
+                    }
+
+                    @Nullable
+                    @Override
+                    public TerminalSession getCurrentSession() {
+                        return TermuxActivity.this.getCurrentSession();
+                    }
+                }
+            );
+            mTerminalSessionSurfaceView.setTerminalViewClient(mTermuxTerminalViewClient);
+            mTerminalSessionSurfaceView.setCallbacks(new TerminalSessionSurfaceView.Callbacks() {
+                @Override
+                public void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser) {
+                    if (session == null || mTermuxTerminalSessionActivityClient == null) return;
+
+                    mSurfaceSelectionDispatchInProgress = true;
+                    try {
+                        mTermuxTerminalSessionActivityClient.setCurrentSession(session);
+                    } finally {
+                        mSurfaceSelectionDispatchInProgress = false;
+                    }
+                    refreshTerminalTopBar();
+                }
+
+                @Override
+                public void onActiveTerminalViewChanged(@NonNull TerminalView terminalView,
+                                                        @Nullable TerminalSession session) {
+                    mTerminalView = terminalView;
+                    updateTerminalContextMenuRegistration(terminalView);
+                }
+
+                @Override
+                public void onExtraKeysViewCreated(@NonNull ExtraKeysView extraKeysView) {
+                    mExtraKeysView = extraKeysView;
                 }
             });
-            mTerminalTabsBar.setOnAddLongPressListener(() -> {
-                if (mTermuxTerminalSessionActivityClient != null) {
-                    mTermuxTerminalSessionActivityClient.showPlusLongPressPanel();
-                }
-            });
-            mTerminalTabsBar.setOnTabSelectedListener((index, tab) -> {
-                if (mTermuxTerminalSessionActivityClient != null) {
-                    mTermuxTerminalSessionActivityClient.switchToSession(index);
-                    updateTerminalTabsBar();
-                }
-            });
-            mTerminalTabsBar.setOnTabCloseListener(index -> {
-                TermuxService service = getTermuxService();
-                if (mTermuxTerminalSessionActivityClient == null || service == null) return;
-
-                TermuxSession termuxSession = service.getTermuxSession(index);
-                if (termuxSession == null) return;
-
-                TerminalSession terminalSession = termuxSession.getTerminalSession();
-                if (terminalSession == null) return;
-
-                int sessionsSize = service.getTermuxSessionsSize();
-                boolean isClosingCurrent = terminalSession == getCurrentSession();
-
-                if (sessionsSize > 1 && isClosingCurrent) {
-                    int newIndex = index == 0 ? 1 : index - 1;
-                    mTermuxTerminalSessionActivityClient.switchToSession(newIndex);
-                    updateTerminalTabsBar();
-                }
-
-                if (terminalSession.isRunning()) {
-                    termuxSession.killIfExecuting(TermuxActivity.this, true);
-                } else {
-                    service.removeTermuxSession(terminalSession);
-                }
-
-                if (sessionsSize <= 1) {
-                    finishActivityIfNotFinishing();
-                }
-            });
-            mTerminalTabsBar.setOnTabLongPressListener((index, tab) -> {
-                if (mTermuxTerminalSessionActivityClient != null) {
-                    mTermuxTerminalSessionActivityClient.onTerminalTabLongPress(index);
-                }
-            });
+            mTerminalView = mTerminalSessionSurfaceView.getCurrentTerminalView();
+            updateTerminalContextMenuRegistration(mTerminalView);
         }
-        mTerminalView.setTerminalViewClient(mTermuxTerminalViewClient);
+        if (mTerminalTopBarView != null) {
+            mTermuxTerminalTopBarBridge = new TermuxTerminalTopBarBridge(
+                new TermuxTerminalTopBarBridge.Host() {
+                    @NonNull
+                    @Override
+                    public Context getContext() {
+                        return TermuxActivity.this;
+                    }
+
+                    @Nullable
+                    @Override
+                    public TermuxService getTermuxService() {
+                        return TermuxActivity.this.getTermuxService();
+                    }
+
+                    @Nullable
+                    @Override
+                    public TermuxTerminalSessionActivityClient getSessionClient() {
+                        return mTermuxTerminalSessionActivityClient;
+                    }
+
+                    @Nullable
+                    @Override
+                    public TerminalSession getCurrentSession() {
+                        return TermuxActivity.this.getCurrentSession();
+                    }
+                }
+            );
+            mTerminalTopBarController = new TerminalTopBarController(
+                mTerminalTopBarView,
+                new TerminalTopBarController.Callbacks() {
+                    @Override
+                    public void onAddSession() {
+                        if (mTermuxTerminalSessionActivityClient != null) {
+                            mTermuxTerminalSessionActivityClient.addNewLocalSession(null);
+                            refreshTerminalTopBar();
+                        }
+                    }
+
+                    @Override
+                    public void onAddLongPress() {
+                        if (mTermuxTerminalSessionActivityClient != null) {
+                            mTermuxTerminalSessionActivityClient.showPlusLongPressPanel();
+                        }
+                    }
+
+                    @Override
+                    public void onSelectSession(int index) {
+                        if (mTerminalSessionSurfaceView != null) {
+                            mTerminalSessionSurfaceView.setCurrentSessionPage(index, true);
+                        } else if (mTermuxTerminalSessionActivityClient != null) {
+                            mTermuxTerminalSessionActivityClient.switchToSession(index);
+                            refreshTerminalTopBar();
+                        }
+                    }
+
+                    @Override
+                    public void onCloseSession(int index) {
+                        TermuxService service = getTermuxService();
+                        if (mTermuxTerminalSessionActivityClient == null || service == null) return;
+
+                        TermuxSession termuxSession = service.getTermuxSession(index);
+                        if (termuxSession == null) return;
+
+                        TerminalSession terminalSession = termuxSession.getTerminalSession();
+                        if (terminalSession == null) return;
+
+                        int sessionsSize = service.getTermuxSessionsSize();
+                        boolean isClosingCurrent = terminalSession == getCurrentSession();
+
+                        if (sessionsSize > 1 && isClosingCurrent) {
+                            int newIndex = index == 0 ? 1 : index - 1;
+                            if (mTerminalSessionSurfaceView != null) {
+                                mTerminalSessionSurfaceView.setCurrentSessionPage(newIndex, true);
+                            } else {
+                                mTermuxTerminalSessionActivityClient.switchToSession(newIndex);
+                            }
+                            refreshTerminalTopBar();
+                        }
+
+                        if (terminalSession.isRunning()) {
+                            termuxSession.killIfExecuting(TermuxActivity.this, true);
+                        } else {
+                            service.removeTermuxSession(terminalSession);
+                        }
+
+                        if (sessionsSize <= 1) {
+                            finishActivityIfNotFinishing();
+                        }
+                    }
+
+                    @Override
+                    public void onLongPressSession(int index) {
+                        if (mTermuxTerminalSessionActivityClient != null) {
+                            mTermuxTerminalSessionActivityClient.onTerminalTabLongPress(index);
+                        }
+                    }
+                }
+            );
+        }
 
         if (mTermuxTerminalViewClient != null)
             mTermuxTerminalViewClient.onCreate();
@@ -1540,183 +1639,85 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mTermuxTerminalSessionActivityClient.onCreate();
     }
 
-    private void updateTerminalTabsBar() {
-        if (mTerminalTabsBar == null) return;
+    private void refreshTerminalTopBar() {
+        if (mTerminalTopBarController == null || mTermuxTerminalTopBarBridge == null) return;
+        TermuxTerminalTopBarBridge.Snapshot snapshot = mTermuxTerminalTopBarBridge.capture();
+        mTerminalTopBarController.render(snapshot.models);
+        mTermuxTerminalTopBarBridge.publish(snapshot);
+    }
+
+    private void refreshTerminalSessionSurface() {
+        if (mTerminalSessionSurfaceView == null || mTermuxTerminalSessionSurfaceBridge == null) return;
+        TermuxTerminalSessionSurfaceBridge.Snapshot snapshot = mTermuxTerminalSessionSurfaceBridge.capture();
+        mTerminalSessionSurfaceHasSnapshot = !snapshot.items.isEmpty();
+        mTerminalSessionSurfaceView.submitSessions(snapshot.items, snapshot.selectedIndex, false);
+    }
+
+    public void applyTerminalSessionSurfaceSettings() {
+        if (mTerminalSessionSurfaceView != null && mPreferences != null) {
+            mTerminalSessionSurfaceView.setTerminalTextSize(mPreferences.getFontSize());
+            mTerminalSessionSurfaceView.setTerminalKeepScreenOn(mPreferences.shouldKeepScreenOn());
+        } else if (mTerminalView != null && mPreferences != null) {
+            mTerminalView.setTextSize(mPreferences.getFontSize());
+            mTerminalView.setKeepScreenOn(mPreferences.shouldKeepScreenOn());
+        }
+    }
+
+    public void applyTerminalSessionSurfaceTypeface(@NonNull Typeface typeface) {
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.setTerminalTypeface(typeface);
+        } else if (mTerminalView != null) {
+            mTerminalView.setTypeface(typeface);
+        }
+    }
+
+    public void onTerminalSessionTextChanged(@NonNull TerminalSession session) {
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.refreshSession(session);
+        }
+    }
+
+    public void onTerminalSessionColorsChanged(@NonNull TerminalSession session) {
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.invalidateSession(session);
+        }
+    }
+
+    public void onTerminalSessionSelectionCommitted(@Nullable TerminalSession session) {
+        if (session == null || mSurfaceSelectionDispatchInProgress) return;
+        refreshTerminalSessionSurface();
+        refreshTerminalTopBar();
+    }
+
+    public boolean requestTerminalSessionSurfaceSelection(@Nullable TerminalSession session, boolean animate) {
+        if (session == null || mSurfaceSelectionDispatchInProgress ||
+            mTerminalSessionSurfaceView == null) {
+            return false;
+        }
+
+        if (!mTerminalSessionSurfaceHasSnapshot) {
+            refreshTerminalSessionSurface();
+        }
+        if (!mTerminalSessionSurfaceHasSnapshot) return false;
+
         TermuxService service = getTermuxService();
-        if (service == null) return;
+        if (service == null) return false;
 
-        int size = service.getTermuxSessionsSize();
-        ArrayList<TerminalTabsBar.Tab> tabs = new ArrayList<>(size);
-        ArrayList<SessionEntry> syncEntries = new ArrayList<>(size);
-        long nowMs = System.currentTimeMillis();
-        TerminalSession current = getCurrentSession();
-        Set<String> pinnedSessionHandles = mTermuxTerminalSessionActivityClient == null
-            ? Collections.emptySet()
-            : mTermuxTerminalSessionActivityClient.getPinnedSessionHandleSnapshot();
-        for (int i = 0; i < size; i++) {
-            TermuxSession termuxSession = service.getTermuxSession(i);
-            if (termuxSession == null) continue;
-            TerminalSession session = termuxSession.getTerminalSession();
-            if (session == null) continue;
+        int index = service.getIndexOfSession(session);
+        if (index < 0) return false;
 
-            boolean selected = session == current;
-            boolean locked = !TextUtils.isEmpty(session.mHandle) &&
-                pinnedSessionHandles.contains(session.mHandle);
-            String pinnedDisplayName = locked && mTermuxTerminalSessionActivityClient != null
-                ? mTermuxTerminalSessionActivityClient.getPinnedDisplayNameForSession(session)
-                : null;
+        TerminalSession currentSurfaceSession = mTerminalSessionSurfaceView.getCurrentSession();
+        if (currentSurfaceSession == session) return false;
 
-            String sshCommand = mTermuxTerminalSessionActivityClient == null
-                ? null
-                : mTermuxTerminalSessionActivityClient.getSshBootstrapCommandForSession(session);
-            SessionTransport transport = SessionTransport.LOCAL;
-            String tmuxSession = null;
-            if (!TextUtils.isEmpty(sshCommand)) {
-                if (locked) {
-                    transport = SessionTransport.SSH_PERSIST;
-                    tmuxSession = mTermuxTerminalSessionActivityClient.getPinnedTmuxSessionForSession(session);
-                } else {
-                    transport = SessionTransport.SSH;
-                }
-            }
-
-            TerminalSessionTabStateMachine.RuntimeState runtimeState =
-                mTermuxTerminalSessionActivityClient == null
-                    ? TerminalSessionTabStateMachine.RuntimeState.IDLE
-                    : mTermuxTerminalSessionActivityClient.getRuntimeStateForSession(
-                        session, tmuxSession, pinnedDisplayName, !TextUtils.isEmpty(sshCommand), selected);
-
-            int exitStatus = session.isRunning() ? 0 : session.getExitStatus();
-            TerminalSessionTabStateMachine.Snapshot tabSnapshot = TerminalSessionTabStateMachine.resolve(
-                new TerminalSessionTabStateMachine.Input(
-                    selected,
-                    locked,
-                    session.isRunning(),
-                    exitStatus,
-                    pinnedDisplayName,
-                    session.mSessionName,
-                    session.getTitle(),
-                    toTerminalTabTransport(transport),
-                    runtimeState
-                )
-            );
-
-            String title = tabSnapshot.title;
-            tabs.add(new TerminalTabsBar.Tab(
-                session.mHandle,
-                title,
-                tabSnapshot.selected,
-                tabSnapshot.locked,
-                tabSnapshot.closable,
-                toTerminalTabTone(tabSnapshot.accentTone),
-                getTerminalTabBadgeText(tabSnapshot.badgeKind),
-                buildTerminalTabContentDescription(tabSnapshot)
-            ));
-
-            String sessionId = TextUtils.isEmpty(session.mHandle) ? "session-" + i : session.mHandle;
-            syncEntries.add(new SessionEntry.Builder(sessionId, title)
-                .setTransport(transport)
-                .setTerminalHandle(session.mHandle)
-                .setSshCommand(sshCommand)
-                .setTmuxSession(tmuxSession)
-                .setActive(selected)
-                .setRunning(session.isRunning())
-                .setUpdatedAtMs(nowMs)
-                .build());
-        }
-        mTerminalTabsBar.setTabs(tabs);
-
-        String activeSessionId = null;
-        if (current != null && !TextUtils.isEmpty(current.mHandle)) {
-            activeSessionId = current.mHandle;
-        } else {
-            for (SessionEntry entry : syncEntries) {
-                if (entry.active) {
-                    activeSessionId = entry.id;
-                    break;
-                }
-            }
-        }
-        SessionRegistry.getInstance().publish(this,
-            new SessionSnapshot(syncEntries, activeSessionId, nowMs));
-    }
-
-    @NonNull
-    private TerminalSessionTabStateMachine.TransportKind toTerminalTabTransport(@NonNull SessionTransport transport) {
-        switch (transport) {
-            case SSH:
-                return TerminalSessionTabStateMachine.TransportKind.SSH;
-            case SSH_PERSIST:
-                return TerminalSessionTabStateMachine.TransportKind.SSH_PERSIST;
-            case LOCAL:
-            default:
-                return TerminalSessionTabStateMachine.TransportKind.LOCAL;
-        }
-    }
-
-    @NonNull
-    private TerminalTabsBar.StatusTone toTerminalTabTone(@NonNull TerminalSessionTabStateMachine.AccentTone accentTone) {
-        switch (accentTone) {
-            case ACTIVE:
-                return TerminalTabsBar.StatusTone.ACTIVE;
-            case REMOTE:
-                return TerminalTabsBar.StatusTone.REMOTE;
-            case PERSISTENT:
-                return TerminalTabsBar.StatusTone.PERSISTENT;
-            case BUSY:
-                return TerminalTabsBar.StatusTone.BUSY;
-            case SUCCESS:
-                return TerminalTabsBar.StatusTone.SUCCESS;
-            case ERROR:
-                return TerminalTabsBar.StatusTone.ERROR;
-            case NEUTRAL:
-            default:
-                return TerminalTabsBar.StatusTone.NEUTRAL;
-        }
-    }
-
-    @Nullable
-    private String getTerminalTabBadgeText(@NonNull TerminalSessionTabStateMachine.BadgeKind badgeKind) {
-        switch (badgeKind) {
-            case SSH:
-                return "SSH";
-            case PIN:
-                return "PIN";
-            case BUSY:
-                return "SYNC";
-            case RETRY:
-                return "RETRY";
-            case DONE:
-                return "DONE";
-            case ERROR:
-                return "ERR";
-            case NONE:
-            default:
-                return null;
-        }
-    }
-
-    @NonNull
-    private String buildTerminalTabContentDescription(@NonNull TerminalSessionTabStateMachine.Snapshot tabSnapshot) {
-        StringBuilder sb = new StringBuilder(tabSnapshot.title);
-        String badge = getTerminalTabBadgeText(tabSnapshot.badgeKind);
-        if (!TextUtils.isEmpty(badge)) {
-            sb.append(" ").append(badge);
-        }
-        if (tabSnapshot.selected) {
-            sb.append(" current");
-        }
-        if (tabSnapshot.locked) {
-            sb.append(" locked");
-        }
-        return sb.toString();
+        mTerminalSessionSurfaceView.setCurrentSessionPage(index, animate);
+        return true;
     }
 
     private void scheduleCoalescedSessionListUiUpdate() {
         Runnable schedule = () -> {
             if (mSessionListUiUpdateScheduled) return;
             mSessionListUiUpdateScheduled = true;
-            View anchor = mTerminalTabsBar;
+            View anchor = mTerminalTopBarView;
             if (anchor == null && getWindow() != null) {
                 anchor = getWindow().getDecorView();
             }
@@ -1738,8 +1739,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         mSessionListUiUpdateScheduled = false;
         mSessionUiBatchDepth = 0;
         mSessionUiUpdatePendingInBatch = false;
-        if (mTerminalTabsBar != null) {
-            mTerminalTabsBar.removeCallbacks(mCoalescedSessionListUiUpdate);
+        if (mTerminalTopBarView != null) {
+            mTerminalTopBarView.removeCallbacks(mCoalescedSessionListUiUpdate);
         }
         if (getWindow() != null && getWindow().getDecorView() != null) {
             getWindow().getDecorView().removeCallbacks(mCoalescedSessionListUiUpdate);
@@ -1771,53 +1772,63 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
 
     private void setTerminalToolbarView(Bundle savedInstanceState) {
-        mTermuxTerminalExtraKeys = new TermuxTerminalExtraKeys(this, mTerminalView,
+        mTermuxTerminalExtraKeys = new TermuxTerminalExtraKeys(this,
+            getTerminalView() == null ? new TerminalView(this, null) : getTerminalView(),
             mTermuxTerminalViewClient, mTermuxTerminalSessionActivityClient);
 
         final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
-        if (mPreferences.shouldShowTerminalToolbar()) terminalToolbarViewPager.setVisibility(View.VISIBLE);
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalToolbarDefaultHeight = mTerminalSessionSurfaceView.getToolbarDefaultHeightPx();
+        } else if (terminalToolbarViewPager != null) {
+            ViewGroup.LayoutParams layoutParams = terminalToolbarViewPager.getLayoutParams();
+            mTerminalToolbarDefaultHeight = layoutParams.height;
+        }
 
-        ViewGroup.LayoutParams layoutParams = terminalToolbarViewPager.getLayoutParams();
-        mTerminalToolbarDefaultHeight = layoutParams.height;
-
-        setTerminalToolbarHeight();
-
-        String savedTextInput = null;
-        if (savedInstanceState != null)
-            savedTextInput = savedInstanceState.getString(ARG_TERMINAL_TOOLBAR_TEXT_INPUT);
-
-        terminalToolbarViewPager.setAdapter(new TerminalToolbarViewPager.PageAdapter(this, savedTextInput));
-        terminalToolbarViewPager.addOnPageChangeListener(new TerminalToolbarViewPager.OnPageChangeListener(this, terminalToolbarViewPager));
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.setToolbarMetrics(
+                mTerminalToolbarDefaultHeight,
+                mProperties.getTerminalToolbarHeightScaleFactor()
+            );
+            mTerminalSessionSurfaceView.setToolbarTextInputEnabled(false);
+            mTerminalSessionSurfaceView.setToolbarButtonTextAllCaps(
+                mProperties.shouldExtraKeysTextBeAllCaps());
+            mTerminalSessionSurfaceView.setToolbarExtraKeys(
+                mTermuxTerminalExtraKeys.getExtraKeysInfo(),
+                mTermuxTerminalExtraKeys
+            );
+            mTerminalSessionSurfaceView.setToolbarVisible(
+                mPreferences != null && mPreferences.shouldShowTerminalToolbar());
+        }
     }
 
     private void setTerminalToolbarHeight() {
-        final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
-        if (terminalToolbarViewPager == null) return;
-
-        ViewGroup.LayoutParams layoutParams = terminalToolbarViewPager.getLayoutParams();
-        layoutParams.height = Math.round(mTerminalToolbarDefaultHeight *
-            (mTermuxTerminalExtraKeys.getExtraKeysInfo() == null ? 0 : mTermuxTerminalExtraKeys.getExtraKeysInfo().getMatrix().length) *
-            mProperties.getTerminalToolbarHeightScaleFactor());
-        terminalToolbarViewPager.setLayoutParams(layoutParams);
+        if (mTerminalSessionSurfaceView != null && mTermuxTerminalExtraKeys != null) {
+            mTerminalSessionSurfaceView.setToolbarMetrics(
+                mTerminalToolbarDefaultHeight,
+                mProperties.getTerminalToolbarHeightScaleFactor()
+            );
+            mTerminalSessionSurfaceView.setToolbarExtraKeys(
+                mTermuxTerminalExtraKeys.getExtraKeysInfo(),
+                mTermuxTerminalExtraKeys
+            );
+        }
     }
 
     public void toggleTerminalToolbar() {
-        final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
-        if (terminalToolbarViewPager == null) return;
-
         final boolean showNow = mPreferences.toogleShowTerminalToolbar();
         Logger.showToast(this, (showNow ? getString(R.string.msg_enabling_terminal_toolbar) : getString(R.string.msg_disabling_terminal_toolbar)), true);
-        terminalToolbarViewPager.setVisibility(showNow ? View.VISIBLE : View.GONE);
-        if (showNow && isTerminalToolbarTextInputViewSelected()) {
-            // Focus the text input view if just revealed.
-            findViewById(R.id.terminal_toolbar_text_input).requestFocus();
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.setToolbarVisible(showNow);
+        }
+        if (showNow && isTerminalToolbarTextInputViewSelected() && mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.focusToolbarTextInput();
         }
     }
 
     private void saveTerminalToolbarTextInput(Bundle savedInstanceState) {
         if (savedInstanceState == null) return;
 
-        final EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+        final EditText textInputView = findViewById(R.id.terminal_surface_text_input);
         if (textInputView != null) {
             String textInput = textInputView.getText().toString();
             if (!textInput.isEmpty()) savedInstanceState.putString(ARG_TERMINAL_TOOLBAR_TEXT_INPUT, textInput);
@@ -2140,6 +2151,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     public ExtraKeysView getExtraKeysView() {
+        if (mExtraKeysView == null && mTerminalSessionSurfaceView != null) {
+            mExtraKeysView = mTerminalSessionSurfaceView.getExtraKeysView();
+        }
         return mExtraKeysView;
     }
 
@@ -2157,7 +2171,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
 
     public ViewPager getTerminalToolbarViewPager() {
-        return (ViewPager) findViewById(R.id.terminal_toolbar_view_pager);
+        return mTerminalSessionSurfaceView == null ? null : mTerminalSessionSurfaceView.getToolbarPager();
     }
 
     public float getTerminalToolbarDefaultHeight() {
@@ -2165,11 +2179,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     public boolean isTerminalViewSelected() {
-        return getTerminalToolbarViewPager().getCurrentItem() == 0;
+        return mTerminalSessionSurfaceView == null || mTerminalSessionSurfaceView.isTerminalToolbarPrimaryPageSelected();
     }
 
     public boolean isTerminalToolbarTextInputViewSelected() {
-        return getTerminalToolbarViewPager().getCurrentItem() == 1;
+        return mTerminalSessionSurfaceView != null && mTerminalSessionSurfaceView.isTerminalToolbarTextInputPageSelected();
     }
 
 
@@ -2208,7 +2222,26 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         return mTermuxService;
     }
 
+    private void updateTerminalContextMenuRegistration(@Nullable TerminalView terminalView) {
+        if (mContextMenuTerminalView == terminalView) return;
+
+        if (mContextMenuTerminalView != null) {
+            unregisterForContextMenu(mContextMenuTerminalView);
+        }
+
+        mContextMenuTerminalView = terminalView;
+        if (terminalView != null) {
+            registerForContextMenu(terminalView);
+        }
+    }
+
     public TerminalView getTerminalView() {
+        if (mTerminalSessionSurfaceView != null) {
+            TerminalView activeTerminalView = mTerminalSessionSurfaceView.getCurrentTerminalView();
+            if (activeTerminalView != null) {
+                mTerminalView = activeTerminalView;
+            }
+        }
         return mTerminalView;
     }
 
@@ -2222,10 +2255,15 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     @Nullable
     public TerminalSession getCurrentSession() {
-        if (mTerminalView != null)
-            return mTerminalView.getCurrentSession();
-        else
-            return null;
+        if (mTerminalView != null) {
+            TerminalSession currentSession = mTerminalView.getCurrentSession();
+            if (currentSession != null) return currentSession;
+        }
+        if (mTerminalSessionSurfaceView != null) {
+            TerminalSession currentSession = mTerminalSessionSurfaceView.getCurrentSession();
+            if (currentSession != null) return currentSession;
+        }
+        return null;
     }
 
     public TermuxAppSharedPreferences getPreferences() {
@@ -2300,7 +2338,14 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mProperties != null) {
             reloadProperties();
 
-            if (mExtraKeysView != null) {
+            if (mTerminalSessionSurfaceView != null && mTermuxTerminalExtraKeys != null) {
+                mTerminalSessionSurfaceView.setToolbarButtonTextAllCaps(
+                    mProperties.shouldExtraKeysTextBeAllCaps());
+                mTerminalSessionSurfaceView.setToolbarExtraKeys(
+                    mTermuxTerminalExtraKeys.getExtraKeysInfo(),
+                    mTermuxTerminalExtraKeys
+                );
+            } else if (mExtraKeysView != null && mTermuxTerminalExtraKeys != null) {
                 mExtraKeysView.setButtonTextAllCaps(mProperties.shouldExtraKeysTextBeAllCaps());
                 mExtraKeysView.reload(mTermuxTerminalExtraKeys.getExtraKeysInfo(), mTerminalToolbarDefaultHeight);
             }

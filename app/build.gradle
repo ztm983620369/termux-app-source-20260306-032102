@@ -53,11 +53,14 @@ android {
         implementation project(":terminal-view")
         implementation project(":termux-shared")
         implementation project(":terminal-tabs")
+        implementation project(":terminal-session-surface")
         implementation project(":terminal-session-core")
         implementation project(":terminal-session-runtime")
         implementation project(":system-status-surface")
         implementation project(":ui-shell")
-        implementation project(":sora-demo")
+        implementation(project(":sora-demo")) {
+            exclude group: "com.squareup.leakcanary"
+        }
         implementation project(":session-sync-core")
         implementation project(":file-bridge")
         implementation project(":file-manager")

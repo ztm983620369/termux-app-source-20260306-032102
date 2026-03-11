@@ -261,7 +261,7 @@ public final class SshTmuxRuntimeEngine {
                 requestedDisplayName, fallbackDisplayName, sshCommand, anchorSession.mHandle);
         String tmuxSession = snapshot.remoteSessionName;
         String displayName = snapshot.displayName;
-        RuntimeOperation operation = startOperation(anchorSession.mHandle);
+        RuntimeOperation operation = startOperation(null);
         transition(operation, SshTmuxRuntimeStateMachine.Phase.CREATING_REMOTE, tmuxSession, displayName, 0, null);
         runBackgroundTask("tmux-create-session", operation, () -> {
             ShellCommandResult createResult = shellExecutor.execute(
@@ -341,7 +341,7 @@ public final class SshTmuxRuntimeEngine {
                                                @Nullable String displayName,
                                                @NonNull OperationCallback callback) {
         connectToPersistentTmuxSession(
-            startOperation(anchorSession == null ? null : anchorSession.mHandle),
+            startOperation(null),
             anchorSession, sshCommand, tmuxSession, displayName, callback);
     }
 

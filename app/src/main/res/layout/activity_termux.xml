@@ -26,7 +26,7 @@
             android:id="@+id/drawer_layout"
             android:layout_width="match_parent"
             android:layout_alignParentTop="true"
-            android:layout_above="@+id/terminal_toolbar_view_pager"
+            android:layout_above="@+id/bottom_navigation"
             android:layout_height="match_parent">
 
             <FrameLayout
@@ -40,21 +40,16 @@
                     android:layout_height="match_parent"
                     android:orientation="vertical">
 
-                    <com.termux.terminaltabs.TerminalTabsBar
-                        android:id="@+id/terminal_tabs_bar"
+                    <com.termux.app.topbar.TerminalTopBarView
+                        android:id="@+id/terminal_top_bar"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content" />
 
-                    <com.termux.view.TerminalView
-                        android:id="@+id/terminal_view"
+                    <com.termux.terminalsessionsurface.TerminalSessionSurfaceView
+                        android:id="@+id/terminal_session_surface"
                         android:layout_width="match_parent"
                         android:layout_height="0dp"
-                        android:layout_weight="1"
-                        android:defaultFocusHighlightEnabled="false"
-                        android:focusableInTouchMode="true"
-                        android:scrollbarThumbVertical="@drawable/terminal_scroll_shape"
-                        android:scrollbars="vertical"
-                        tools:ignore="UnusedAttribute" />
+                        android:layout_weight="1" />
 
                 </LinearLayout>
 
@@ -132,15 +127,6 @@
             </LinearLayout>
 
         </androidx.drawerlayout.widget.DrawerLayout>
-
-        <androidx.viewpager.widget.ViewPager
-            android:id="@+id/terminal_toolbar_view_pager"
-            android:visibility="gone"
-            android:layout_width="match_parent"
-            android:layout_height="37.5dp"
-            android:background="@color/black"
-            android:layout_above="@+id/bottom_navigation"
-            android:layout_alignParentBottom="false" />
 
         <com.google.android.material.bottomnavigation.BottomNavigationView
             android:id="@+id/bottom_navigation"

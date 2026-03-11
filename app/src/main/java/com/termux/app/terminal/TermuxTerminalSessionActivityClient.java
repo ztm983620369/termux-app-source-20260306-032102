@@ -28,6 +28,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.termux.R;
+import com.termux.app.topbar.TerminalTopBarRuntimeState;
 import com.termux.shared.interact.ShareUtils;
 import com.termux.shared.shell.command.ExecutionCommand;
 import com.termux.shared.shell.command.runner.app.AppShell;
@@ -46,12 +47,12 @@ import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
 import com.termux.terminal.TextStyle;
 import com.termux.terminalsessioncore.SshTmuxSessionStateMachine;
-import com.termux.terminalsessioncore.TerminalSessionTabStateMachine;
 import com.termux.terminalsessionruntime.RemoteTmuxListResult;
 import com.termux.terminalsessionruntime.SshTmuxOperationResult;
 import com.termux.terminalsessionruntime.SshTmuxRuntimeBridge;
 import com.termux.terminalsessionruntime.SshTmuxRuntimeEngine;
 import com.termux.terminalsessionruntime.SshTmuxRuntimeStateMachine;
+import com.termux.view.TerminalView;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -314,7 +315,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
         // The current terminal session may have changed while being away, force
         // a refresh of the displayed terminal.
-        mActivity.getTerminalView().onScreenUpdated();
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView != null) {
+            terminalView.onScreenUpdated();
+        }
     }
 
     /**
@@ -355,8 +359,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     @Override
     public void onTextChanged(@NonNull TerminalSession changedSession) {
         if (!mActivity.isVisible()) return;
-
-        if (mActivity.getCurrentSession() == changedSession) mActivity.getTerminalView().onScreenUpdated();
+        mActivity.onTerminalSessionTextChanged(changedSession);
     }
 
     @Override
@@ -433,8 +436,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (!mActivity.isVisible()) return;
 
         String text = ShareUtils.getTextStringFromClipboardIfSet(mActivity, true);
-        if (text != null)
-            mActivity.getTerminalView().mEmulator.paste(text);
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (text != null && terminalView != null && terminalView.mEmulator != null) {
+            terminalView.mEmulator.paste(text);
+        }
     }
 
     @Override
@@ -458,6 +463,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @Override
     public void onColorsChanged(@NonNull TerminalSession changedSession) {
+        mActivity.onTerminalSessionColorsChanged(changedSession);
         if (mActivity.getCurrentSession() == changedSession)
             updateBackgroundColor();
     }
@@ -472,7 +478,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
         // If cursor is to enabled now, then start cursor blinking if blinking is enabled
         // otherwise stop cursor blinking
-        mActivity.getTerminalView().setTerminalCursorBlinkerState(enabled, false);
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView != null) {
+            terminalView.setTerminalCursorBlinkerState(enabled, false);
+        }
     }
 
     @Override
@@ -492,7 +501,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     public void onResetTerminalSession() {
         // Ensure blinker starts again after reset if cursor blinking was disabled before reset like
         // with "tput civis" which would have called onTerminalCursorStateChange()
-        mActivity.getTerminalView().setTerminalCursorBlinkerState(true, true);
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView != null) {
+            terminalView.setTerminalCursorBlinkerState(true, true);
+        }
     }
 
 
@@ -533,8 +545,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     /** Try switching to session. */
     public void setCurrentSession(TerminalSession session) {
         if (session == null) return;
+        if (mActivity.requestTerminalSessionSurfaceSelection(session, true)) return;
 
-        if (mActivity.getTerminalView().attachSession(session)) {
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView != null && terminalView.attachSession(session)) {
             // notify about switched session if not already displaying the session
             notifyOfSessionChange();
         }
@@ -543,6 +557,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         // be stale, like current session not selected or scrolled to.
         checkAndScrollToSession(session);
         updateBackgroundColor();
+        mActivity.onTerminalSessionSelectionCommitted(session);
     }
 
     void notifyOfSessionChange() {
@@ -2241,29 +2256,25 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @NonNull
-    public TerminalSessionTabStateMachine.RuntimeState getRuntimeStateForSession(@Nullable TerminalSession session,
-                                                                                 @Nullable String pinnedTmuxSession,
-                                                                                 @Nullable String pinnedDisplayName,
-                                                                                 boolean hasRemoteTransport,
-                                                                                 boolean selected) {
+    public TerminalTopBarRuntimeState getTopBarRuntimeStateForSession(@Nullable TerminalSession session) {
         if (session == null || TextUtils.isEmpty(session.mHandle)) {
-            return TerminalSessionTabStateMachine.RuntimeState.IDLE;
+            return TerminalTopBarRuntimeState.IDLE;
         }
         SshTmuxRuntimeStateMachine.Snapshot snapshot;
         synchronized (mRuntimeStateLock) {
             snapshot = mRuntimeSnapshotBySessionHandle.get(session.mHandle);
         }
         if (snapshot == null) {
-            return TerminalSessionTabStateMachine.RuntimeState.IDLE;
+            return TerminalTopBarRuntimeState.IDLE;
         }
         if (snapshot.phase == SshTmuxRuntimeStateMachine.Phase.FAILED) {
-            return TerminalSessionTabStateMachine.RuntimeState.FAILED;
+            return TerminalTopBarRuntimeState.FAILED;
         }
         if (snapshot.phase == SshTmuxRuntimeStateMachine.Phase.RETRY_SCHEDULED) {
-            return TerminalSessionTabStateMachine.RuntimeState.RETRY_SCHEDULED;
+            return TerminalTopBarRuntimeState.RETRY_SCHEDULED;
         }
 
-        return TerminalSessionTabStateMachine.RuntimeState.BUSY;
+        return TerminalTopBarRuntimeState.BUSY;
     }
 
     private void trackRuntimeSnapshot(@NonNull SshTmuxRuntimeStateMachine.Snapshot snapshot) {
@@ -3715,7 +3726,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             updateBackgroundColor();
 
             final Typeface newTypeface = (fontFile.exists() && fontFile.length() > 0) ? Typeface.createFromFile(fontFile) : Typeface.MONOSPACE;
-            mActivity.getTerminalView().setTypeface(newTypeface);
+            mActivity.applyTerminalSessionSurfaceTypeface(newTypeface);
         } catch (Exception e) {
             Logger.logStackTraceWithMessage(LOG_TAG, "Error in checkForFontAndColors()", e);
         }

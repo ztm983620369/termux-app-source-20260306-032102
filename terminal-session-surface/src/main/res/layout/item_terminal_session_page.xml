@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    android:orientation="vertical">
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <com.termux.view.TerminalView
+            android:id="@+id/terminal_session_page_terminal_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:defaultFocusHighlightEnabled="false"
+            android:focusableInTouchMode="true"
+            android:scrollbars="vertical" />
+    </FrameLayout>
+
+    <com.termux.terminalsessionsurface.SessionSwipeFrameLayout
+        android:id="@+id/terminal_session_page_extra_keys_container"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <com.termux.shared.termux.extrakeys.ExtraKeysView
+            android:id="@+id/terminal_session_page_extra_keys"
+            style="?android:attr/buttonBarStyle"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_alignParentBottom="true"
+            android:orientation="horizontal" />
+
+    </com.termux.terminalsessionsurface.SessionSwipeFrameLayout>
+
+</LinearLayout>
