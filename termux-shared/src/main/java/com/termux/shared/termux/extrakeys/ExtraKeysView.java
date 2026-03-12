@@ -212,6 +212,12 @@ public final class ExtraKeysView extends GridLayout {
     public ExtraKeysView(Context context, AttributeSet attrs) {
         super(context, attrs);
 
+        setFocusable(false);
+        setFocusableInTouchMode(false);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            setTouchscreenBlocksFocus(true);
+        }
+
         setRepetitiveKeys(ExtraKeysConstants.PRIMARY_REPETITIVE_KEYS);
         setSpecialButtons(getDefaultSpecialButtons(this));
 
@@ -413,6 +419,8 @@ public final class ExtraKeysView extends GridLayout {
                 button.setTextColor(mButtonTextColor);
                 button.setAllCaps(mButtonTextAllCaps);
                 button.setPadding(0, 0, 0, 0);
+                button.setFocusable(false);
+                button.setFocusableInTouchMode(false);
 
                 button.setOnClickListener(view -> {
                     performExtraKeyButtonHapticFeedback(view, buttonInfo, button);

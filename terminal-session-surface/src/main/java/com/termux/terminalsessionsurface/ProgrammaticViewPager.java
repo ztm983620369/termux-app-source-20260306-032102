@@ -20,8 +20,16 @@ public class ProgrammaticViewPager extends ViewPager {
         @Nullable View getSwipeRegionView();
     }
 
+    public interface SwipeGestureListener {
+        void onSwipeTouchDownInRegion();
+        void onSwipeGestureCaptured();
+        void onSwipeGestureFinished();
+    }
+
     @Nullable private SwipeRegionProvider swipeRegionProvider;
+    @Nullable private SwipeGestureListener swipeGestureListener;
     private boolean gestureStartedInSwipeRegion;
+    private boolean gestureCapturedByPager;
 
     public ProgrammaticViewPager(@NonNull Context context) {
         super(context);
@@ -35,28 +43,38 @@ public class ProgrammaticViewPager extends ViewPager {
         swipeRegionProvider = provider;
     }
 
+    public void setSwipeGestureListener(@Nullable SwipeGestureListener listener) {
+        swipeGestureListener = listener;
+    }
+
     @Override
     public boolean onInterceptTouchEvent(MotionEvent ev) {
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                gestureCapturedByPager = false;
                 gestureStartedInSwipeRegion = isTouchInSwipeRegion(ev);
+                if (gestureStartedInSwipeRegion && swipeGestureListener != null) {
+                    swipeGestureListener.onSwipeTouchDownInRegion();
+                }
                 if (!gestureStartedInSwipeRegion) {
                     return false;
                 }
-                return super.onInterceptTouchEvent(ev);
+                return dispatchIntercept(ev);
             case MotionEvent.ACTION_MOVE:
                 if (!gestureStartedInSwipeRegion) {
                     return false;
                 }
-                return super.onInterceptTouchEvent(ev);
+                return dispatchIntercept(ev);
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
                 if (!gestureStartedInSwipeRegion) {
                     return false;
                 }
-                return super.onInterceptTouchEvent(ev);
+                boolean intercepted = dispatchIntercept(ev);
+                finishSwipeGesture();
+                return intercepted;
             default:
-                return gestureStartedInSwipeRegion && super.onInterceptTouchEvent(ev);
+                return gestureStartedInSwipeRegion && dispatchIntercept(ev);
         }
     }
 
@@ -68,15 +86,56 @@ public class ProgrammaticViewPager extends ViewPager {
 
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                gestureCapturedByPager = false;
                 gestureStartedInSwipeRegion = isTouchInSwipeRegion(ev);
-                return gestureStartedInSwipeRegion && super.onTouchEvent(ev);
+                if (gestureStartedInSwipeRegion && swipeGestureListener != null) {
+                    swipeGestureListener.onSwipeTouchDownInRegion();
+                }
+                if (!gestureStartedInSwipeRegion) return false;
+                boolean handledDown = super.onTouchEvent(ev);
+                if (handledDown) {
+                    captureSwipeGesture();
+                }
+                return handledDown;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
-                boolean handled = gestureStartedInSwipeRegion && super.onTouchEvent(ev);
-                gestureStartedInSwipeRegion = false;
-                return handled;
+                boolean handledUp = gestureStartedInSwipeRegion && super.onTouchEvent(ev);
+                finishSwipeGesture();
+                return handledUp;
             default:
-                return gestureStartedInSwipeRegion && super.onTouchEvent(ev);
+                if (!gestureStartedInSwipeRegion) return false;
+                boolean handledMove = super.onTouchEvent(ev);
+                if (handledMove) {
+                    captureSwipeGesture();
+                }
+                return handledMove;
+        }
+    }
+
+    private boolean dispatchIntercept(@NonNull MotionEvent event) {
+        boolean intercepted = super.onInterceptTouchEvent(event);
+        if (intercepted) {
+            captureSwipeGesture();
+        }
+        return intercepted;
+    }
+
+    private void captureSwipeGesture() {
+        if (gestureCapturedByPager) return;
+
+        gestureCapturedByPager = true;
+        if (swipeGestureListener != null) {
+            swipeGestureListener.onSwipeGestureCaptured();
+        }
+    }
+
+    private void finishSwipeGesture() {
+        boolean notifyFinished = gestureStartedInSwipeRegion || gestureCapturedByPager;
+        gestureStartedInSwipeRegion = false;
+        gestureCapturedByPager = false;
+
+        if (notifyFinished && swipeGestureListener != null) {
+            swipeGestureListener.onSwipeGestureFinished();
         }
     }
 

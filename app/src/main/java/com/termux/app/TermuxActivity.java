@@ -1504,6 +1504,27 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mTerminalSessionSurfaceView.setTerminalViewClient(mTermuxTerminalViewClient);
             mTerminalSessionSurfaceView.setCallbacks(new TerminalSessionSurfaceView.Callbacks() {
                 @Override
+                public void onSessionPageSwipeTouchDown() {
+                    if (mTermuxTerminalViewClient != null) {
+                        mTermuxTerminalViewClient.preparePreservingSoftKeyboardOnSessionSwitch();
+                    }
+                }
+
+                @Override
+                public void onSessionPageChangeStarted() {
+                    if (mTermuxTerminalViewClient != null) {
+                        mTermuxTerminalViewClient.beginPreservingSoftKeyboardOnSessionSwitch();
+                    }
+                }
+
+                @Override
+                public void onSessionPageChangeFinished() {
+                    if (mTermuxTerminalViewClient != null) {
+                        mTermuxTerminalViewClient.finishPreservingSoftKeyboardOnSessionSwitch();
+                    }
+                }
+
+                @Override
                 public void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser) {
                     if (session == null || mTermuxTerminalSessionActivityClient == null) return;
 
@@ -1520,6 +1541,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 public void onActiveTerminalViewChanged(@NonNull TerminalView terminalView,
                                                         @Nullable TerminalSession session) {
                     mTerminalView = terminalView;
+                    if (mTermuxTerminalViewClient != null) {
+                        mTermuxTerminalViewClient.bindTerminalViewKeyboardBehavior(terminalView);
+                    }
                     updateTerminalContextMenuRegistration(terminalView);
                 }
 

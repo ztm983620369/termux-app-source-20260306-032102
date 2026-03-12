@@ -64,9 +64,15 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     boolean mVirtualControlKeyDown, mVirtualFnKeyDown;
 
     private Runnable mShowSoftKeyboardRunnable;
+    private Runnable mReleasePreservedSoftKeyboardRunnable;
 
     private boolean mShowSoftKeyboardIgnoreOnce;
     private boolean mShowSoftKeyboardWithDelayOnce;
+    private boolean mPreserveSoftKeyboardOnSessionSwitch;
+    private boolean mPreservedSoftKeyboardVisibleOnSessionSwitch;
+    private boolean mPreparedSoftKeyboardStateForSessionSwitch;
+    private boolean mPreparedSoftKeyboardVisibleOnSessionSwitch;
+    private int mPreserveSoftKeyboardRequestCount;
 
     private boolean mTerminalCursorBlinkerStateAlreadySet;
 
@@ -132,6 +138,10 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     public void requestTerminalViewFocus(boolean allowShowSoftKeyboard) {
         final View terminalView = mActivity.getTerminalView();
         if (terminalView == null) return;
+
+        if (terminalView instanceof TerminalView) {
+            bindTerminalViewKeyboardBehavior((TerminalView) terminalView);
+        }
 
         // Only ignore the "show keyboard" side-effect if focus will actually change. Otherwise we may
         // accidentally suppress the next real focus change and require an extra tap.
@@ -611,6 +621,156 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         }
     }
 
+    public void bindTerminalViewKeyboardBehavior(TerminalView terminalView) {
+        if (terminalView == null) return;
+
+        terminalView.setOnFocusChangeListener((view, hasFocus) -> {
+            if (mPreserveSoftKeyboardOnSessionSwitch || mPreparedSoftKeyboardStateForSessionSwitch) {
+                Logger.logVerbose(LOG_TAG, "Preserving soft keyboard state during terminal switch");
+                return;
+            }
+
+            boolean textInputViewHasFocus = false;
+            final EditText textInputView = mActivity.findViewById(R.id.terminal_surface_text_input);
+            if (textInputView != null) textInputViewHasFocus = textInputView.hasFocus();
+
+            if (hasFocus || textInputViewHasFocus) {
+                if (mShowSoftKeyboardIgnoreOnce) {
+                    mShowSoftKeyboardIgnoreOnce = false;
+                    return;
+                }
+                Logger.logVerbose(LOG_TAG, "Showing soft keyboard on focus change");
+            } else {
+                Logger.logVerbose(LOG_TAG, "Hiding soft keyboard on focus change");
+            }
+
+            KeyboardUtils.setSoftKeyboardVisibility(getShowSoftKeyboardRunnable(), mActivity, terminalView,
+                hasFocus || textInputViewHasFocus);
+        });
+    }
+
+    public void preparePreservingSoftKeyboardOnSessionSwitch() {
+        snapshotSoftKeyboardStateForSessionSwitch();
+    }
+
+    public void cancelPreparedSoftKeyboardOnSessionSwitch() {
+        mPreparedSoftKeyboardStateForSessionSwitch = false;
+        if (mPreserveSoftKeyboardRequestCount == 0) {
+            View anchor = getSoftKeyboardPreservationAnchor();
+            if (anchor != null) {
+                anchor.removeCallbacks(getReleasePreservedSoftKeyboardRunnable());
+            }
+            mPreserveSoftKeyboardOnSessionSwitch = false;
+        }
+    }
+
+    public void beginPreservingSoftKeyboardOnSessionSwitch() {
+        View anchor = getSoftKeyboardPreservationAnchor();
+        if (anchor != null) {
+            anchor.removeCallbacks(getReleasePreservedSoftKeyboardRunnable());
+        }
+
+        if (mPreserveSoftKeyboardRequestCount == 0) {
+            if (!mPreparedSoftKeyboardStateForSessionSwitch) {
+                snapshotSoftKeyboardStateForSessionSwitch();
+            }
+            mPreservedSoftKeyboardVisibleOnSessionSwitch = mPreparedSoftKeyboardVisibleOnSessionSwitch;
+            mPreserveSoftKeyboardOnSessionSwitch = true;
+            cancelPendingShowSoftKeyboard();
+        }
+
+        mPreparedSoftKeyboardStateForSessionSwitch = false;
+        mPreserveSoftKeyboardRequestCount++;
+    }
+
+    public void endPreservingSoftKeyboardOnSessionSwitch() {
+        if (mPreserveSoftKeyboardRequestCount <= 0) {
+            cancelPreparedSoftKeyboardOnSessionSwitch();
+            return;
+        }
+
+        mPreserveSoftKeyboardRequestCount--;
+        if (mPreserveSoftKeyboardRequestCount > 0) return;
+
+        restorePreservedSoftKeyboardStateAfterSessionSwitch();
+
+        View anchor = getSoftKeyboardPreservationAnchor();
+        if (anchor != null) {
+            anchor.removeCallbacks(getReleasePreservedSoftKeyboardRunnable());
+            anchor.postDelayed(getReleasePreservedSoftKeyboardRunnable(), 200);
+        } else {
+            mPreserveSoftKeyboardOnSessionSwitch = false;
+        }
+    }
+
+    public void finishPreservingSoftKeyboardOnSessionSwitch() {
+        if (mPreserveSoftKeyboardRequestCount > 0) {
+            endPreservingSoftKeyboardOnSessionSwitch();
+        } else {
+            cancelPreparedSoftKeyboardOnSessionSwitch();
+        }
+    }
+
+    private void snapshotSoftKeyboardStateForSessionSwitch() {
+        mPreparedSoftKeyboardVisibleOnSessionSwitch =
+            !KeyboardUtils.areDisableSoftKeyboardFlagsSet(mActivity) &&
+                KeyboardUtils.isSoftKeyboardVisible(mActivity);
+        mPreparedSoftKeyboardStateForSessionSwitch = true;
+    }
+
+    private void restorePreservedSoftKeyboardStateAfterSessionSwitch() {
+        EditText textInputView = mActivity.findViewById(R.id.terminal_surface_text_input);
+        boolean textInputViewHasFocus = textInputView != null && textInputView.hasFocus();
+        TerminalView terminalView = mActivity.getTerminalView();
+
+        if (mPreservedSoftKeyboardVisibleOnSessionSwitch) {
+            if (textInputViewHasFocus && textInputView != null) {
+                KeyboardUtils.showSoftKeyboard(mActivity, textInputView);
+                textInputView.postDelayed(() -> KeyboardUtils.showSoftKeyboard(mActivity, textInputView), 150);
+            } else if (terminalView != null) {
+                bindTerminalViewKeyboardBehavior(terminalView);
+                terminalView.requestFocus();
+                KeyboardUtils.showSoftKeyboard(mActivity, terminalView);
+                terminalView.postDelayed(getShowSoftKeyboardRunnable(), 150);
+            }
+            return;
+        }
+
+        if (!textInputViewHasFocus && terminalView != null) {
+            bindTerminalViewKeyboardBehavior(terminalView);
+            terminalView.requestFocus();
+        }
+
+        View hideTarget = textInputViewHasFocus && textInputView != null ? textInputView : terminalView;
+        if (hideTarget == null) {
+            hideTarget = getSoftKeyboardPreservationAnchor();
+        }
+        if (hideTarget != null) {
+            KeyboardUtils.hideSoftKeyboard(mActivity, hideTarget);
+        }
+    }
+
+    private View getSoftKeyboardPreservationAnchor() {
+        View textInputView = mActivity.findViewById(R.id.terminal_surface_text_input);
+        if (textInputView != null) return textInputView;
+
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView != null) return terminalView;
+
+        return mActivity.getWindow() == null ? null : mActivity.getWindow().getDecorView();
+    }
+
+    private Runnable getReleasePreservedSoftKeyboardRunnable() {
+        if (mReleasePreservedSoftKeyboardRunnable == null) {
+            mReleasePreservedSoftKeyboardRunnable = () -> {
+                if (mPreserveSoftKeyboardRequestCount == 0) {
+                    mPreserveSoftKeyboardOnSessionSwitch = false;
+                }
+            };
+        }
+        return mReleasePreservedSoftKeyboardRunnable;
+    }
+
     public void setSoftKeyboardState(boolean isStartup, boolean isReloadTermuxProperties) {
         TerminalView terminalView = mActivity.getTerminalView();
         if (terminalView == null) return;
@@ -657,27 +817,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             }
         }
 
-        terminalView.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            @Override
-            public void onFocusChange(View view, boolean hasFocus) {
-                // Force show soft keyboard if TerminalView or toolbar text input view has
-                // focus and close it if they don't
-                boolean textInputViewHasFocus = false;
-                final EditText textInputView = mActivity.findViewById(R.id.terminal_surface_text_input);
-                if (textInputView != null) textInputViewHasFocus = textInputView.hasFocus();
-
-                if (hasFocus || textInputViewHasFocus) {
-                    if (mShowSoftKeyboardIgnoreOnce) {
-                        mShowSoftKeyboardIgnoreOnce = false; return;
-                    }
-                    Logger.logVerbose(LOG_TAG, "Showing soft keyboard on focus change");
-                } else {
-                    Logger.logVerbose(LOG_TAG, "Hiding soft keyboard on focus change");
-                }
-
-                KeyboardUtils.setSoftKeyboardVisibility(getShowSoftKeyboardRunnable(), mActivity, terminalView, hasFocus || textInputViewHasFocus);
-            }
-        });
+        bindTerminalViewKeyboardBehavior(terminalView);
 
         if (!isReloadTermuxProperties && !noShowKeyboard) {
             if (terminalView.getVisibility() == View.VISIBLE) {

@@ -30,6 +30,9 @@ import java.util.List;
 
 public class TerminalSessionSurfaceView extends LinearLayout {
     public interface Callbacks {
+        void onSessionPageSwipeTouchDown();
+        void onSessionPageChangeStarted();
+        void onSessionPageChangeFinished();
         void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser);
         void onActiveTerminalViewChanged(@NonNull TerminalView terminalView, @Nullable TerminalSession session);
         void onExtraKeysViewCreated(@NonNull ExtraKeysView extraKeysView);
@@ -65,6 +68,8 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     private int mToolbarComputedHeightPx;
     private int mSelectedSessionIndex;
     private final int mSessionPageGapPx;
+    private boolean mSessionPageSwipeTouchActive;
+    private boolean mSessionPageChangeInProgress;
 
     public TerminalSessionSurfaceView(Context context) {
         super(context);
@@ -96,9 +101,29 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         updateToolbarMetricsState();
 
         if (mSessionPager instanceof ProgrammaticViewPager) {
-            ((ProgrammaticViewPager) mSessionPager).setSwipeRegionProvider(() -> {
+            ProgrammaticViewPager programmaticViewPager = (ProgrammaticViewPager) mSessionPager;
+            programmaticViewPager.setSwipeRegionProvider(() -> {
                 PageHolder holder = sessionPagerAdapter.findHolder(mSessionPager.getCurrentItem());
                 return holder == null ? null : holder.extraKeysContainer;
+            });
+            programmaticViewPager.setSwipeGestureListener(new ProgrammaticViewPager.SwipeGestureListener() {
+                @Override
+                public void onSwipeTouchDownInRegion() {
+                    mSessionPageSwipeTouchActive = true;
+                    if (mCallbacks != null) {
+                        mCallbacks.onSessionPageSwipeTouchDown();
+                    }
+                }
+
+                @Override
+                public void onSwipeGestureCaptured() {
+                    notifySessionPageChangeStarted();
+                }
+
+                @Override
+                public void onSwipeGestureFinished() {
+                    finishSessionPageChangeIfIdle();
+                }
             });
         }
 
@@ -110,6 +135,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             @Override
             public void onPageScrollStateChanged(int state) {
                 if (state == ViewPager.SCROLL_STATE_DRAGGING) {
+                    notifySessionPageChangeStarted();
                     pagerStateMachine.onDragStarted();
                 } else if (state == ViewPager.SCROLL_STATE_SETTLING) {
                     pagerStateMachine.onSettlingStarted();
@@ -234,6 +260,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
 
         mSelectedSessionIndex = safeIndex;
         if (safeIndex != currentItem) {
+            notifySessionPageChangeStarted();
             mSuppressSessionPageCallback = true;
             mSessionPager.setCurrentItem(safeIndex, animate);
             mSuppressSessionPageCallback = false;
@@ -250,6 +277,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             dispatchActivePageChanged(safeIndex, false);
             return;
         }
+        notifySessionPageChangeStarted();
         mSuppressSessionPageCallback = true;
         mSessionPager.setCurrentItem(safeIndex, animate);
         mSuppressSessionPageCallback = false;
@@ -310,13 +338,49 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         if (editText != null) editText.requestFocus();
     }
 
+    private void notifySessionPageChangeStarted() {
+        if (mSessionPageChangeInProgress) return;
+
+        mSessionPageChangeInProgress = true;
+        if (mCallbacks != null) {
+            mCallbacks.onSessionPageChangeStarted();
+        }
+    }
+
+    private void finishSessionPageChangeIfIdle() {
+        if (mSessionPageChangeInProgress) {
+            if (pagerStateMachine.getState() != TerminalSessionSurfacePagerStateMachine.State.IDLE) {
+                return;
+            }
+            dispatchSessionPageChangeFinished();
+            return;
+        }
+
+        if (!mSessionPageSwipeTouchActive) return;
+
+        dispatchSessionPageChangeFinished();
+    }
+
+    private void dispatchSessionPageChangeFinished() {
+        if (!mSessionPageChangeInProgress && !mSessionPageSwipeTouchActive) return;
+
+        mSessionPageChangeInProgress = false;
+        mSessionPageSwipeTouchActive = false;
+        if (mCallbacks != null) {
+            mCallbacks.onSessionPageChangeFinished();
+        }
+    }
+
     private void dispatchActivePageChanged(int position, boolean fromUser) {
         PageHolder holder = sessionPagerAdapter.findHolder(position);
         if (holder == null && sessionPagerAdapter.getCount() > 0) {
             mSessionPager.post(() -> dispatchActivePageChanged(position, fromUser));
             return;
         }
-        if (holder == null) return;
+        if (holder == null) {
+            dispatchSessionPageChangeFinished();
+            return;
+        }
 
         if (mCallbacks != null) {
             mCallbacks.onActiveTerminalViewChanged(holder.terminalView, holder.session);
@@ -325,6 +389,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             mCallbacks.onSessionPageSelected(position, holder.session, fromUser);
         }
         dispatchCurrentExtraKeysViewChanged();
+        dispatchSessionPageChangeFinished();
     }
 
     private void dispatchCurrentExtraKeysViewChanged() {
