@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Terminal Sidebar and Shortcuts -->
+    <string name="action_new_session">新建会话</string>
+    <string name="action_new_session_failsafe">安全模式</string>
+    <string name="title_max_terminals_reached">已达到终端上限</string>
+    <string name="msg_max_terminals_reached">请先关闭已有终端，再创建新的终端。</string>
+    <string name="title_rename_session">设置会话名称</string>
+    <string name="action_rename_session_confirm">确定</string>
+    <string name="title_create_named_session">新建命名会话</string>
+    <string name="action_create_named_session_confirm">创建</string>
+    <string name="action_toggle_soft_keyboard">键盘</string>
+    <string name="msg_enabling_terminal_toolbar">正在启用终端工具栏</string>
+    <string name="msg_disabling_terminal_toolbar">正在禁用终端工具栏</string>
+
+    <!-- Terminal Popup -->
+    <string name="action_share_transcript">分享终端记录</string>
+    <string name="title_share_transcript">终端记录</string>
+    <string name="title_share_transcript_with">发送终端记录到：</string>
+    <string name="action_share_selected_text">分享选中文本</string>
+    <string name="title_share_selected_text">终端文本</string>
+    <string name="title_share_selected_text_with">发送选中文本到：</string>
+    <string name="action_autofill_username">自动填充用户名</string>
+    <string name="action_autofill_password">自动填充密码</string>
+    <string name="action_reset_terminal">重置终端</string>
+    <string name="msg_terminal_reset">终端已重置</string>
+    <string name="action_kill_process">结束进程（%d）</string>
+    <string name="title_confirm_kill_process">确定要结束这个会话吗？</string>
+    <string name="action_style_terminal">样式</string>
+    <string name="action_toggle_keep_screen_on">保持屏幕常亮</string>
+    <string name="action_open_help">帮助</string>
+    <string name="action_open_settings">设置</string>
+    <string name="action_open_selection_preview_settings">预览设置</string>
+    <string name="action_report_issue">报告问题</string>
+    <string name="msg_generating_report">正在生成报告</string>
+    <string name="msg_add_termux_debug_info">是否在报告中附加 Termux 调试信息？</string>
+    <string name="error_styling_not_installed">未安装 Termux:Styling 插件应用。</string>
+    <string name="action_styling_install">安装</string>
+
+    <!-- Settings -->
+    <string name="title_activity_termux_settings">Termux 设置</string>
+    <string name="title_activity_selection_preview_settings">选中预览设置</string>
+    <string name="selection_preview_settings_description">在这里实时调整选中预览框的距离、字号和宽度，修改后会立即保存。</string>
+    <string name="selection_preview_distance_title">距离</string>
+    <string name="selection_preview_offset_title">水平偏移</string>
+    <string name="selection_preview_size_title">字号</string>
+    <string name="selection_preview_width_title">宽度</string>
+    <string name="selection_preview_padding_horizontal_title">左右内边距</string>
+    <string name="selection_preview_padding_vertical_title">上下内边距</string>
+    <string name="selection_preview_corner_radius_title">圆角</string>
+    <string name="selection_preview_opacity_title">框体透明度</string>
+    <string name="selection_preview_cursor_width_title">光标宽度</string>
+    <string name="selection_preview_cursor_height_title">光标额外高度</string>
+    <string name="selection_preview_reset">恢复默认</string>
+    <string name="selection_preview_distance_value">%1$d dp</string>
+    <string name="selection_preview_offset_value">%1$d dp</string>
+    <string name="selection_preview_size_value">%1$d sp</string>
+    <string name="selection_preview_width_value">%1$d dp</string>
+    <string name="selection_preview_padding_horizontal_value">%1$d dp</string>
+    <string name="selection_preview_padding_vertical_value">%1$d dp</string>
+    <string name="selection_preview_corner_radius_value">%1$d dp</string>
+    <string name="selection_preview_opacity_value">%1$d%%</string>
+    <string name="selection_preview_cursor_width_value">%1$d dp</string>
+    <string name="selection_preview_cursor_height_value">%1$d dp</string>
+    <string name="selection_preview_demo_terminal">$ ssh root@preview-host /var/www/current</string>
+    <string name="selection_preview_demo_bubble">ssh root@preview-host /var/www/current</string>
+    <string name="selection_preview_live_tip">直接长按下方真实终端并拖动选区手柄，然后在这里调参数，效果会实时生效。</string>
+    <string name="termux_preferences_summary">Termux 应用偏好设置</string>
+    <string name="termux_debugging_preferences_title">调试</string>
+    <string name="termux_debugging_preferences_summary">调试相关偏好设置</string>
+    <string name="termux_logging_header">日志</string>
+    <string name="termux_log_level_title">日志级别</string>
+    <string name="termux_terminal_view_key_logging_enabled_title">终端视图按键日志</string>
+    <string name="termux_terminal_view_key_logging_enabled_off">日志中不会记录终端视图按键事件。（默认）</string>
+    <string name="termux_terminal_view_key_logging_enabled_on">Logcat 日志将记录终端视图按键事件。该日志非常详细，日常使用建议关闭，否则可能影响性能。</string>
+    <string name="termux_plugin_error_notifications_enabled_title">插件错误通知</string>
+    <string name="termux_plugin_error_notifications_enabled_off">禁用插件错误的闪烁提示和通知。</string>
+    <string name="termux_plugin_error_notifications_enabled_on">显示插件错误的闪烁提示和通知。（默认）</string>
+    <string name="termux_crash_report_notifications_enabled_title">崩溃报告通知</string>
+    <string name="termux_crash_report_notifications_enabled_off">禁用崩溃报告通知。</string>
+    <string name="termux_crash_report_notifications_enabled_on">显示崩溃报告通知。（默认）</string>
+    <string name="termux_terminal_io_preferences_title">终端输入输出</string>
+    <string name="termux_terminal_io_preferences_summary">终端输入输出相关偏好设置</string>
+    <string name="termux_keyboard_header">键盘</string>
+    <string name="termux_soft_keyboard_enabled_title">启用软键盘</string>
+    <string name="termux_soft_keyboard_enabled_off">软键盘将被禁用。</string>
+    <string name="termux_soft_keyboard_enabled_on">软键盘将被启用。（默认）</string>
+    <string name="termux_soft_keyboard_enabled_only_if_no_hardware_title">仅在无硬件键盘时启用软键盘</string>
+    <string name="termux_soft_keyboard_enabled_only_if_no_hardware_off">即使连接了硬件键盘，也会启用软键盘。（默认）</string>
+    <string name="termux_soft_keyboard_enabled_only_if_no_hardware_on">只有在未连接硬件键盘时才启用软键盘。</string>
+    <string name="termux_terminal_view_preferences_title">终端视图</string>
+    <string name="termux_terminal_view_preferences_summary">终端视图相关偏好设置</string>
+    <string name="termux_terminal_view_view_header">视图</string>
+    <string name="termux_terminal_view_terminal_margin_adjustment_title">终端边距调整</string>
+    <string name="termux_terminal_view_terminal_margin_adjustment_off">终端边距调整将被禁用。</string>
+    <string name="termux_terminal_view_terminal_margin_adjustment_on">终端边距调整将被启用。建议开启，以尝试修复软键盘遮挡额外按键或终端视图的问题；如果在你的设备上导致屏幕闪烁，请关闭。（默认）</string>
+    <string name="termux_api_preferences_summary">Termux:API 应用偏好设置</string>
+    <string name="termux_float_preferences_summary">Termux:Float 应用偏好设置</string>
+    <string name="termux_tasker_preferences_summary">Termux:Tasker 应用偏好设置</string>
+    <string name="termux_widget_preferences_summary">Termux:Widget 应用偏好设置</string>
+    <string name="about_preference_title">关于</string>
+    <string name="donate_preference_title">捐赠</string>
+
+</resources>

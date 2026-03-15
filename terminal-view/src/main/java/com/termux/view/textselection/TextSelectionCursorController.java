@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
+import android.text.SpannableStringBuilder;
 import android.text.TextUtils;
 import android.util.Patterns;
 import android.view.ActionMode;
@@ -18,6 +19,7 @@ import android.view.View;
 import androidx.annotation.Nullable;
 
 import com.termux.terminal.TerminalBuffer;
+import com.termux.terminal.TerminalRow;
 import com.termux.terminal.WcWidth;
 import com.termux.view.R;
 import com.termux.view.TerminalView;
@@ -29,6 +31,10 @@ public class TextSelectionCursorController implements CursorController {
     private String mStoredSelectedText;
     private boolean mIsSelectingText = false;
     private long mShowStartTime = System.currentTimeMillis();
+    private float mLastPreviewAnchorX = Float.NaN;
+    private float mLastPreviewAnchorY = Float.NaN;
+    private int mLastPreviewFocusX = -1;
+    private int mLastPreviewFocusY = Integer.MIN_VALUE;
 
     private final int mHandleHeight;
     private int mSelX1 = -1, mSelX2 = -1, mSelY1 = -1, mSelY2 = -1;
@@ -58,6 +64,15 @@ public class TextSelectionCursorController implements CursorController {
         mIsSelectingText = true;
     }
 
+    void onHandleDragStarted(TextSelectionHandleView handle) {
+        if (!isActive()) return;
+        updateSelectionPreviewForHandle(handle);
+    }
+
+    void onHandleDragStopped() {
+        terminalView.hideTextSelectionPreview();
+    }
+
     @Override
     public boolean hide() {
         if (!isActive()) return false;
@@ -79,6 +94,7 @@ public class TextSelectionCursorController implements CursorController {
 
         mSelX1 = mSelY1 = mSelX2 = mSelY2 = -1;
         mIsSelectingText = false;
+        terminalView.hideTextSelectionPreview();
 
         return true;
     }
@@ -279,10 +295,16 @@ public class TextSelectionCursorController implements CursorController {
 
     @Override
     public void updatePosition(TextSelectionHandleView handle, int x, int y) {
+        if (terminalView.mEmulator == null) return;
+
         TerminalBuffer screen = terminalView.mEmulator.getScreen();
         final int scrollRows = screen.getActiveRows() - terminalView.mEmulator.mRows;
+        final int columns = terminalView.mEmulator.mColumns;
+        final float fontWidth = terminalView.mRenderer.getFontWidth();
         if (handle == mStartHandle) {
-            mSelX1 = terminalView.getCursorX(x);
+            // Invert {@link TerminalView#getPointX(int)} (which uses Math.round) by snapping to the nearest cell
+            // boundary. This avoids systematic +/-1 drift when fontWidth is non-integer.
+            mSelX1 = clamp(Math.round(x / fontWidth), 0, Math.max(0, columns - 1));
             mSelY1 = terminalView.getCursorY(y);
             if (mSelX1 < 0) {
                 mSelX1 = 0;
@@ -321,11 +343,14 @@ public class TextSelectionCursorController implements CursorController {
                 terminalView.setTopRow(topRow);
             }
 
-            mSelX1 = getValidCurX(screen, mSelY1, mSelX1);
+            mSelX1 = snapSelectionStartColumn(screen, mSelY1, mSelX1);
 
         } else {
-            mSelX2 = terminalView.getCursorX(x);
+            // End handle hotspot represents the boundary *after* the last selected character. Snap to the nearest
+            // boundary (same rationale as start handle) to avoid +/-1 drift when fontWidth is non-integer.
+            int endBoundaryColumn = clamp(Math.round(x / fontWidth), 1, columns);
             mSelY2 = terminalView.getCursorY(y);
+            mSelX2 = Math.max(0, Math.min(columns - 1, endBoundaryColumn - 1));
             if (mSelX2 < 0) {
                 mSelX2 = 0;
             }
@@ -361,41 +386,46 @@ public class TextSelectionCursorController implements CursorController {
                 terminalView.setTopRow(topRow);
             }
 
-            mSelX2 = getValidCurX(screen, mSelY2, mSelX2);
+            mSelX2 = snapSelectionEndColumn(screen, mSelY2, mSelX2, columns);
         }
 
         terminalView.invalidate();
+        updateSelectionPreviewForHandle(handle);
     }
 
-    private int getValidCurX(TerminalBuffer screen, int cy, int cx) {
-        String line = screen.getSelectedText(0, cy, cx, cy);
-        if (!TextUtils.isEmpty(line)) {
-            int col = 0;
-            for (int i = 0, len = line.length(); i < len; i++) {
-                char ch1 = line.charAt(i);
-                if (ch1 == 0) {
-                    break;
-                }
-
-                int wc;
-                if (Character.isHighSurrogate(ch1) && i + 1 < len) {
-                    char ch2 = line.charAt(++i);
-                    wc = WcWidth.width(Character.toCodePoint(ch1, ch2));
-                } else {
-                    wc = WcWidth.width(ch1);
-                }
-
-                final int cend = col + wc;
-                if (cx > col && cx < cend) {
-                    return cend;
-                }
-                if (cend == col) {
-                    return col;
-                }
-                col = cend;
-            }
+    private void updateSelectionPreviewForHandle(TextSelectionHandleView handle) {
+        if (handle == mStartHandle) {
+            int boundaryX = mSelX1;
+            float anchorX = terminalView.getPointX(boundaryX);
+            float anchorY = terminalView.getPointY(mSelY1 + 1);
+            updateSelectionPreview(mSelX1, mSelY1, anchorX, anchorY);
+        } else if (handle == mEndHandle) {
+            int boundaryX = mSelX2 + 1;
+            float anchorX = terminalView.getPointX(boundaryX);
+            float anchorY = terminalView.getPointY(mSelY2 + 1);
+            updateSelectionPreview(mSelX2, mSelY2, anchorX, anchorY);
         }
-        return cx;
+    }
+
+    private int snapSelectionStartColumn(TerminalBuffer screen, int row, int column) {
+        if (column <= 0) return column;
+        TerminalRow line = screen.allocateFullLineIfNecessary(screen.externalToInternalRow(row));
+        if (line.findStartOfColumn(column) == line.findStartOfColumn(column - 1)) {
+            // Prevent selecting the 2nd half of a wide char as start.
+            return column - 1;
+        }
+        return column;
+    }
+
+    private int snapSelectionEndColumn(TerminalBuffer screen, int row, int column, int columns) {
+        if (column < 0 || column >= columns) return column;
+        if (column + 1 >= columns) return column;
+        TerminalRow line = screen.allocateFullLineIfNecessary(screen.externalToInternalRow(row));
+        if (line.findStartOfColumn(column + 1) == line.findStartOfColumn(column)) {
+            // Prevent selecting only the 1st half of a wide char as end.
+            return Math.min(columns - 1, column + 1);
+        }
+        return column;
     }
 
     public void decrementYTextSelectionCursors(int decrement) {
@@ -415,6 +445,7 @@ public class TextSelectionCursorController implements CursorController {
 
     @Override
     public void onDetached() {
+        terminalView.hideTextSelectionPreview();
     }
 
     @Override
@@ -467,4 +498,89 @@ public class TextSelectionCursorController implements CursorController {
         return mEndHandle.isDragging();
     }
 
+    private void updateSelectionPreview(int focusX, int focusY, float anchorX, float anchorY) {
+        mLastPreviewAnchorX = anchorX;
+        mLastPreviewAnchorY = anchorY;
+        mLastPreviewFocusX = focusX;
+        mLastPreviewFocusY = focusY;
+        if (terminalView.isTextSelectionMagnifierSupported()) {
+            terminalView.showTextSelectionMagnifier(anchorX, anchorY);
+        } else {
+            terminalView.showTextSelectionPreview(buildPreviewText(focusX, focusY), Math.round(anchorX), Math.round(anchorY));
+        }
+    }
+
+    public void refreshSelectionPreview() {
+        if (!mIsSelectingText) return;
+        int focusX = mLastPreviewFocusX >= 0 ? mLastPreviewFocusX : mSelX2;
+        int focusY = mLastPreviewFocusY != Integer.MIN_VALUE ? mLastPreviewFocusY : mSelY2;
+        float anchorX = !Float.isNaN(mLastPreviewAnchorX) ? mLastPreviewAnchorX : terminalView.getPointX(focusX + 1);
+        float anchorY = !Float.isNaN(mLastPreviewAnchorY) ? mLastPreviewAnchorY : terminalView.getPointY(focusY + 1);
+        if (terminalView.isTextSelectionMagnifierSupported()) {
+            terminalView.showTextSelectionMagnifier(anchorX, anchorY);
+        } else {
+            terminalView.showTextSelectionPreview(buildPreviewText(focusX, focusY), Math.round(anchorX), Math.round(anchorY));
+        }
+    }
+
+    private CharSequence buildPreviewText(int focusX, int focusY) {
+        if (terminalView.mEmulator == null) return " ";
+
+        TerminalBuffer screen = terminalView.mEmulator.getScreen();
+        int columns = terminalView.mEmulator.mColumns;
+        int previewRadius = Math.min(12, Math.max(6, columns / 5));
+        int startColumn = Math.max(0, focusX - previewRadius);
+        int endColumn = Math.min(columns - 1, focusX + previewRadius);
+
+        String segment = screen.getSelectedText(startColumn, focusY, endColumn, focusY);
+        if (segment == null) segment = "";
+        segment = segment.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
+
+        boolean clippedAtStart = startColumn > 0;
+        boolean clippedAtEnd = endColumn < columns - 1;
+        int[] focusCharRange = findFocusCharRange(segment, Math.max(0, focusX - startColumn));
+
+        SpannableStringBuilder builder = new SpannableStringBuilder();
+        if (clippedAtStart) builder.append("...");
+
+        if (focusCharRange[0] >= 0 && focusCharRange[1] >= focusCharRange[0]) {
+            builder.append(segment, 0, focusCharRange[0]);
+            builder.append('[');
+            builder.append(segment, focusCharRange[0], focusCharRange[1]);
+            builder.append(']');
+            builder.append(segment, focusCharRange[1], segment.length());
+        } else {
+            builder.append(segment);
+        }
+
+        if (clippedAtEnd) builder.append("...");
+
+        if (builder.length() == 0) {
+            builder.append(' ');
+        }
+        return builder;
+    }
+
+    private int[] findFocusCharRange(String text, int targetColumn) {
+        int displayColumn = 0;
+        for (int index = 0; index < text.length(); ) {
+            int codePoint = Character.codePointAt(text, index);
+            int charCount = Character.charCount(codePoint);
+            int width = Math.max(1, WcWidth.width(codePoint));
+            int nextDisplayColumn = displayColumn + width;
+
+            if (targetColumn >= displayColumn && targetColumn < nextDisplayColumn) {
+                return new int[]{index, index + charCount};
+            }
+
+            displayColumn = nextDisplayColumn;
+            index += charCount;
+        }
+
+        return new int[]{-1, -1};
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(value, max));
+    }
 }

@@ -34,11 +34,13 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         void onSessionPageChangeStarted();
         void onSessionPageChangeFinished();
         void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser);
+        void onConfigPageSelected(boolean fromUser);
         void onActiveTerminalViewChanged(@NonNull TerminalView terminalView, @Nullable TerminalSession session);
         void onExtraKeysViewCreated(@NonNull ExtraKeysView extraKeysView);
     }
 
     private static final String PLACEHOLDER_KEY = "__placeholder__";
+    private static final String CONFIG_PAGE_KEY = "__config_page__";
 
     private final TerminalSessionSurfacePagerStateMachine pagerStateMachine =
         new TerminalSessionSurfacePagerStateMachine();
@@ -57,6 +59,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     @Nullable private ExtraKeysInfo mExtraKeysInfo;
     @Nullable private Typeface mTerminalTypeface;
     @Nullable private ExtraKeysView mLastDispatchedExtraKeysView;
+    @Nullable private View mConfigPageView;
 
     private int mTerminalTextSize;
     private boolean mTerminalKeepScreenOn;
@@ -68,8 +71,10 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     private int mToolbarComputedHeightPx;
     private int mSelectedSessionIndex;
     private final int mSessionPageGapPx;
+    private boolean mConfigPageEnabled;
     private boolean mSessionPageSwipeTouchActive;
     private boolean mSessionPageChangeInProgress;
+    private boolean mProgrammaticFocusAllowed = true;
 
     public TerminalSessionSurfaceView(Context context) {
         super(context);
@@ -103,8 +108,25 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         if (mSessionPager instanceof ProgrammaticViewPager) {
             ProgrammaticViewPager programmaticViewPager = (ProgrammaticViewPager) mSessionPager;
             programmaticViewPager.setSwipeRegionProvider(() -> {
-                PageHolder holder = sessionPagerAdapter.findHolder(mSessionPager.getCurrentItem());
-                return holder == null ? null : holder.extraKeysContainer;
+                int configPageIndex = getConfigPageIndex();
+                boolean configPageTargeted = configPageIndex >= 0 &&
+                    (mSelectedSessionIndex == configPageIndex || mSessionPager.getCurrentItem() == configPageIndex);
+                int activeIndex = configPageTargeted ? configPageIndex : mSessionPager.getCurrentItem();
+                PageHolder holder = sessionPagerAdapter.findHolder(activeIndex);
+                if (configPageTargeted) {
+                    if (holder != null && holder.configContainer.isShown() &&
+                        holder.configContainer.getWidth() > 0 && holder.configContainer.getHeight() > 0) {
+                        return holder.configContainer;
+                    }
+                    // The config page can be the selected target before ViewPager updates currentItem
+                    // and attaches the holder on the first entry.
+                    return mSessionPager;
+                }
+                if (holder == null) return null;
+                if (TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) {
+                    return holder.root;
+                }
+                return holder.extraKeysContainer;
             });
             programmaticViewPager.setSwipeGestureListener(new ProgrammaticViewPager.SwipeGestureListener() {
                 @Override
@@ -161,6 +183,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             public void onPageSelected(int position) {
                 toolbarStateMachine.onPageSelected(position);
                 updateToolbarPresentation();
+                if (!mProgrammaticFocusAllowed) return;
                 if (position == 0) {
                     TerminalView terminalView = getCurrentTerminalView();
                     if (terminalView != null) terminalView.requestFocus();
@@ -286,6 +309,44 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         }
     }
 
+    public void setConfigPageView(@Nullable View configPageView) {
+        if (mConfigPageView == configPageView) return;
+        mConfigPageView = configPageView;
+        sessionPagerAdapter.notifyDataSetChanged();
+    }
+
+    public void setConfigPageEnabled(boolean enabled) {
+        if (mConfigPageEnabled == enabled) return;
+        mConfigPageEnabled = enabled;
+        sessionPagerAdapter.notifyDataSetChanged();
+    }
+
+    public boolean isConfigPageEnabled() {
+        return mConfigPageEnabled;
+    }
+
+    public int getConfigPageIndex() {
+        return mConfigPageEnabled ? sessionPagerAdapter.getItemsCount() : -1;
+    }
+
+    public void setCurrentConfigPage(boolean animate) {
+        if (!mConfigPageEnabled) return;
+        int configIndex = getConfigPageIndex();
+        if (configIndex < 0) return;
+        mSelectedSessionIndex = configIndex;
+        if (configIndex == mSessionPager.getCurrentItem()) {
+            dispatchActivePageChanged(configIndex, false);
+            return;
+        }
+        notifySessionPageChangeStarted();
+        mSuppressSessionPageCallback = true;
+        mSessionPager.setCurrentItem(configIndex, animate);
+        mSuppressSessionPageCallback = false;
+        if (pagerStateMachine.getState() == TerminalSessionSurfacePagerStateMachine.State.IDLE) {
+            dispatchActivePageChanged(configIndex, false);
+        }
+    }
+
     public void refreshSession(@NonNull TerminalSession session) {
         PageHolder holder = sessionPagerAdapter.findHolder(session);
         if (holder == null) return;
@@ -305,6 +366,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     @Nullable
     public TerminalView getCurrentTerminalView() {
         PageHolder holder = sessionPagerAdapter.findHolder(mSessionPager.getCurrentItem());
+        if (holder == null || TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) return null;
         return holder == null ? null : holder.terminalView;
     }
 
@@ -322,6 +384,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     @Nullable
     public ExtraKeysView getExtraKeysView() {
         PageHolder holder = sessionPagerAdapter.findHolder(mSessionPager.getCurrentItem());
+        if (holder == null || TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) return null;
         return holder == null ? null : holder.extraKeysView;
     }
 
@@ -333,7 +396,12 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         return toolbarStateMachine.isTextInputPageSelected();
     }
 
+    public void setProgrammaticFocusAllowed(boolean allowed) {
+        mProgrammaticFocusAllowed = allowed;
+    }
+
     public void focusToolbarTextInput() {
+        mProgrammaticFocusAllowed = true;
         EditText editText = findViewById(R.id.terminal_surface_text_input);
         if (editText != null) editText.requestFocus();
     }
@@ -378,6 +446,15 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             return;
         }
         if (holder == null) {
+            dispatchSessionPageChangeFinished();
+            return;
+        }
+
+        if (TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) {
+            if (mCallbacks != null && !mSuppressSessionPageCallback) {
+                mCallbacks.onConfigPageSelected(fromUser);
+            }
+            dispatchCurrentExtraKeysViewChanged();
             dispatchSessionPageChangeFinished();
             return;
         }
@@ -466,8 +543,15 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             return Math.max(0, Math.min(index, count - 1));
         }
 
+        int getItemsCount() {
+            return items.size();
+        }
+
         @Override
         public int getCount() {
+            if (mConfigPageEnabled) {
+                return Math.max(1, items.size() + 1);
+            }
             return Math.max(1, items.size());
         }
 
@@ -486,6 +570,9 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             if (PLACEHOLDER_KEY.equals(holder.key)) {
                 return items.isEmpty() ? POSITION_UNCHANGED : POSITION_NONE;
             }
+            if (CONFIG_PAGE_KEY.equals(holder.key)) {
+                return mConfigPageEnabled ? POSITION_UNCHANGED : POSITION_NONE;
+            }
             for (TerminalSessionSurfaceItem item : items) {
                 if (TextUtils.equals(item.key, holder.key)) return POSITION_UNCHANGED;
             }
@@ -495,16 +582,23 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         @NonNull
         @Override
         public Object instantiateItem(@NonNull ViewGroup container, int position) {
-            TerminalSessionSurfaceItem item = position < items.size()
-                ? items.get(position)
-                : new TerminalSessionSurfaceItem(PLACEHOLDER_KEY, null);
+            TerminalSessionSurfaceItem item;
+            if (position < items.size()) {
+                item = items.get(position);
+            } else if (mConfigPageEnabled && position == items.size()) {
+                item = new TerminalSessionSurfaceItem(CONFIG_PAGE_KEY, null);
+            } else {
+                item = new TerminalSessionSurfaceItem(PLACEHOLDER_KEY, null);
+            }
 
             PageHolder holder = PLACEHOLDER_KEY.equals(item.key)
                 ? createPageHolder()
                 : holdersByKey.get(item.key);
             if (holder == null) {
                 holder = createPageHolder();
-                holdersByKey.put(item.key, holder);
+                if (!PLACEHOLDER_KEY.equals(item.key)) {
+                    holdersByKey.put(item.key, holder);
+                }
             }
 
             bindHolder(holder, item);
@@ -523,7 +617,14 @@ public class TerminalSessionSurfaceView extends LinearLayout {
 
         @Nullable
         PageHolder findHolder(int position) {
-            TerminalSessionSurfaceItem item = position < items.size() ? items.get(position) : null;
+            TerminalSessionSurfaceItem item;
+            if (position < items.size()) {
+                item = items.get(position);
+            } else if (mConfigPageEnabled && position == items.size()) {
+                item = new TerminalSessionSurfaceItem(CONFIG_PAGE_KEY, null);
+            } else {
+                item = null;
+            }
             if (item == null) return null;
             return holdersByKey.get(item.key);
         }
@@ -562,12 +663,13 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             View root = LayoutInflater.from(getContext())
                 .inflate(R.layout.item_terminal_session_page, mSessionPager, false);
             TerminalView terminalView = root.findViewById(R.id.terminal_session_page_terminal_view);
+            ViewGroup configContainer = root.findViewById(R.id.terminal_session_page_config_container);
             SessionSwipeFrameLayout extraKeysContainer =
                 root.findViewById(R.id.terminal_session_page_extra_keys_container);
             ExtraKeysView extraKeysView = root.findViewById(R.id.terminal_session_page_extra_keys);
             applyTerminalViewConfig(terminalView);
             reloadExtraKeysView(extraKeysView);
-            PageHolder holder = new PageHolder(root, terminalView, extraKeysContainer, extraKeysView);
+            PageHolder holder = new PageHolder(root, terminalView, configContainer, extraKeysContainer, extraKeysView);
             root.setTag(holder);
             return holder;
         }
@@ -575,6 +677,30 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         private void bindHolder(@NonNull PageHolder holder, @NonNull TerminalSessionSurfaceItem item) {
             holder.key = item.key;
             holder.session = item.session;
+            if (CONFIG_PAGE_KEY.equals(item.key)) {
+                holder.terminalView.setVisibility(View.GONE);
+                holder.extraKeysContainer.setVisibility(View.GONE);
+                holder.configContainer.setVisibility(View.VISIBLE);
+                holder.configContainer.removeAllViews();
+                if (mConfigPageView != null) {
+                    View parent = (View) mConfigPageView.getParent();
+                    if (parent instanceof ViewGroup) {
+                        ((ViewGroup) parent).removeView(mConfigPageView);
+                    }
+                    holder.configContainer.addView(
+                        mConfigPageView,
+                        new ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    );
+                }
+                return;
+            }
+
+            holder.configContainer.removeAllViews();
+            holder.configContainer.setVisibility(View.GONE);
+            holder.terminalView.setVisibility(View.VISIBLE);
             applyTerminalViewConfig(holder.terminalView);
             reloadExtraKeysView(holder.extraKeysView);
             applyToolbarPresentation(holder);
@@ -594,6 +720,10 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         }
 
         private void applyToolbarPresentation(@NonNull PageHolder holder) {
+            if (TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) {
+                holder.extraKeysContainer.setVisibility(View.GONE);
+                return;
+            }
             boolean showIntegratedToolbar = shouldShowIntegratedToolbar();
             ViewGroup.LayoutParams layoutParams = holder.extraKeysContainer.getLayoutParams();
             int desiredHeight = showIntegratedToolbar ? mToolbarComputedHeightPx : 0;
@@ -676,6 +806,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     private static final class PageHolder {
         @NonNull final View root;
         @NonNull final TerminalView terminalView;
+        @NonNull final ViewGroup configContainer;
         @NonNull final SessionSwipeFrameLayout extraKeysContainer;
         @NonNull final ExtraKeysView extraKeysView;
         @Nullable TerminalSession session;
@@ -683,10 +814,12 @@ public class TerminalSessionSurfaceView extends LinearLayout {
 
         PageHolder(@NonNull View root,
                    @NonNull TerminalView terminalView,
+                   @NonNull ViewGroup configContainer,
                    @NonNull SessionSwipeFrameLayout extraKeysContainer,
                    @NonNull ExtraKeysView extraKeysView) {
             this.root = root;
             this.terminalView = terminalView;
+            this.configContainer = configContainer;
             this.extraKeysContainer = extraKeysContainer;
             this.extraKeysView = extraKeysView;
         }

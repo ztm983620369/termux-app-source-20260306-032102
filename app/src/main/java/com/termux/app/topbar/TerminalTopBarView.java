@@ -1,5 +1,6 @@
 package com.termux.app.topbar;
 
+import android.animation.LayoutTransition;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -80,6 +81,7 @@ public class TerminalTopBarView extends LinearLayout {
     @Nullable private OnTabCloseListener mOnTabCloseListener;
 
     private final List<Item> mItems = new ArrayList<>();
+    private boolean mAddButtonSelected;
     private int mLastSelectedIndex = -1;
     private int mTabMoveThresholdPx;
     private int mLongPressTimeoutMs;
@@ -105,6 +107,10 @@ public class TerminalTopBarView extends LinearLayout {
         LayoutInflater.from(context).inflate(R.layout.view_terminal_top_bar, this, true);
         mScrollView = findViewById(R.id.terminal_top_bar_scroll);
         mTabsContainer = findViewById(R.id.terminal_top_bar_container);
+        LayoutTransition layoutTransition = new LayoutTransition();
+        layoutTransition.setDuration(180L);
+        layoutTransition.setAnimateParentHierarchy(false);
+        mTabsContainer.setLayoutTransition(layoutTransition);
         ViewConfiguration viewConfiguration = ViewConfiguration.get(context);
         mTabMoveThresholdPx = viewConfiguration.getScaledTouchSlop();
         mLongPressTimeoutMs = ViewConfiguration.getLongPressTimeout();
@@ -134,6 +140,16 @@ public class TerminalTopBarView extends LinearLayout {
         mItems.clear();
         mItems.addAll(items);
         updateItems();
+    }
+
+    public void setAddButtonSelected(boolean selected) {
+        if (mAddButtonSelected == selected && mAddButton != null) return;
+        mAddButtonSelected = selected;
+        ensureAddButton();
+        applyAddButtonState();
+        if (selected) {
+            post(this::scrollToAddButton);
+        }
     }
 
     private void updateItems() {
@@ -175,11 +191,41 @@ public class TerminalTopBarView extends LinearLayout {
             orderedViews.add(holder.root);
         }
 
-        mTabsContainer.removeAllViews();
-        for (View tabView : orderedViews) {
-            mTabsContainer.addView(tabView, createTabLayoutParams());
+        boolean rebuildChildren = false;
+        int existingTabCount = 0;
+        for (int i = 0; i < mTabsContainer.getChildCount(); i++) {
+            View child = mTabsContainer.getChildAt(i);
+            if (child == mAddButton) continue;
+            existingTabCount++;
         }
-        mTabsContainer.addView(mAddButton, createAddButtonLayoutParams());
+        if (existingTabCount != orderedViews.size()) {
+            rebuildChildren = true;
+        } else {
+            int tabIndex = 0;
+            for (int i = 0; i < mTabsContainer.getChildCount(); i++) {
+                View child = mTabsContainer.getChildAt(i);
+                if (child == mAddButton) continue;
+                if (tabIndex >= orderedViews.size() || child != orderedViews.get(tabIndex)) {
+                    rebuildChildren = true;
+                    break;
+                }
+                tabIndex++;
+            }
+        }
+        if (mAddButton.getParent() != mTabsContainer ||
+            mTabsContainer.getChildCount() == 0 ||
+            mTabsContainer.getChildAt(mTabsContainer.getChildCount() - 1) != mAddButton) {
+            rebuildChildren = true;
+        }
+
+        if (rebuildChildren) {
+            mTabsContainer.removeAllViews();
+            for (View tabView : orderedViews) {
+                mTabsContainer.addView(tabView, createTabLayoutParams());
+            }
+            mTabsContainer.addView(mAddButton, createAddButtonLayoutParams());
+        }
+        applyAddButtonState();
 
         if (selectedIndex >= 0 && selectedIndex != mLastSelectedIndex) {
             int indexToScroll = selectedIndex;
@@ -313,16 +359,26 @@ public class TerminalTopBarView extends LinearLayout {
         mAddButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         mAddButton.setGravity(Gravity.CENTER);
         mAddButton.setTextColor(Color.WHITE);
-        mAddButton.setBackground(createTabBackground(false, TerminalTopBarStateMachine.Tone.NEUTRAL));
         mAddButton.setMinimumWidth(dp(48));
+        applyAddButtonState();
         mAddButton.setOnClickListener(v -> {
             if (mOnAddClickListener != null) mOnAddClickListener.run();
         });
         mAddButton.setOnLongClickListener(v -> {
+            if (mOnAddLongPressListener == null) return false;
             mAddButton.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-            if (mOnAddLongPressListener != null) mOnAddLongPressListener.onAddLongPress();
+            mOnAddLongPressListener.onAddLongPress();
             return true;
         });
+    }
+
+    private void applyAddButtonState() {
+        if (mAddButton == null) return;
+        mAddButton.setBackground(createTabBackground(
+            mAddButtonSelected,
+            mAddButtonSelected ? TerminalTopBarStateMachine.Tone.ACTIVE : TerminalTopBarStateMachine.Tone.NEUTRAL
+        ));
+        mAddButton.setAlpha(mAddButtonSelected ? 1.0f : 0.88f);
     }
 
     @NonNull
@@ -431,6 +487,12 @@ public class TerminalTopBarView extends LinearLayout {
         View child = mTabsContainer.getChildAt(index);
         if (child == null) return;
         int scrollX = child.getLeft() - dp(16);
+        mScrollView.smoothScrollTo(Math.max(scrollX, 0), 0);
+    }
+
+    private void scrollToAddButton() {
+        if (mAddButton == null) return;
+        int scrollX = mAddButton.getLeft() - dp(16);
         mScrollView.smoothScrollTo(Math.max(scrollX, 0), 0);
     }
 

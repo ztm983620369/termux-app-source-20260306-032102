@@ -331,7 +331,11 @@ fun FilesBrowserPage(
 
     DisposableEffect(currentDirPath) {
         val observer = if (currentDir.exists() && currentDir.isDirectory) {
-            DirectoryObserver(currentDir) { _, _ -> requestReload() }.also { it.startWatching() }
+            DirectoryObserver(currentDir) { _, path ->
+                if (!isTransientEditorArtifact(path)) {
+                    requestReload()
+                }
+            }.also { it.startWatching() }
         } else {
             null
         }
@@ -1145,6 +1149,16 @@ private fun shareToWeChat(context: Context, file: File) {
 }
 
 private data class SaveResult(val ok: Boolean, val message: String)
+
+private fun isTransientEditorArtifact(path: String?): Boolean {
+    val name = path?.substringAfterLast('/')?.trim().orEmpty()
+    if (name.isEmpty()) return false
+    return name.contains(".editor-sync.tmp") ||
+        name.contains(".editor-sync.bak") ||
+        name.contains(".termux-upload-") ||
+        name.contains(".termux-backup-") ||
+        name.contains(".termux-download-")
+}
 
 private fun saveImageToAlbum(context: Context, file: File): SaveResult {
     if (!file.exists() || !file.isFile) return SaveResult(false, "文件不可用")

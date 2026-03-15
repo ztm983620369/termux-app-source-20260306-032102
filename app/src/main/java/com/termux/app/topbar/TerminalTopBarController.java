@@ -66,7 +66,7 @@ public final class TerminalTopBarController {
 
     private void bindListeners() {
         view.setOnAddClickListener(callbacks::onAddSession);
-        view.setOnAddLongPressListener(callbacks::onAddLongPress);
+        view.setOnAddLongPressListener(null);
         view.setOnTabSelectedListener((index, item) -> callbacks.onSelectSession(index));
         view.setOnTabCloseListener(callbacks::onCloseSession);
         view.setOnTabLongPressListener((index, item) -> callbacks.onLongPressSession(index));

@@ -12,7 +12,9 @@ data class FileOpenRequest(
     val mimeType: String? = null,
     val originType: String? = null,
     val originPath: String? = null,
-    val originDisplayPath: String? = null
+    val originDisplayPath: String? = null,
+    val originModifiedMs: Long? = null,
+    val originSize: Long? = null
 ) {
     companion object {
         const val ORIGIN_LOCAL = "local"
@@ -31,6 +33,9 @@ object FileEditorContract {
     private const val EXTRA_ORIGIN_TYPE = "com.termux.bridge.extra.ORIGIN_TYPE"
     private const val EXTRA_ORIGIN_PATH = "com.termux.bridge.extra.ORIGIN_PATH"
     private const val EXTRA_ORIGIN_DISPLAY_PATH = "com.termux.bridge.extra.ORIGIN_DISPLAY_PATH"
+    private const val EXTRA_ORIGIN_MODIFIED_MS = "com.termux.bridge.extra.ORIGIN_MODIFIED_MS"
+    private const val EXTRA_ORIGIN_SIZE = "com.termux.bridge.extra.ORIGIN_SIZE"
+    private const val NULL_LONG_SENTINEL = Long.MIN_VALUE
 
     @JvmStatic
     fun createIntent(context: Context, request: FileOpenRequest): Intent {
@@ -50,6 +55,8 @@ object FileEditorContract {
             putString(EXTRA_ORIGIN_TYPE, request.originType)
             putString(EXTRA_ORIGIN_PATH, request.originPath)
             putString(EXTRA_ORIGIN_DISPLAY_PATH, request.originDisplayPath)
+            putLong(EXTRA_ORIGIN_MODIFIED_MS, request.originModifiedMs ?: NULL_LONG_SENTINEL)
+            putLong(EXTRA_ORIGIN_SIZE, request.originSize ?: NULL_LONG_SENTINEL)
         }
     }
 
@@ -64,6 +71,10 @@ object FileEditorContract {
         val originType = i.getStringExtra(EXTRA_ORIGIN_TYPE)
         val originPath = i.getStringExtra(EXTRA_ORIGIN_PATH)
         val originDisplayPath = i.getStringExtra(EXTRA_ORIGIN_DISPLAY_PATH)
+        val originModifiedMs = i.getLongExtra(EXTRA_ORIGIN_MODIFIED_MS, NULL_LONG_SENTINEL)
+            .takeUnless { it == NULL_LONG_SENTINEL }
+        val originSize = i.getLongExtra(EXTRA_ORIGIN_SIZE, NULL_LONG_SENTINEL)
+            .takeUnless { it == NULL_LONG_SENTINEL }
         return FileOpenRequest(
             path = path,
             displayName = displayName,
@@ -72,7 +83,9 @@ object FileEditorContract {
             mimeType = mimeType,
             originType = originType,
             originPath = originPath,
-            originDisplayPath = originDisplayPath
+            originDisplayPath = originDisplayPath,
+            originModifiedMs = originModifiedMs,
+            originSize = originSize
         )
     }
 }

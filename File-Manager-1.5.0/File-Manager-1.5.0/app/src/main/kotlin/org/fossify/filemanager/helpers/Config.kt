@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.res.Configuration
 import org.fossify.commons.extensions.getInternalStoragePath
 import org.fossify.commons.helpers.BaseConfig
+import org.json.JSONObject
 import java.io.File
 import java.util.Locale
 
@@ -37,31 +38,97 @@ class Config(context: Context) : BaseConfig(context) {
         }
         set(homeFolder) = prefs.edit().putString(HOME_FOLDER, homeFolder).apply()
 
-    fun addFavorite(path: String) {
+    fun isFavorite(path: String): Boolean {
+        return resolveStoredFavoritePath(path) != null
+    }
+
+    fun getFavoriteRemark(path: String): String? {
+        return getFavoriteRemarkMap()[normalizeFavoritePath(path)]?.takeIf { it.isNotBlank() }
+    }
+
+    fun addFavorite(path: String, remark: String) {
+        val normalizedPath = normalizeFavoritePath(path)
         val currFavorites = HashSet<String>(favorites)
-        currFavorites.add(path)
+        currFavorites.removeAll { normalizeFavoritePath(it) == normalizedPath }
+        currFavorites.add(normalizedPath)
         favorites = currFavorites
+
+        val currRemarks = getFavoriteRemarkMap()
+        currRemarks[normalizedPath] = remark.trim()
+        setFavoriteRemarkMap(currRemarks)
     }
 
     fun moveFavorite(oldPath: String, newPath: String) {
-        if (!favorites.contains(oldPath)) {
-            return
-        }
+        val storedOldPath = resolveStoredFavoritePath(oldPath) ?: return
+        val normalizedNewPath = normalizeFavoritePath(newPath)
 
         val currFavorites = HashSet<String>(favorites)
-        currFavorites.remove(oldPath)
-        currFavorites.add(newPath)
+        currFavorites.remove(storedOldPath)
+        currFavorites.add(normalizedNewPath)
         favorites = currFavorites
+
+        val currRemarks = getFavoriteRemarkMap()
+        val movedRemark = currRemarks.remove(normalizeFavoritePath(oldPath))
+        if (!movedRemark.isNullOrBlank()) {
+            currRemarks[normalizedNewPath] = movedRemark
+        }
+        setFavoriteRemarkMap(currRemarks)
     }
 
     fun removeFavorite(path: String) {
-        if (!favorites.contains(path)) {
-            return
-        }
+        val storedPath = resolveStoredFavoritePath(path) ?: return
 
         val currFavorites = HashSet<String>(favorites)
-        currFavorites.remove(path)
+        currFavorites.remove(storedPath)
         favorites = currFavorites
+
+        val currRemarks = getFavoriteRemarkMap()
+        currRemarks.remove(normalizeFavoritePath(path))
+        setFavoriteRemarkMap(currRemarks)
+    }
+
+    private fun resolveStoredFavoritePath(path: String): String? {
+        val normalizedPath = normalizeFavoritePath(path)
+        return favorites.firstOrNull { normalizeFavoritePath(it) == normalizedPath }
+    }
+
+    private fun normalizeFavoritePath(path: String): String {
+        val normalized = path.trim().trimEnd('/')
+        return normalized.ifEmpty { "/" }
+    }
+
+    private fun getFavoriteRemarkMap(): LinkedHashMap<String, String> {
+        val rawValue = prefs.getString(FAVORITE_REMARKS, "")!!
+        if (rawValue.isBlank()) {
+            return LinkedHashMap()
+        }
+
+        return try {
+            val map = LinkedHashMap<String, String>()
+            val json = JSONObject(rawValue)
+            val iterator = json.keys()
+            while (iterator.hasNext()) {
+                val key = iterator.next()
+                val value = json.optString(key).trim()
+                if (value.isNotEmpty()) {
+                    map[key] = value
+                }
+            }
+            map
+        } catch (_: Exception) {
+            LinkedHashMap()
+        }
+    }
+
+    private fun setFavoriteRemarkMap(remarks: Map<String, String>) {
+        val json = JSONObject()
+        remarks.forEach { (path, remark) ->
+            val cleanedRemark = remark.trim()
+            if (cleanedRemark.isNotEmpty()) {
+                json.put(path, cleanedRemark)
+            }
+        }
+        prefs.edit().putString(FAVORITE_REMARKS, json.toString()).apply()
     }
 
     var isRootAvailable: Boolean

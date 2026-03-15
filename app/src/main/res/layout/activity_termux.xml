@@ -45,11 +45,24 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content" />
 
-                    <com.termux.terminalsessionsurface.TerminalSessionSurfaceView
-                        android:id="@+id/terminal_session_surface"
+                    <FrameLayout
+                        android:id="@+id/terminal_surface_host"
                         android:layout_width="match_parent"
                         android:layout_height="0dp"
-                        android:layout_weight="1" />
+                        android:layout_weight="1">
+
+                        <com.termux.terminalsessionsurface.TerminalSessionSurfaceView
+                            android:id="@+id/terminal_session_surface"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent" />
+
+                        <FrameLayout
+                            android:id="@+id/page_terminal_config"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent"
+                            android:visibility="gone" />
+
+                    </FrameLayout>
 
                 </LinearLayout>
 

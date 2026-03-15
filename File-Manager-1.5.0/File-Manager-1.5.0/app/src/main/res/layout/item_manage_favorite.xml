@@ -8,14 +8,31 @@
     android:paddingStart="@dimen/activity_margin"
     android:paddingEnd="0dp">
 
-    <org.fossify.commons.views.MyTextView
-        android:id="@+id/manage_favorite_title"
+    <LinearLayout
+        android:id="@+id/manage_favorite_text_holder"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_centerVertical="true"
         android:layout_marginTop="@dimen/medium_margin"
+        android:layout_marginBottom="@dimen/medium_margin"
         android:layout_toStartOf="@+id/overflow_menu_icon"
-        tools:text="/Internal/DCIM" />
+        android:orientation="vertical">
+
+        <org.fossify.commons.views.MyTextView
+            android:id="@+id/manage_favorite_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            tools:text="My server workdir" />
+
+        <org.fossify.commons.views.MyTextView
+            android:id="@+id/manage_favorite_subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:alpha="0.5"
+            android:textSize="@dimen/small_text_size"
+            android:visibility="gone"
+            tools:text="/Internal/DCIM"
+            tools:visibility="visible" />
+    </LinearLayout>
 
     <ImageView
         android:id="@+id/overflow_menu_icon"

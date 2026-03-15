@@ -9,4 +9,7 @@
     <string name="industrial_self_test_running_message">正在使用你已保存的服务器执行主动压测，请保持应用运行并等待完成。</string>
     <string name="industrial_self_test_report_copied">自检测报告已复制</string>
     <string name="industrial_self_test_open_report_folder">打开报告目录</string>
+    <string name="favorite_remark_hint">收藏备注</string>
+    <string name="favorite_remark_required">备注不能为空</string>
+    <string name="favorite_remark_message">备注会显示在核心导航器中，位于 SFTP 或路径信息上方。</string>
 </resources>

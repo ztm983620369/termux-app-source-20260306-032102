@@ -38,6 +38,7 @@ import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 
 import com.termux.terminal.KeyHandler;
+import com.termux.terminal.TextStyle;
 import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
 import com.termux.view.textselection.TextSelectionCursorController;
@@ -58,6 +59,9 @@ public final class TerminalView extends View {
     public TerminalViewClient mClient;
 
     private TextSelectionCursorController mTextSelectionCursorController;
+    private TextSelectionPreviewPopup mTextSelectionPreviewPopup;
+    @Nullable
+    private TextSelectionMagnifier mTextSelectionMagnifier;
 
     private Handler mTerminalCursorBlinkerHandler;
     private TerminalCursorBlinkerRunnable mTerminalCursorBlinkerRunnable;
@@ -1053,11 +1057,15 @@ public final class TerminalView extends View {
     }
 
     public int getCursorX(float x) {
-        return (int) (x / mRenderer.mFontWidth);
+        // Avoid occasional off-by-one due to floating point rounding at exact cell boundaries.
+        // (E.g. x/fontWidth yielding 4.999999 -> 4 instead of 5.)
+        if (x <= 0) return 0;
+        return (int) (x / mRenderer.mFontWidth + 0.0001f);
     }
 
     public int getCursorY(float y) {
-        return (int) (((y - 40) / mRenderer.mFontLineSpacing) + mTopRow);
+        // Keep consistent with {@link #getColumnAndRow(MotionEvent, boolean)} to avoid row drift.
+        return (int) ((y - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing) + mTopRow;
     }
 
     public int getPointX(int cx) {
@@ -1392,6 +1400,40 @@ public final class TerminalView extends View {
             mTextSelectionCursorController.render();
     }
 
+    public void showTextSelectionPreview(CharSequence text, int anchorX, int anchorY) {
+        if (mEmulator == null) return;
+
+        if (mTextSelectionPreviewPopup == null) {
+            mTextSelectionPreviewPopup = new TextSelectionPreviewPopup(this);
+        }
+
+        mTextSelectionPreviewPopup.show(text, getSelectionPreviewForegroundColor(), getSelectionPreviewBackgroundColor(), anchorX, anchorY);
+    }
+
+    public boolean isTextSelectionMagnifierSupported() {
+        return true;
+    }
+
+    public void showTextSelectionMagnifier(float anchorX, float anchorY) {
+        if (!isTextSelectionMagnifierSupported()) return;
+        if (mEmulator == null) return;
+
+        if (mTextSelectionMagnifier == null) {
+            mTextSelectionMagnifier = new TextSelectionMagnifier(this);
+        }
+
+        mTextSelectionMagnifier.show(anchorX, anchorY);
+    }
+
+    public void hideTextSelectionPreview() {
+        if (mTextSelectionPreviewPopup != null) {
+            mTextSelectionPreviewPopup.hide();
+        }
+        if (mTextSelectionMagnifier != null) {
+            mTextSelectionMagnifier.hide();
+        }
+    }
+
     public boolean isSelectingText() {
         if (mTextSelectionCursorController != null) {
             return mTextSelectionCursorController.isActive();
@@ -1472,6 +1514,8 @@ public final class TerminalView extends View {
             getViewTreeObserver().removeOnTouchModeChangeListener(mTextSelectionCursorController);
             mTextSelectionCursorController.onDetached();
         }
+
+        hideTextSelectionPreview();
     }
 
 
@@ -1516,6 +1560,14 @@ public final class TerminalView extends View {
                     showFloatingToolbar();
             }
         }
+    }
+
+    private int getSelectionPreviewForegroundColor() {
+        return mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_FOREGROUND];
+    }
+
+    private int getSelectionPreviewBackgroundColor() {
+        return mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND];
     }
 
 }

@@ -217,6 +217,28 @@ public final class SessionFileCoordinator {
     }
 
     @NonNull
+    public SftpProtocolManager.UploadResult uploadLocalFileToVirtualPath(@NonNull Context context,
+                                                                         @NonNull String localFilePath,
+                                                                         @NonNull String targetVirtualPath,
+                                                                         long expectedRemoteModifiedMs,
+                                                                         long expectedRemoteSize) {
+        initialize(context);
+        SftpProtocolManager.UploadResult result = SftpProtocolManager.getInstance()
+            .uploadLocalFileToVirtualPath(
+                context,
+                localFilePath,
+                targetVirtualPath,
+                expectedRemoteModifiedMs,
+                expectedRemoteSize
+            );
+        if (!result.success) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "uploadLocalFileToVirtualPath",
+                null, "\u8986\u76d6\u8fdc\u7a0b\u6587\u4ef6\u5931\u8d25", result.messageCn);
+        }
+        return result;
+    }
+
+    @NonNull
     public SftpProtocolManager.RemoteTransferResult transferVirtualPaths(@NonNull Context context,
                                                                          @NonNull List<String> sourceVirtualPaths,
                                                                          @NonNull String destinationVirtualDir,
@@ -263,6 +285,34 @@ public final class SessionFileCoordinator {
         if (!result.success) {
             SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "deleteVirtualPath",
                 null, "\u5220\u9664\u865a\u62df\u76ee\u6807\u5931\u8d25", result.messageCn);
+        }
+        return result;
+    }
+
+    @NonNull
+    public SftpProtocolManager.RenameResult renameVirtualPath(@NonNull Context context,
+                                                              @NonNull String virtualPath,
+                                                              @NonNull String newName) {
+        initialize(context);
+        SftpProtocolManager.RenameResult result = SftpProtocolManager.getInstance()
+            .renameVirtualPath(context, virtualPath, newName);
+        if (!result.success) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "renameVirtualPath",
+                null, "\u91cd\u547d\u540d\u8fdc\u7a0b\u9879\u76ee\u5931\u8d25", result.messageCn);
+        }
+        return result;
+    }
+
+    @NonNull
+    public SftpProtocolManager.MoveResult moveVirtualPaths(@NonNull Context context,
+                                                           @NonNull List<String> sourceVirtualPaths,
+                                                           @NonNull String destinationVirtualDir) {
+        initialize(context);
+        SftpProtocolManager.MoveResult result = SftpProtocolManager.getInstance()
+            .moveVirtualPaths(context, sourceVirtualPaths, destinationVirtualDir);
+        if (!result.success) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "moveVirtualPaths",
+                null, "\u79fb\u52a8\u8fdc\u7a0b\u9879\u76ee\u5931\u8d25", result.messageCn);
         }
         return result;
     }

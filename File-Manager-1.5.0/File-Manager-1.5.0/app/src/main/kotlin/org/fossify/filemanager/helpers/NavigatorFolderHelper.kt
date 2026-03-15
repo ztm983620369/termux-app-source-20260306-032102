@@ -64,7 +64,8 @@ object NavigatorFolderHelper {
         }
 
         favoritePaths.forEach { path ->
-            val label = "\u6536\u85cf / ${context.humanizePath(path)}"
+            val label = context.config.getFavoriteRemark(path)
+                ?: "\u6536\u85cf / ${FavoriteHelper.displayPath(context, path)}"
             addFolder(label, path, selected = selectedKey.isNullOrEmpty() && normalizePath(path) == normalizePath(homePath))
         }
 

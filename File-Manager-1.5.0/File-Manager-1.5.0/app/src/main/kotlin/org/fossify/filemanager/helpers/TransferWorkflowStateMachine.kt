@@ -34,6 +34,7 @@ sealed class TransferExecutionPlan {
     data class Upload(val destinationVirtualPath: String) : TransferExecutionPlan()
     data class Download(val destinationLocalPath: String) : TransferExecutionPlan()
     data class RemoteTransfer(val destinationVirtualPath: String) : TransferExecutionPlan()
+    data class RemoteMove(val destinationVirtualPath: String) : TransferExecutionPlan()
     data class Unsupported(val message: String) : TransferExecutionPlan()
 }
 
@@ -83,6 +84,7 @@ class TransferWorkflowStateMachine {
 
     fun pickerScopeFor(source: TransferSourceSnapshot): FilePickerDialog.TargetScope {
         return when {
+            !source.isCopyOperation && source.selectionKind == TransferSelectionKind.REMOTE_ONLY -> FilePickerDialog.TargetScope.REMOTE_ONLY
             !source.isCopyOperation -> FilePickerDialog.TargetScope.LOCAL_ONLY
             source.selectionKind == TransferSelectionKind.REMOTE_ONLY -> FilePickerDialog.TargetScope.ANY
             else -> FilePickerDialog.TargetScope.ANY
@@ -131,7 +133,11 @@ class TransferWorkflowStateMachine {
 
             TransferSelectionKind.REMOTE_ONLY -> {
                 if (!source.isCopyOperation) {
-                    TransferExecutionPlan.Unsupported("服务器项目暂不支持“移动到”，请使用“复制到”。")
+                    if (targetIsVirtual) {
+                        TransferExecutionPlan.RemoteMove(targetPath)
+                    } else {
+                        TransferExecutionPlan.Unsupported("服务器项目暂不支持直接移动到本地，请使用“复制到”。")
+                    }
                 } else if (targetIsVirtual) {
                     TransferExecutionPlan.RemoteTransfer(targetPath)
                 } else {

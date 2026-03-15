@@ -299,6 +299,10 @@ public class TextSelectionHandleView extends View {
                 mLastParentX = coords[0];
                 mLastParentY = coords[1];
                 mIsDragging = true;
+
+                if (mCursorController instanceof TextSelectionCursorController) {
+                    ((TextSelectionCursorController) mCursorController).onHandleDragStarted(this);
+                }
                 break;
             }
 
@@ -316,6 +320,9 @@ public class TextSelectionHandleView extends View {
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
                 mIsDragging = false;
+                if (mCursorController instanceof TextSelectionCursorController) {
+                    ((TextSelectionCursorController) mCursorController).onHandleDragStopped();
+                }
         }
         return true;
     }

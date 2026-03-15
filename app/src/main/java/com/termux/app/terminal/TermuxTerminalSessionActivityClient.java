@@ -775,7 +775,295 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         });
     }
 
+    public static final class ConfigProfileItem {
+        @NonNull public final String id;
+        @NonNull public final String title;
+        @NonNull public final String summary;
+        public final boolean hasPassword;
+
+        public ConfigProfileItem(@NonNull String id, @NonNull String title,
+                                 @NonNull String summary, boolean hasPassword) {
+            this.id = id;
+            this.title = title;
+            this.summary = summary;
+            this.hasPassword = hasPassword;
+        }
+    }
+
+    public static final class ConfigTmuxSessionItem {
+        @NonNull public final String name;
+        @NonNull public final String title;
+        @NonNull public final String summary;
+        public final boolean current;
+
+        public ConfigTmuxSessionItem(@NonNull String name, @NonNull String title,
+                                     @NonNull String summary, boolean current) {
+            this.name = name;
+            this.title = title;
+            this.summary = summary;
+            this.current = current;
+        }
+    }
+
+    public static final class ConfigTmuxSnapshot {
+        @NonNull public final String profileId;
+        @NonNull public final String profileTitle;
+        @NonNull public final String targetLabel;
+        public final boolean tmuxMissing;
+        @NonNull public final ArrayList<ConfigTmuxSessionItem> sessions;
+        @Nullable public final String errorMessage;
+
+        public ConfigTmuxSnapshot(@NonNull String profileId,
+                                  @NonNull String profileTitle,
+                                  @NonNull String targetLabel,
+                                  boolean tmuxMissing,
+                                  @NonNull ArrayList<ConfigTmuxSessionItem> sessions,
+                                  @Nullable String errorMessage) {
+            this.profileId = profileId;
+            this.profileTitle = profileTitle;
+            this.targetLabel = targetLabel;
+            this.tmuxMissing = tmuxMissing;
+            this.sessions = sessions;
+            this.errorMessage = errorMessage;
+        }
+    }
+
+    public interface ConfigTmuxSnapshotCallback {
+        void onLoaded(@NonNull ConfigTmuxSnapshot snapshot);
+    }
+
+    public interface ConfigActionCallback {
+        void onComplete(boolean success);
+    }
+
+    @NonNull
+    public ArrayList<ConfigProfileItem> getConfigProfileItems() {
+        ArrayList<SshProfile> profiles = loadSshProfiles();
+        ArrayList<ConfigProfileItem> items = new ArrayList<>(profiles.size());
+        for (SshProfile profile : profiles) {
+            if (profile == null) continue;
+            items.add(new ConfigProfileItem(
+                profile.id,
+                profile.displayName,
+                buildSshProfileSummary(profile),
+                !TextUtils.isEmpty(profile.password)
+            ));
+        }
+        return items;
+    }
+
+    @Nullable
+    private SshProfile findSshProfileById(@Nullable String id) {
+        if (TextUtils.isEmpty(id)) return null;
+        ArrayList<SshProfile> profiles = loadSshProfiles();
+        for (SshProfile profile : profiles) {
+            if (profile != null && id.equals(profile.id)) return profile;
+        }
+        return null;
+    }
+
+    public void connectProfileFromConfigTab(@Nullable String profileId) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            return;
+        }
+        connectWithSshProfile(profile);
+    }
+
+    public void openProfileEditorFromConfigTab(@Nullable String profileId) {
+        showSshProfileEditorDialog(findSshProfileById(profileId), false);
+    }
+
+    public void openPersistenceManagerFromConfigTab(@Nullable String profileId) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            return;
+        }
+        showSshPersistenceManagerDialog(profile);
+    }
+
+    public void deleteProfileFromConfigTab(@Nullable String profileId) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            return;
+        }
+        showDeleteSshProfileConfirmDialog(profile, false);
+    }
+
+    public void loadTmuxSnapshotForConfigTab(@Nullable String profileId,
+                                             @NonNull ConfigTmuxSnapshotCallback callback) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            callback.onLoaded(new ConfigTmuxSnapshot(
+                "",
+                "",
+                "",
+                false,
+                new ArrayList<>(),
+                mActivity.getString(R.string.msg_ssh_profile_invalid)
+            ));
+            return;
+        }
+        SshLaunchConfig config = resolveSshLaunchConfig(profile);
+        if (config == null) {
+            callback.onLoaded(new ConfigTmuxSnapshot(
+                profile.id,
+                profile.displayName,
+                profile.displayName,
+                false,
+                new ArrayList<>(),
+                mActivity.getString(R.string.msg_ssh_profile_invalid)
+            ));
+            return;
+        }
+        ensureSshpassAndRunIfNeeded(profile, () ->
+            mSshTmuxRuntimeEngine.loadRemoteTmuxSessions(config.sshCommand, result -> {
+                boolean tmuxMissing = result.tmuxMissing;
+                String error = null;
+                if (!tmuxMissing && !result.listDone && result.sessions.isEmpty()) {
+                    error = mActivity.getString(R.string.msg_ssh_persistence_list_failed);
+                }
+                String currentTmux = findCurrentActiveTmuxSession(config);
+                callback.onLoaded(new ConfigTmuxSnapshot(
+                    profile.id,
+                    profile.displayName,
+                    TextUtils.isEmpty(config.targetLabel) ? profile.displayName : config.targetLabel,
+                    tmuxMissing,
+                    toConfigTmuxSessionItems(toAppRemoteTmuxSessions(result.sessions), currentTmux),
+                    error
+                ));
+            })
+        );
+    }
+
+    public void installTmuxFromConfigTab(@Nullable String profileId, @NonNull ConfigActionCallback callback) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            callback.onComplete(false);
+            return;
+        }
+        SshLaunchConfig config = resolveSshLaunchConfig(profile);
+        if (config == null) {
+            callback.onComplete(false);
+            return;
+        }
+        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_installing_tmux), true);
+        mSshTmuxRuntimeEngine.installTmux(config.sshCommand, result -> {
+            boolean success = result.code == SshTmuxOperationResult.Code.SUCCESS;
+            if (!success) {
+                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_install_failed), true);
+            }
+            callback.onComplete(success);
+        });
+    }
+
+    public void createTmuxSessionFromConfigTab(@Nullable String profileId, @Nullable String requestedDisplayName,
+                                               @NonNull ConfigActionCallback callback) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            callback.onComplete(false);
+            return;
+        }
+        SshLaunchConfig config = resolveSshLaunchConfig(profile);
+        if (config == null) {
+            callback.onComplete(false);
+            return;
+        }
+        TerminalSession anchorSession = mActivity.getCurrentSession();
+        mSshTmuxRuntimeEngine.createRemoteTmuxSessionAndConnect(
+            anchorSession,
+            config.sshCommand,
+            config.sessionName,
+            requestedDisplayName,
+            result -> {
+                boolean success = result.code == SshTmuxOperationResult.Code.SUCCESS;
+                if (result.code == SshTmuxOperationResult.Code.TMUX_MISSING) {
+                    mActivity.showToast(mActivity.getString(R.string.title_ssh_persistence_tmux_missing), true);
+                } else if (!success) {
+                    mActivity.showToast(mActivity.getString(
+                        R.string.msg_ssh_persistence_create_failed,
+                        summarizeCommandResult(toCommandResult(result.commandResult))), true);
+                } else {
+                    mActivity.showToast(mActivity.getString(
+                        R.string.msg_ssh_persistence_created_connecting, result.displayName), false);
+                }
+                callback.onComplete(success);
+            }
+        );
+    }
+
+    public void connectTmuxSessionFromConfigTab(@Nullable String profileId,
+                                                @NonNull String tmuxSession,
+                                                @NonNull String displayName,
+                                                @NonNull ConfigActionCallback callback) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            callback.onComplete(false);
+            return;
+        }
+        SshLaunchConfig config = resolveSshLaunchConfig(profile);
+        if (config == null) {
+            callback.onComplete(false);
+            return;
+        }
+        TerminalSession anchorSession = mActivity.getCurrentSession();
+        mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_connecting_tmux, displayName), false);
+        mSshTmuxRuntimeEngine.connectToPersistentTmuxSession(
+            anchorSession,
+            config.sshCommand,
+            normalizeTmuxSessionName(tmuxSession),
+            displayName,
+            result -> {
+                boolean success = result.code == SshTmuxOperationResult.Code.SUCCESS;
+                if (!success) {
+                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_tmux_check_failed), true);
+                }
+                callback.onComplete(success);
+            }
+        );
+    }
+
+    public void destroyTmuxSessionFromConfigTab(@Nullable String profileId,
+                                                @NonNull String tmuxSession,
+                                                @NonNull ConfigActionCallback callback) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            callback.onComplete(false);
+            return;
+        }
+        SshLaunchConfig config = resolveSshLaunchConfig(profile);
+        if (config == null) {
+            callback.onComplete(false);
+            return;
+        }
+        String safeTmuxSession = normalizeTmuxSessionName(tmuxSession);
+        mSshTmuxRuntimeEngine.destroyRemoteTmuxSession(config.sshCommand, safeTmuxSession, safeTmuxSession, result -> {
+            boolean success = result.code == SshTmuxOperationResult.Code.SUCCESS;
+            if (result.code == SshTmuxOperationResult.Code.TMUX_MISSING) {
+                mActivity.showToast(mActivity.getString(R.string.title_ssh_persistence_tmux_missing), true);
+            } else if (!success) {
+                mActivity.showToast(mActivity.getString(
+                    R.string.msg_ssh_persistence_destroy_failed,
+                    summarizeCommandResult(toCommandResult(result.commandResult))), true);
+            } else {
+                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_destroyed, safeTmuxSession), false);
+            }
+            callback.onComplete(success);
+        });
+    }
+
     private void showDeleteSshProfileConfirmDialog(@NonNull SshProfile profile) {
+        showDeleteSshProfileConfirmDialog(profile, true);
+    }
+
+    private void showDeleteSshProfileConfirmDialog(@NonNull SshProfile profile, boolean reopenProfilesDialog) {
         new AlertDialog.Builder(mActivity)
             .setTitle(R.string.title_ssh_profile_delete_confirm)
             .setMessage(mActivity.getString(R.string.msg_ssh_profile_delete_confirm, profile.displayName))
@@ -792,13 +1080,19 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                     saveSshProfiles(profiles);
                     mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_deleted), false);
                 }
-                showSshProfilesDialog();
+                mActivity.notifyTerminalConfigTabDataChanged();
+                if (reopenProfilesDialog) showSshProfilesDialog();
             })
-            .setNegativeButton(android.R.string.cancel, (dialog, which) -> showSshProfilesDialog())
+            .setNegativeButton(android.R.string.cancel,
+                reopenProfilesDialog ? (dialog, which) -> showSshProfilesDialog() : null)
             .show();
     }
 
     private void showSshProfileEditorDialog(@Nullable SshProfile existing) {
+        showSshProfileEditorDialog(existing, true);
+    }
+
+    private void showSshProfileEditorDialog(@Nullable SshProfile existing, boolean reopenProfilesDialog) {
         final boolean isEdit = existing != null;
 
         ScrollView scrollView = new ScrollView(mActivity);
@@ -819,7 +1113,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             .setTitle(isEdit ? R.string.title_ssh_profile_edit : R.string.title_ssh_profile_add)
             .setView(scrollView)
             .setPositiveButton(R.string.action_ssh_profile_save, null)
-            .setNegativeButton(android.R.string.cancel, (d, which) -> showSshProfilesDialog())
+            .setNegativeButton(android.R.string.cancel,
+                reopenProfilesDialog ? (d, which) -> showSshProfilesDialog() : null)
             .create();
 
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
@@ -853,8 +1148,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
             saveSshProfiles(profiles);
             mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_saved), false);
+            mActivity.notifyTerminalConfigTabDataChanged();
             dialog.dismiss();
-            showSshProfilesDialog();
+            if (reopenProfilesDialog) showSshProfilesDialog();
         }));
         dialog.show();
     }
@@ -1658,6 +1954,28 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         for (com.termux.terminalsessionruntime.RemoteTmuxSessionInfo session : sessions) {
             converted.add(new RemoteTmuxSessionInfo(
                 session.name, session.displayName, session.windows, session.attached));
+        }
+        return converted;
+    }
+
+    @NonNull
+    private ArrayList<ConfigTmuxSessionItem> toConfigTmuxSessionItems(
+        @NonNull ArrayList<RemoteTmuxSessionInfo> sessions,
+        @Nullable String currentTmuxSession) {
+        ArrayList<ConfigTmuxSessionItem> converted = new ArrayList<>(sessions.size());
+        for (RemoteTmuxSessionInfo session : sessions) {
+            boolean isCurrent = !TextUtils.isEmpty(currentTmuxSession) && currentTmuxSession.equals(session.name);
+            String title = isCurrent
+                ? mActivity.getString(R.string.msg_ssh_persistence_current_badge) + " · " + session.displayName
+                : session.displayName;
+            String attached = mActivity.getString(session.attached
+                ? R.string.msg_ssh_persistence_tty_attached
+                : R.string.msg_ssh_persistence_tty_detached);
+            String summary = mActivity.getString(R.string.msg_ssh_persistence_tty_windows, session.windows) + "  ·  " + attached;
+            if (!TextUtils.equals(session.displayName, session.name)) {
+                summary = summary + "  ·  " + session.name;
+            }
+            converted.add(new ConfigTmuxSessionItem(session.name, title, summary, isCurrent));
         }
         return converted;
     }

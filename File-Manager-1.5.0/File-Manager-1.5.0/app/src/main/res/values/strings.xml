@@ -44,6 +44,9 @@
     <string name="manage_favorites">Manage favorites</string>
     <string name="go_to_favorite">Go to favorite</string>
     <string name="favorites_activity_placeholder">You can add frequently used folders to favorites for easy access from anywhere.</string>
+    <string name="favorite_remark_hint">Favorite remark</string>
+    <string name="favorite_remark_required">Remark is required</string>
+    <string name="favorite_remark_message">The remark will be shown as the title above the path in Core Navigator.</string>
 
     <!-- File Editor -->
     <string name="file_editor">File Editor</string>

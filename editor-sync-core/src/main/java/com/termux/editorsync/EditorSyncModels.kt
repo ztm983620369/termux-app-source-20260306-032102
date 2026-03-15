@@ -25,7 +25,9 @@ data class EditorSyncTarget(
     val mimeType: String? = null,
     val kind: EditorSyncTargetKind = EditorSyncTargetKind.LOCAL_FILE,
     val originPath: String? = null,
-    val originDisplayPath: String? = null
+    val originDisplayPath: String? = null,
+    val originModifiedMs: Long? = null,
+    val originSize: Long? = null
 ) {
     fun supportsSaving(): Boolean {
         return !readOnly && localPath.isNotBlank()

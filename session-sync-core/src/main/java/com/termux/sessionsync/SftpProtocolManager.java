@@ -265,7 +265,7 @@ public final class SftpProtocolManager {
                 return MaterializeResult.fail("\u4e0b\u8f7d\u5931\u8d25\uff1a\u65e0\u6cd5\u521b\u5efa\u672c\u5730\u7f13\u5b58\u76ee\u5f55\u3002");
             }
 
-            String localPath = withReconnectRetry(context, target.entry, channel -> {
+            MaterializeResult materialized = withReconnectRetry(context, target.entry, channel -> {
                 SftpATTRS attrs = channel.stat(target.remotePath);
                 if (attrs == null) {
                     throw new IllegalStateException("\u8fdc\u7aef\u6587\u4ef6\u4e0d\u5b58\u5728\u3002");
@@ -277,12 +277,16 @@ public final class SftpProtocolManager {
                 try (OutputStream outputStream = new FileOutputStream(targetFile, false)) {
                     channel.get(target.remotePath, outputStream);
                 }
-                return targetFile.getAbsolutePath();
+                return MaterializeResult.ok(
+                    targetFile.getAbsolutePath(),
+                    attrsModifiedMs(attrs),
+                    Math.max(0L, attrs.getSize())
+                );
             });
-            if (TextUtils.isEmpty(localPath)) {
+            if (materialized == null || TextUtils.isEmpty(materialized.localPath)) {
                 return MaterializeResult.fail("\u4e0b\u8f7d\u5931\u8d25\uff1a\u672a\u77e5\u9519\u8bef\u3002");
             }
-            return MaterializeResult.ok(localPath);
+            return materialized;
         } catch (Exception e) {
             clearSessionByEntry(target.entry);
             return MaterializeResult.fail("\u4e0b\u8f7d\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
@@ -370,11 +374,144 @@ public final class SftpProtocolManager {
             synchronized (mLock) {
                 clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(target.entry));
             }
+            cleanupVirtualArtifacts(context, target);
             String localPath = target.virtualRoot + ("/".equals(target.remotePath) ? "" : target.remotePath);
             return DeleteResult.ok(localPath);
         } catch (Exception e) {
             clearSessionByEntry(target.entry);
             return DeleteResult.fail("\u5220\u9664\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
+        }
+    }
+
+    @NonNull
+    public RenameResult renameVirtualPath(@NonNull Context context,
+                                          @Nullable String virtualPath,
+                                          @Nullable String newNameRaw) {
+        VirtualTarget target = resolveVirtualTarget(context, virtualPath);
+        if (target == null) {
+            return RenameResult.fail("\u91cd\u547d\u540d\u5931\u8d25\uff1a\u76ee\u6807\u4e0d\u662f\u6709\u6548\u7684 SFTP \u8def\u5f84\u3002");
+        }
+        if ("/".equals(target.remotePath)) {
+            return RenameResult.fail("\u91cd\u547d\u540d\u5931\u8d25\uff1a\u4e0d\u5141\u8bb8\u91cd\u547d\u540d\u8fdc\u7a0b\u6839\u76ee\u5f55\u3002");
+        }
+
+        String newName = newNameRaw == null ? "" : newNameRaw.trim();
+        if (TextUtils.isEmpty(newName)
+            || ".".equals(newName)
+            || "..".equals(newName)
+            || newName.contains("/")
+            || newName.contains("\\")) {
+            return RenameResult.fail("\u91cd\u547d\u540d\u5931\u8d25\uff1a\u65e0\u6548\u7684\u540d\u79f0\u3002");
+        }
+
+        String sourceRemotePath = normalizeRemotePath(target.remotePath);
+        String renamedRemotePath = joinRemotePath(parentRemotePath(sourceRemotePath), newName);
+        if (sourceRemotePath.equals(renamedRemotePath)) {
+            return RenameResult.fail("\u91cd\u547d\u540d\u5931\u8d25\uff1a\u65b0\u540d\u79f0\u4e0e\u539f\u540d\u79f0\u76f8\u540c\u3002");
+        }
+
+        try {
+            final String finalRenamedRemotePath = renamedRemotePath;
+            withReconnectRetry(context, target.entry, channel -> {
+                SftpATTRS sourceAttrs = channel.stat(sourceRemotePath);
+                if (sourceAttrs == null) {
+                    throw new IllegalStateException("\u8fdc\u7a0b\u6e90\u6587\u4ef6\u4e0d\u5b58\u5728\u3002");
+                }
+                try {
+                    SftpATTRS existing = channel.stat(finalRenamedRemotePath);
+                    if (existing != null) {
+                        throw new IllegalStateException("\u5df2\u5b58\u5728\u540c\u540d\u6587\u4ef6\u6216\u76ee\u5f55\u3002");
+                    }
+                } catch (SftpException e) {
+                    if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                        throw e;
+                    }
+                }
+                channel.rename(sourceRemotePath, finalRenamedRemotePath);
+                return null;
+            });
+            synchronized (mLock) {
+                clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(target.entry));
+            }
+            cleanupVirtualArtifacts(context, target);
+            cleanupVirtualArtifacts(context, target.entry, target.virtualRoot, renamedRemotePath);
+            String localPath = target.virtualRoot + ("/".equals(renamedRemotePath) ? "" : renamedRemotePath);
+            return RenameResult.ok(localPath);
+        } catch (Exception e) {
+            clearSessionByEntry(target.entry);
+            return RenameResult.fail("\u91cd\u547d\u540d\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
+        }
+    }
+
+    @NonNull
+    public MoveResult moveVirtualPaths(@NonNull Context context,
+                                       @NonNull List<String> sourceVirtualPaths,
+                                       @Nullable String destinationVirtualDir) {
+        if (sourceVirtualPaths.isEmpty()) {
+            return MoveResult.fail("\u79fb\u52a8\u5931\u8d25\uff1a\u672a\u9009\u62e9\u9700\u8981\u79fb\u52a8\u7684\u9879\u76ee\u3002");
+        }
+
+        VirtualTarget destination = resolveVirtualTarget(context, destinationVirtualDir);
+        if (destination == null) {
+            return MoveResult.fail("\u79fb\u52a8\u5931\u8d25\uff1a\u76ee\u6807\u4e0d\u662f\u6709\u6548\u7684 SFTP \u76ee\u5f55\u3002");
+        }
+
+        final ArrayList<VirtualTarget> sources = new ArrayList<>();
+        for (String sourceVirtualPath : sourceVirtualPaths) {
+            VirtualTarget source = resolveVirtualTarget(context, sourceVirtualPath);
+            if (source == null) {
+                return MoveResult.fail("\u79fb\u52a8\u5931\u8d25\uff1a\u9009\u4e2d\u9879\u76ee\u4e2d\u5305\u542b\u65e0\u6548\u7684 SFTP \u8def\u5f84\u3002");
+            }
+            if (!source.virtualRoot.equals(destination.virtualRoot)) {
+                return MoveResult.fail("\u79fb\u52a8\u5931\u8d25\uff1a\u6682\u4ec5\u652f\u6301\u5728\u540c\u4e00\u670d\u52a1\u5668\u4f1a\u8bdd\u5185\u79fb\u52a8\u3002");
+            }
+            if ("/".equals(source.remotePath)) {
+                return MoveResult.fail("\u79fb\u52a8\u5931\u8d25\uff1a\u4e0d\u5141\u8bb8\u79fb\u52a8\u8fdc\u7a0b\u6839\u76ee\u5f55\u3002");
+            }
+            sources.add(source);
+        }
+
+        final ArrayList<String> movedVirtualPaths = new ArrayList<>(sources.size());
+        try {
+            withReconnectRetry(context, destination.entry, channel -> {
+                SftpATTRS destinationAttrs = channel.stat(destination.remotePath);
+                if (destinationAttrs == null || !destinationAttrs.isDir()) {
+                    throw new IllegalStateException("\u8fdc\u7a0b\u76ee\u6807\u76ee\u5f55\u4e0d\u5b58\u5728\u6216\u4e0d\u53ef\u7528\u3002");
+                }
+                LinkedHashSet<String> reservedDestinations = new LinkedHashSet<>();
+                for (VirtualTarget source : sources) {
+                    String normalizedSource = normalizeRemotePath(source.remotePath);
+                    String normalizedDestinationDir = normalizeRemotePath(destination.remotePath);
+                    String desiredDestination = joinRemotePath(
+                        normalizedDestinationDir,
+                        normalizedSource.substring(normalizedSource.lastIndexOf('/') + 1)
+                    );
+
+                    if (normalizedDestinationDir.equals(parentRemotePath(normalizedSource))) {
+                        movedVirtualPaths.add(source.virtualRoot + normalizedSource);
+                        continue;
+                    }
+                    if (normalizedDestinationDir.equals(normalizedSource)
+                        || normalizedDestinationDir.startsWith(normalizedSource + "/")) {
+                        throw new IllegalStateException("\u79fb\u52a8\u5931\u8d25\uff1a\u4e0d\u80fd\u5c06\u6587\u4ef6\u5939\u79fb\u52a8\u5230\u81ea\u8eab\u6216\u5b50\u76ee\u5f55\u4e0b\u3002");
+                    }
+
+                    String resolvedDestination = resolveUniqueRemotePath(channel, desiredDestination, reservedDestinations);
+                    channel.rename(normalizedSource, resolvedDestination);
+                    movedVirtualPaths.add(source.virtualRoot + resolvedDestination);
+                }
+                return null;
+            });
+            synchronized (mLock) {
+                clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(destination.entry));
+            }
+            for (VirtualTarget source : sources) {
+                cleanupVirtualArtifacts(context, source);
+            }
+            return MoveResult.ok(movedVirtualPaths);
+        } catch (Exception e) {
+            clearSessionByEntry(destination.entry);
+            return MoveResult.fail("\u79fb\u52a8\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
         }
     }
 
@@ -852,6 +989,104 @@ public final class SftpProtocolManager {
             "\u4e0a\u4f20\u5931\u8d25\uff1a" + reason);
         finishUploadJournal(context, journalHandle, result);
         return result;
+    }
+
+    @NonNull
+    public UploadResult uploadLocalFileToVirtualPath(@NonNull Context context,
+                                                     @NonNull String localFilePath,
+                                                     @NonNull String targetVirtualPath,
+                                                     long expectedRemoteModifiedMs,
+                                                     long expectedRemoteSize) {
+        if (TextUtils.isEmpty(localFilePath)) {
+            return UploadResult.fail("\u8986\u76d6\u5931\u8d25\uff1a\u672c\u5730\u6587\u4ef6\u8def\u5f84\u4e3a\u7a7a\u3002");
+        }
+
+        File localFile = new File(localFilePath);
+        if (!localFile.exists() || !localFile.isFile()) {
+            return UploadResult.fail("\u8986\u76d6\u5931\u8d25\uff1a\u672c\u5730\u6587\u4ef6\u4e0d\u5b58\u5728\u6216\u4e0d\u53ef\u7528\u3002");
+        }
+
+        VirtualTarget target = resolveVirtualTarget(context, targetVirtualPath);
+        if (target == null) {
+            return UploadResult.fail("\u8986\u76d6\u5931\u8d25\uff1a\u76ee\u6807\u4e0d\u662f\u6709\u6548\u7684 SFTP \u6587\u4ef6\u8def\u5f84\u3002");
+        }
+
+        String normalizedTarget = normalizeRemotePath(target.remotePath);
+        long localSize = Math.max(0L, localFile.length());
+        final long[] remoteModifiedMsHolder = new long[]{-1L};
+        final long[] remoteSizeHolder = new long[]{-1L};
+
+        try {
+            withReconnectRetry(context, target.entry, channel -> {
+                String parentRemotePath = parentRemotePath(normalizedTarget);
+                SftpATTRS parentAttrs = channel.stat(parentRemotePath);
+                if (parentAttrs == null || !parentAttrs.isDir()) {
+                    throw new IllegalStateException("\u8fdc\u7a0b\u76ee\u6807\u76ee\u5f55\u4e0d\u5b58\u5728\u6216\u4e0d\u53ef\u7528\u3002");
+                }
+
+                SftpATTRS currentTargetAttrs = null;
+                try {
+                    currentTargetAttrs = channel.stat(normalizedTarget);
+                } catch (SftpException e) {
+                    if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                        throw e;
+                    }
+                }
+                if (currentTargetAttrs != null && currentTargetAttrs.isDir()) {
+                    throw new IllegalStateException("\u8fdc\u7a0b\u76ee\u6807\u662f\u76ee\u5f55\uff0c\u65e0\u6cd5\u8986\u76d6\uff1a" + normalizedTarget);
+                }
+                if (!matchesExpectedRemoteVersion(
+                    expectedRemoteModifiedMs,
+                    expectedRemoteSize,
+                    currentTargetAttrs
+                )) {
+                    throw new IllegalStateException("\u8fdc\u7a0b\u6587\u4ef6\u5df2\u88ab\u5176\u4ed6\u7f16\u8f91\u6216\u66ff\u6362\uff0c\u8bf7\u5148\u91cd\u65b0\u6253\u5f00\u518d\u4fdd\u5b58\u3002");
+                }
+
+                String tempRemotePath = buildRemoteTransferTempPath(normalizedTarget);
+                deleteRemoteFileIfExists(channel, tempRemotePath);
+                try {
+                    try (InputStream inputStream = new FileInputStream(localFile);
+                         OutputStream outputStream = channel.put(tempRemotePath, ChannelSftp.OVERWRITE)) {
+                        byte[] buffer = new byte[16 * 1024];
+                        int read;
+                        while ((read = inputStream.read(buffer)) >= 0) {
+                            if (read == 0) continue;
+                            outputStream.write(buffer, 0, read);
+                        }
+                        outputStream.flush();
+                    }
+                    verifyUploadedTempFile(channel, tempRemotePath, localFile, localSize, null);
+                    replaceRemoteFile(channel, tempRemotePath, normalizedTarget);
+                } catch (Exception e) {
+                    try {
+                        deleteRemoteFileIfExists(channel, tempRemotePath);
+                    } catch (Throwable ignored) {
+                    }
+                    throw e;
+                }
+                SftpATTRS committedAttrs = channel.stat(normalizedTarget);
+                remoteModifiedMsHolder[0] = attrsModifiedMs(committedAttrs);
+                remoteSizeHolder[0] = committedAttrs == null ? -1L : Math.max(0L, committedAttrs.getSize());
+                return null;
+            });
+        } catch (Exception e) {
+            clearSessionByEntry(target.entry);
+            return UploadResult.fail("\u8986\u76d6\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
+        }
+
+        synchronized (mLock) {
+            clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(target.entry));
+        }
+        return UploadResult.okWithRemote(
+            1,
+            1,
+            0,
+            localSize,
+            localSize,
+            remoteModifiedMsHolder[0],
+            remoteSizeHolder[0]
+        );
     }
 
     @NonNull
@@ -2504,8 +2739,61 @@ public final class SftpProtocolManager {
         }
     }
 
+    private static void cleanupVirtualArtifacts(@NonNull Context context, @NonNull VirtualTarget target) {
+        cleanupVirtualArtifacts(context, target.entry, target.virtualRoot, target.remotePath);
+    }
+
+    private static void cleanupVirtualArtifacts(@NonNull Context context,
+                                                @NonNull SessionEntry entry,
+                                                @NonNull String virtualRoot,
+                                                @NonNull String remotePath) {
+        String normalizedRemote = normalizeRemotePath(remotePath);
+        String relative = normalizedRemote.startsWith("/") ? normalizedRemote.substring(1) : normalizedRemote;
+        File cacheRoot = new File(FileRootResolver.resolveCacheRoot(context, entry));
+        File cacheFile = TextUtils.isEmpty(relative) ? cacheRoot : new File(cacheRoot, relative);
+        deleteDirectoryContents(cacheFile);
+
+        String localVirtualPath = virtualRoot + ("/".equals(normalizedRemote) ? "" : normalizedRemote);
+        deleteDirectoryContents(new File(localVirtualPath));
+    }
+
     private static boolean isCancelledMessage(@Nullable String messageCn) {
         return !TextUtils.isEmpty(messageCn) && messageCn.contains("\u5df2\u53d6\u6d88");
+    }
+
+    static long attrsModifiedMs(@Nullable SftpATTRS attrs) {
+        if (attrs == null) return -1L;
+        return Math.max(0L, ((long) attrs.getMTime()) * 1000L);
+    }
+
+    static boolean matchesExpectedRemoteVersion(long expectedRemoteModifiedMs,
+                                                long expectedRemoteSize,
+                                                long actualModifiedMs,
+                                                long actualSize) {
+        if (expectedRemoteModifiedMs < 0L && expectedRemoteSize < 0L) {
+            return true;
+        }
+        if (actualModifiedMs < 0L && actualSize < 0L) {
+            return false;
+        }
+        if (expectedRemoteModifiedMs >= 0L && actualModifiedMs >= 0L && expectedRemoteModifiedMs != actualModifiedMs) {
+            return false;
+        }
+        if (expectedRemoteSize >= 0L && actualSize >= 0L && expectedRemoteSize != actualSize) {
+            return false;
+        }
+        return true;
+    }
+
+    static boolean matchesExpectedRemoteVersion(long expectedRemoteModifiedMs,
+                                                long expectedRemoteSize,
+                                                @Nullable SftpATTRS actualAttrs) {
+        return matchesExpectedRemoteVersion(
+            expectedRemoteModifiedMs,
+            expectedRemoteSize,
+            actualAttrs == null ? -1L : attrsModifiedMs(actualAttrs),
+            actualAttrs == null ? -1L : Math.max(0L, actualAttrs.getSize())
+        );
     }
 
     @NonNull
@@ -3780,23 +4068,29 @@ public final class SftpProtocolManager {
         public final boolean success;
         @NonNull
         public final String localPath;
+        public final long remoteModifiedMs;
+        public final long remoteSize;
         @NonNull
         public final String messageCn;
 
-        private MaterializeResult(boolean success, @NonNull String localPath, @NonNull String messageCn) {
+        private MaterializeResult(boolean success, @NonNull String localPath,
+                                  long remoteModifiedMs, long remoteSize,
+                                  @NonNull String messageCn) {
             this.success = success;
             this.localPath = localPath;
+            this.remoteModifiedMs = remoteModifiedMs;
+            this.remoteSize = remoteSize;
             this.messageCn = messageCn;
         }
 
         @NonNull
-        static MaterializeResult ok(@NonNull String localPath) {
-            return new MaterializeResult(true, localPath, "");
+        static MaterializeResult ok(@NonNull String localPath, long remoteModifiedMs, long remoteSize) {
+            return new MaterializeResult(true, localPath, remoteModifiedMs, remoteSize, "");
         }
 
         @NonNull
         static MaterializeResult fail(@NonNull String messageCn) {
-            return new MaterializeResult(false, "", messageCn);
+            return new MaterializeResult(false, "", -1L, -1L, messageCn);
         }
     }
 
@@ -3845,6 +4139,54 @@ public final class SftpProtocolManager {
         @NonNull
         static DeleteResult fail(@NonNull String messageCn) {
             return new DeleteResult(false, "", messageCn);
+        }
+    }
+
+    public static final class RenameResult {
+        public final boolean success;
+        @NonNull
+        public final String virtualPath;
+        @NonNull
+        public final String messageCn;
+
+        private RenameResult(boolean success, @NonNull String virtualPath, @NonNull String messageCn) {
+            this.success = success;
+            this.virtualPath = virtualPath;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static RenameResult ok(@NonNull String virtualPath) {
+            return new RenameResult(true, virtualPath, "");
+        }
+
+        @NonNull
+        static RenameResult fail(@NonNull String messageCn) {
+            return new RenameResult(false, "", messageCn);
+        }
+    }
+
+    public static final class MoveResult {
+        public final boolean success;
+        @NonNull
+        public final ArrayList<String> movedVirtualPaths;
+        @NonNull
+        public final String messageCn;
+
+        private MoveResult(boolean success, @NonNull ArrayList<String> movedVirtualPaths, @NonNull String messageCn) {
+            this.success = success;
+            this.movedVirtualPaths = movedVirtualPaths;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static MoveResult ok(@NonNull ArrayList<String> movedVirtualPaths) {
+            return new MoveResult(true, movedVirtualPaths, "");
+        }
+
+        @NonNull
+        static MoveResult fail(@NonNull String messageCn) {
+            return new MoveResult(false, new ArrayList<>(), messageCn);
         }
     }
 
@@ -3991,6 +4333,8 @@ public final class SftpProtocolManager {
         public final int failedFiles;
         public final long totalBytes;
         public final long uploadedBytes;
+        public final long remoteModifiedMs;
+        public final long remoteSize;
         @NonNull
         public final String messageCn;
 
@@ -4001,12 +4345,26 @@ public final class SftpProtocolManager {
                              long totalBytes,
                              long uploadedBytes,
                              @NonNull String messageCn) {
+            this(success, totalFiles, uploadedFiles, failedFiles, totalBytes, uploadedBytes, messageCn, -1L, -1L);
+        }
+
+        private UploadResult(boolean success,
+                             int totalFiles,
+                             int uploadedFiles,
+                             int failedFiles,
+                             long totalBytes,
+                             long uploadedBytes,
+                             @NonNull String messageCn,
+                             long remoteModifiedMs,
+                             long remoteSize) {
             this.success = success;
             this.totalFiles = Math.max(0, totalFiles);
             this.uploadedFiles = Math.max(0, uploadedFiles);
             this.failedFiles = Math.max(0, failedFiles);
             this.totalBytes = Math.max(0L, totalBytes);
             this.uploadedBytes = Math.max(0L, uploadedBytes);
+            this.remoteModifiedMs = remoteModifiedMs;
+            this.remoteSize = remoteSize;
             this.messageCn = messageCn;
         }
 
@@ -4015,6 +4373,14 @@ public final class SftpProtocolManager {
                                long totalBytes, long uploadedBytes) {
             return new UploadResult(true, totalFiles, uploadedFiles, failedFiles,
                 totalBytes, uploadedBytes, "");
+        }
+
+        @NonNull
+        static UploadResult okWithRemote(int totalFiles, int uploadedFiles, int failedFiles,
+                                         long totalBytes, long uploadedBytes,
+                                         long remoteModifiedMs, long remoteSize) {
+            return new UploadResult(true, totalFiles, uploadedFiles, failedFiles,
+                totalBytes, uploadedBytes, "", remoteModifiedMs, remoteSize);
         }
 
         @NonNull

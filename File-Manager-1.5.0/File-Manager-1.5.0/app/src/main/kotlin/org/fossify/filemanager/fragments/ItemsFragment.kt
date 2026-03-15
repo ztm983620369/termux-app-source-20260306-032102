@@ -374,20 +374,22 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                         if (result.success) {
                             val localPath = result.localPath
                             val extension = item.name.substringAfterLast('.', "").lowercase().ifBlank { null }
-                            clickedPath(
-                                localPath,
-                                FileOpenRequest(
-                                    path = localPath,
-                                    displayName = item.name,
+                                clickedPath(
+                                    localPath,
+                                    FileOpenRequest(
+                                        path = localPath,
+                                        displayName = item.name,
                                     readOnly = false,
                                     extension = extension,
-                                    mimeType = localPath.getMimeType(),
-                                    originType = FileOpenRequest.ORIGIN_SFTP_VIRTUAL,
-                                    originPath = item.path,
-                                    originDisplayPath = sessionFileCoordinator.getDisplayPath(context!!, item.path)
+                                        mimeType = localPath.getMimeType(),
+                                        originType = FileOpenRequest.ORIGIN_SFTP_VIRTUAL,
+                                        originPath = item.path,
+                                        originDisplayPath = sessionFileCoordinator.getDisplayPath(context!!, item.path),
+                                        originModifiedMs = result.remoteModifiedMs.takeIf { it >= 0L },
+                                        originSize = result.remoteSize.takeIf { it >= 0L }
+                                    )
                                 )
-                            )
-                        } else {
+                            } else {
                             activity?.toast(result.messageCn)
                         }
                     }

@@ -24,6 +24,7 @@ const val SHOW_TABS = "show_tabs"
 const val WAS_STORAGE_ANALYSIS_TAB_ADDED = "was_storage_analysis_tab_added"
 const val PREFER_TERMUX_STORAGE = "prefer_termux_storage"
 const val SHOW_TERMUX_SYSTEM_DIRS = "show_termux_system_dirs"
+const val FAVORITE_REMARKS = "favorite_remarks"
 
 // open as
 const val OPEN_AS_DEFAULT = 0

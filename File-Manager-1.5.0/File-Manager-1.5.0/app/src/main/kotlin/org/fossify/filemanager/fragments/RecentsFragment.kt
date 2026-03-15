@@ -209,7 +209,9 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
                         mimeType = localPath.getMimeType(),
                         originType = entry.originType,
                         originPath = remoteOriginPath,
-                        originDisplayPath = originDisplayPath
+                        originDisplayPath = originDisplayPath,
+                        originModifiedMs = result.remoteModifiedMs.takeIf { it >= 0L },
+                        originSize = result.remoteSize.takeIf { it >= 0L }
                     )
                 )
             }

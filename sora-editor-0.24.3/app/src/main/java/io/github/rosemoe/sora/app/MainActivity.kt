@@ -601,6 +601,11 @@ class MainActivity : AppCompatActivity() {
         applyPendingBridgeRequests("bridge.onResume")
     }
 
+    override fun onPause() {
+        flushPendingEditsOnVisibilityLoss()
+        super.onPause()
+    }
+
     /**
      * Generate new [SearchOptions] for text searching in editor
      */
@@ -725,8 +730,54 @@ class MainActivity : AppCompatActivity() {
             mimeType = request.mimeType,
             kind = if (isRemote) EditorSyncTargetKind.SFTP_VIRTUAL_FILE else EditorSyncTargetKind.LOCAL_FILE,
             originPath = request.originPath,
-            originDisplayPath = request.originDisplayPath
+            originDisplayPath = request.originDisplayPath,
+            originModifiedMs = request.originModifiedMs,
+            originSize = request.originSize
         )
+    }
+
+    private fun flushPendingEditsOnVisibilityLoss() {
+        if (!documentSync.isAutoSaveEnabled()) return
+        if (!documentSync.canSave() || !documentSync.hasUnsavedChanges()) return
+        lifecycleScope.launch {
+            val result = documentSync.flushPendingSave(EditorSaveTrigger.AUTO)
+            if (!result.ok) {
+                Log.w(TAG, "Auto-save flush on pause failed: ${result.error ?: "unknown"}")
+            }
+        }
+    }
+
+    private fun proceedOpenRequest(req: FileOpenRequest, source: String, bridgeSequence: Long?) {
+        lastOpenRequest = req
+        if (source.startsWith("bridge")) {
+            val seq = bridgeSequence ?: FileOpenBridge.getLatestSequence()
+            if (seq > lastBridgeSeqHandled) {
+                lastBridgeSeqHandled = seq
+            }
+        }
+        title = req.displayName ?: File(req.path).name
+        openDiskFile(req)
+    }
+
+    private fun showUnsavedChangesDialogForOpen(req: FileOpenRequest, source: String, bridgeSequence: Long?) {
+        AlertDialog.Builder(this)
+            .setTitle("未保存更改")
+            .setMessage("当前文件还有未保存修改，切换前需要先处理。")
+            .setPositiveButton("保存并切换") { _, _ ->
+                lifecycleScope.launch {
+                    val save = documentSync.saveNow(EditorSaveTrigger.MANUAL)
+                    if (save.ok) {
+                        proceedOpenRequest(req, source, bridgeSequence)
+                    } else {
+                        toast("切换前保存失败：${save.error ?: "unknown"}")
+                    }
+                }
+            }
+            .setNeutralButton("放弃更改") { _, _ ->
+                proceedOpenRequest(req, source, bridgeSequence)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     private fun applyPendingBridgeRequests(source: String) {
@@ -740,15 +791,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyOpenRequest(req: FileOpenRequest?, source: String, bridgeSequence: Long? = null) {
         if (req == null) return
-        lastOpenRequest = req
-        if (source.startsWith("bridge")) {
-            val seq = bridgeSequence ?: FileOpenBridge.getLatestSequence()
-            if (seq > lastBridgeSeqHandled) {
-                lastBridgeSeqHandled = seq
+        val normalizedPath = req.path.trim()
+        if (normalizedPath.isEmpty()) return
+        val normalizedReq = if (normalizedPath == req.path) req else req.copy(path = normalizedPath)
+        val currentPath = lastOpenRequest?.path?.trim()?.takeIf { it.isNotEmpty() }
+        val hasProtectedDirtyDocument = currentPath != null && documentSync.canSave() && documentSync.hasUnsavedChanges()
+        if (hasProtectedDirtyDocument) {
+            if (documentSync.isAutoSaveEnabled()) {
+                lifecycleScope.launch {
+                    val save = documentSync.flushPendingSave(EditorSaveTrigger.AUTO)
+                    if (save.ok) {
+                        proceedOpenRequest(normalizedReq, source, bridgeSequence)
+                    } else {
+                        toast("切换前自动保存失败：${save.error ?: "unknown"}")
+                    }
+                }
+            } else {
+                showUnsavedChangesDialogForOpen(normalizedReq, source, bridgeSequence)
             }
+            return
         }
-        title = req.displayName ?: File(req.path).name
-        openDiskFile(req)
+        proceedOpenRequest(normalizedReq, source, bridgeSequence)
     }
 
     private val fileOpenListener = FileOpenListener { event: FileOpenEvent ->

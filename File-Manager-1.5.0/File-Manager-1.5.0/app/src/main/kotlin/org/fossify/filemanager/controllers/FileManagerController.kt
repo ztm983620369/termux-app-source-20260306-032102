@@ -45,7 +45,6 @@ import org.fossify.commons.extensions.handleHiddenFolderPasswordProtection
 import org.fossify.commons.extensions.hasOTGConnected
 import org.fossify.commons.extensions.hasPermission
 import org.fossify.commons.extensions.hideKeyboard
-import org.fossify.commons.extensions.humanizePath
 import org.fossify.commons.extensions.internalStoragePath
 import org.fossify.commons.extensions.isPathOnOTG
 import org.fossify.commons.extensions.isPathOnSD
@@ -83,6 +82,7 @@ import org.fossify.filemanager.fragments.ItemsFragment
 import org.fossify.filemanager.fragments.MyViewPagerFragment
 import org.fossify.filemanager.fragments.RecentsFragment
 import org.fossify.filemanager.fragments.StorageFragment
+import org.fossify.filemanager.helpers.FavoriteHelper
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
 import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
@@ -402,15 +402,15 @@ class FileManagerController(
         val currentFragment = getCurrentFragment() ?: return
         val isCreateDocumentIntent = intentProvider().action == Intent.ACTION_CREATE_DOCUMENT
         val currentViewType = activity.config.getFolderViewType(currentFragment.currentPath)
-        val favorites = activity.config.favorites
         val isNavigator = currentFragment is ItemsFragment && NavigatorFolderHelper.isNavigatorPath(activity, currentFragment.currentPath)
+        val isFavorite = activity.config.isFavorite(currentFragment.currentPath)
 
         binding.mainMenu.requireToolbar().menu.apply {
             findItem(R.id.sort).isVisible = currentFragment is ItemsFragment && !isNavigator
             findItem(R.id.change_view_type).isVisible = currentFragment !is StorageFragment
 
-            findItem(R.id.add_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && !favorites.contains(currentFragment.currentPath)
-            findItem(R.id.remove_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && favorites.contains(currentFragment.currentPath)
+            findItem(R.id.add_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && !isFavorite
+            findItem(R.id.remove_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && isFavorite
             findItem(R.id.go_to_favorite).isVisible = currentFragment is ItemsFragment
             findItem(R.id.go_to_favorite).title = NavigatorFolderHelper.displayTitle()
 
@@ -793,8 +793,11 @@ class FileManagerController(
     }
 
     private fun addFavorite() {
-        activity.config.addFavorite(getCurrentFragment()!!.currentPath)
-        refreshMenuItems()
+        FavoriteHelper.showAddFavoriteDialog(activity) { remark ->
+            activity.config.addFavorite(getCurrentFragment()!!.currentPath, remark)
+            refreshMenuItems()
+            getCurrentFragment()?.refreshFragment()
+        }
     }
 
     private fun removeFavorite() {

@@ -10,13 +10,16 @@ import android.graphics.drawable.Icon
 import android.graphics.drawable.LayerDrawable
 import android.net.Uri
 import android.os.SystemClock
+import android.text.InputType
 import android.util.TypedValue
 import android.view.LayoutInflater
 import android.view.Menu
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
@@ -76,6 +79,7 @@ import org.fossify.commons.extensions.getTimeFormat
 import org.fossify.commons.extensions.handleDeletePasswordProtection
 import org.fossify.commons.extensions.hasOTGConnected
 import org.fossify.commons.extensions.highlightTextPart
+import org.fossify.commons.extensions.isAValidFilename
 import org.fossify.commons.extensions.isPathOnOTG
 import org.fossify.commons.extensions.isRestrictedSAFOnlyRoot
 import org.fossify.commons.extensions.relativizeWith
@@ -108,6 +112,7 @@ import org.fossify.filemanager.extensions.setLastModified
 import org.fossify.filemanager.extensions.sharePaths
 import org.fossify.filemanager.extensions.toggleItemVisibility
 import org.fossify.filemanager.extensions.tryOpenPathIntent
+import org.fossify.filemanager.helpers.FavoriteHelper
 import org.fossify.filemanager.helpers.OPEN_AS_AUDIO
 import org.fossify.filemanager.helpers.OPEN_AS_IMAGE
 import org.fossify.filemanager.helpers.OPEN_AS_OTHER
@@ -216,6 +221,8 @@ class ItemsAdapter(
             R.id.cab_rename -> displayRenameDialog()
             R.id.cab_properties -> showProperties()
             R.id.cab_share -> shareFiles()
+            R.id.add_favorite -> addSelectedItemToFavorites()
+            R.id.remove_favorite -> removeSelectedItemFromFavorites()
             R.id.cab_hide -> toggleFileVisibility(true)
             R.id.cab_unhide -> toggleFileVisibility(false)
             R.id.cab_create_shortcut -> createShortcut()
@@ -381,6 +388,14 @@ class ItemsAdapter(
         if (isOneItemSelected()) {
             actions.add(LongPressAction(R.id.cab_copy_path, activity.getString(R.string.copy_path)))
             actions.add(LongPressAction(R.id.cab_create_shortcut, activity.getString(R.string.create_shortcut)))
+            val selectedPath = getFirstSelectedItemPath()
+            val isFavorite = config.isFavorite(selectedPath)
+            actions.add(
+                LongPressAction(
+                    if (isFavorite) R.id.remove_favorite else R.id.add_favorite,
+                    activity.getString(if (isFavorite) R.string.remove_from_favorites else R.string.add_to_favorites)
+                )
+            )
         }
         if (isOneFileSelected()) {
             actions.add(LongPressAction(R.id.cab_open_with, activity.getString(R.string.open_with)))
@@ -414,6 +429,8 @@ class ItemsAdapter(
             R.id.cab_rename,
             R.id.cab_properties,
             R.id.cab_share,
+            R.id.add_favorite,
+            R.id.remove_favorite,
             R.id.cab_create_shortcut,
             R.id.cab_copy_path,
             R.id.cab_set_as,
@@ -426,6 +443,20 @@ class ItemsAdapter(
 
             else -> false
         }
+    }
+
+    private fun addSelectedItemToFavorites() {
+        if (!isOneItemSelected()) return
+        val selectedPath = getFirstSelectedItemPath()
+        FavoriteHelper.showAddFavoriteDialog(activity) { remark ->
+            config.addFavorite(selectedPath, remark)
+            listener?.refreshFragment()
+        }
+    }
+
+    private fun removeSelectedItemFromFavorites() {
+        if (!isOneItemSelected()) return
+        config.removeFavorite(getFirstSelectedItemPath())
     }
 
     private fun confirmSelection() {
@@ -445,6 +476,19 @@ class ItemsAdapter(
     private fun displayRenameDialog() {
         val fileDirItems = getSelectedFileDirItems()
         val paths = fileDirItems.asSequence().map { it.path }.toMutableList() as ArrayList<String>
+        val remotePaths = paths.filter { sessionFileCoordinator.isVirtualPath(activity, it) }
+        if (remotePaths.isNotEmpty()) {
+            if (remotePaths.size != paths.size) {
+                activity.toast("请分开选择本地与服务器项目后再重命名。")
+                return
+            }
+            if (paths.size != 1) {
+                activity.toast("服务器项目当前仅支持单个重命名。")
+                return
+            }
+            showRemoteRenameDialog(paths.first())
+            return
+        }
         when {
             paths.size == 1 -> {
                 val oldPath = paths.first()
@@ -673,13 +717,6 @@ class ItemsAdapter(
             return
         }
 
-        if (sourceSnapshot.selectionKind == TransferSelectionKind.REMOTE_ONLY && !isCopyOperation) {
-            val message = "服务器项目暂不支持“移动到”，请使用“复制到”。"
-            transferWorkflowStateMachine.markFailed(message)
-            activity.toast(message)
-            return
-        }
-
         val firstFile = files[0]
         val source = firstFile.getParentPath()
         val defaultTargetPath = resolveTransferPickerStartPath(source)
@@ -719,6 +756,10 @@ class ItemsAdapter(
 
                 is TransferExecutionPlan.RemoteTransfer -> {
                     runVirtualRelay(files, executionPlan.destinationVirtualPath)
+                }
+
+                is TransferExecutionPlan.RemoteMove -> {
+                    runVirtualMove(files, executionPlan.destinationVirtualPath)
                 }
 
                 is TransferExecutionPlan.LocalCopy -> {
@@ -1770,25 +1811,146 @@ class ItemsAdapter(
             }
 
             val files = ArrayList<FileDirItem>(selectedKeys.size)
-            val positions = ArrayList<Int>()
 
             ensureBackgroundThread {
                 selectedKeys.forEach { key ->
-                    config.removeFavorite(getItemWithKey(key)?.path ?: "")
                     val position = listItems.indexOfFirst { it.path.hashCode() == key }
                     if (position != -1) {
-                        positions.add(position)
                         files.add(listItems[position])
                     }
                 }
 
-                positions.sortDescending()
                 activity.runOnUiThread {
-                    removeSelectedItems(positions)
                     listener?.deleteFiles(files)
-                    positions.forEach {
-                        listItems.removeAt(it)
+                    finishActMode()
+                }
+            }
+        }
+    }
+
+    private fun showRemoteRenameDialog(virtualPath: String) {
+        val currentName = virtualPath.getFilenameFromPath()
+        val input = EditText(activity).apply {
+            setText(currentName)
+            setSelectAllOnFocus(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            val dotAt = if (activity.getIsPathDirectory(virtualPath)) -1 else currentName.lastIndexOf('.')
+            val selectionEnd = if (dotAt > 0) dotAt else currentName.length
+            post { setSelection(0, selectionEnd.coerceAtLeast(0)) }
+        }
+        val container = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            val pad = (16 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad, pad, 0)
+            addView(
+                input,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+
+        val dialog = activity.getAlertDialogBuilder()
+            .setTitle(R.string.rename)
+            .setView(container)
+            .setPositiveButton(R.string.ok, null)
+            .setNegativeButton(R.string.cancel, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+                val newName = input.text.toString().trim()
+                if (newName.isEmpty()) {
+                    activity.toast(R.string.empty_name)
+                    return@setOnClickListener
+                }
+                if (!newName.isAValidFilename()) {
+                    activity.toast(R.string.invalid_name)
+                    return@setOnClickListener
+                }
+                ensureBackgroundThread {
+                    val result = sessionFileCoordinator.renameVirtualPath(
+                        activity.applicationContext,
+                        virtualPath,
+                        newName
+                    )
+                    activity.runOnUiThread {
+                        if (result.success) {
+                            config.moveFavorite(virtualPath, result.virtualPath)
+                            listener?.refreshFragment()
+                            finishActMode()
+                            dialog.dismiss()
+                        } else {
+                            activity.toast(result.messageCn)
+                        }
                     }
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun runVirtualMove(remoteItems: List<FileDirItem>, destinationVirtualPath: String) {
+        if (activity.isDestroyed || activity.isFinishing) {
+            return
+        }
+        if (!transferWorkflowStateMachine.begin(TransferWorkflowStage.RELAYING, "remote-move")) {
+            activity.toast("已有传输任务在执行，请稍后再试。")
+            return
+        }
+
+        val progressDialog = activity.getAlertDialogBuilder()
+            .setTitle("服务器移动中")
+            .setMessage("正在准备移动...")
+            .setCancelable(false)
+            .create()
+        try {
+            progressDialog.show()
+        } catch (_: Exception) {
+        }
+
+        ensureBackgroundThread {
+            try {
+                val remotePaths = ArrayList<String>(remoteItems.size)
+                remoteItems.forEach { remotePaths.add(it.path) }
+                activity.runOnUiThread {
+                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                        progressDialog.setMessage("正在移动 ${remotePaths.size} 项...")
+                    }
+                }
+                val result = sessionFileCoordinator.moveVirtualPaths(
+                    activity.applicationContext,
+                    remotePaths,
+                    destinationVirtualPath
+                )
+                activity.runOnUiThread {
+                    dismissTransferDialog(progressDialog)
+                    if (result.success) {
+                        transferWorkflowStateMachine.markCompleted("remote-move:${result.movedVirtualPaths.size}")
+                        remoteItems.forEachIndexed { index, file ->
+                            val newPath = result.movedVirtualPaths.getOrNull(index) ?: return@forEachIndexed
+                            config.moveFavorite(file.path, newPath)
+                        }
+                        activity.toast("服务器移动完成：${result.movedVirtualPaths.size} 项")
+                        if (result.movedVirtualPaths.isNotEmpty()) {
+                            listener?.openPathAndHighlight(destinationVirtualPath, ArrayList(result.movedVirtualPaths))
+                        } else {
+                            listener?.refreshFragment()
+                        }
+                    } else {
+                        transferWorkflowStateMachine.markFailed(result.messageCn)
+                        activity.toast(result.messageCn)
+                        listener?.refreshFragment()
+                    }
+                    finishActMode()
+                }
+            } catch (t: Throwable) {
+                activity.runOnUiThread {
+                    dismissTransferDialog(progressDialog)
+                    val message = t.message?.trim().orEmpty().ifEmpty { "服务器移动异常，请重试。" }
+                    transferWorkflowStateMachine.markFailed(message)
+                    activity.toast(message)
+                    listener?.refreshFragment()
                 }
             }
         }
@@ -1988,8 +2150,13 @@ class ItemsAdapter(
                     if (isListViewType) fontSize else smallerFontSize
                 )
 
+                val isNavigatorSubtitle = listItem.children < 0
                 itemDetails?.setTextColor(textColor)
-                itemDetails?.setTextSize(TypedValue.COMPLEX_UNIT_PX, fontSize)
+                itemDetails?.alpha = if (isNavigatorSubtitle) 0.5f else 0.6f
+                itemDetails?.setTextSize(
+                    TypedValue.COMPLEX_UNIT_PX,
+                    if (isNavigatorSubtitle) smallerFontSize else fontSize
+                )
 
                 itemDate?.setTextColor(textColor)
                 itemDate?.setTextSize(TypedValue.COMPLEX_UNIT_PX, smallerFontSize)

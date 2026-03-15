@@ -103,10 +103,42 @@ class EditorDocumentSyncManager(
         }
     }
 
+    fun hasUnsavedChanges(): Boolean = stateFlow.value.hasUnsavedChanges
+
+    fun canSave(): Boolean = stateFlow.value.canSave
+
     suspend fun saveNow(trigger: EditorSaveTrigger): EditorSaveResult {
         val deferred = CompletableDeferred<EditorSaveResult>()
         requestSave(trigger, deferred)
         return deferred.await()
+    }
+
+    suspend fun flushPendingSave(trigger: EditorSaveTrigger = EditorSaveTrigger.AUTO): EditorSaveResult {
+        val snapshot = stateFlow.value
+        val target = currentTarget
+        if (!snapshot.canSave || target?.supportsSaving() != true) {
+            return EditorSaveResult(
+                ok = false,
+                targetPath = target?.localPath,
+                bytes = 0,
+                elapsedMs = 0L,
+                error = "path not writable",
+                trigger = trigger,
+                remoteSynced = false
+            )
+        }
+        if (!snapshot.hasUnsavedChanges) {
+            return EditorSaveResult(
+                ok = true,
+                targetPath = target.localPath,
+                bytes = 0,
+                elapsedMs = 0L,
+                error = null,
+                trigger = trigger,
+                remoteSynced = target.supportsRemoteSync()
+            )
+        }
+        return saveNow(trigger)
     }
 
     suspend fun runSelfTest(): String {
@@ -327,36 +359,21 @@ class EditorDocumentSyncManager(
 
     private fun syncRemoteTarget(target: EditorSyncTarget) {
         val originPath = target.originPath ?: return
-        val originParent = File(originPath).parent ?: originPath.substringBeforeLast('/', "")
-        val destinationVirtualDir = if (originParent.isBlank()) "/" else originParent
-        val remoteName = File(originPath).name
         val localFile = File(target.localPath)
-
-        val uploadFile = if (localFile.name == remoteName) {
-            localFile
-        } else {
-            val stagingDir = File(context.cacheDir, "editor-sync-stage").apply { mkdirs() }
-            val stagingFile = File(stagingDir, remoteName)
-            localFile.copyTo(stagingFile, overwrite = true)
-            stagingFile
+        val result = sessionFileCoordinator.uploadLocalFileToVirtualPath(
+            context.applicationContext,
+            localFile.absolutePath,
+            originPath,
+            target.originModifiedMs ?: -1L,
+            target.originSize ?: -1L
+        )
+        if (!result.success || result.uploadedFiles <= 0) {
+            throw IllegalStateException(result.messageCn.ifBlank { "remote sync failed" })
         }
-
-        try {
-            val result = sessionFileCoordinator.uploadLocalPathsToVirtual(
-                context.applicationContext,
-                listOf(uploadFile.absolutePath),
-                destinationVirtualDir,
-                null,
-                null
-            )
-            if (!result.success || result.uploadedFiles <= 0) {
-                throw IllegalStateException(result.messageCn.ifBlank { "remote sync failed" })
-            }
-        } finally {
-            if (uploadFile.absolutePath != localFile.absolutePath) {
-                runCatching { uploadFile.delete() }
-            }
-        }
+        currentTarget = target.copy(
+            originModifiedMs = result.remoteModifiedMs.takeIf { it >= 0L } ?: target.originModifiedMs,
+            originSize = result.remoteSize.takeIf { it >= 0L } ?: target.originSize
+        )
     }
 
     private fun publish(snapshot: EditorSyncSnapshot) {

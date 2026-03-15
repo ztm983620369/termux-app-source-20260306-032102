@@ -10,6 +10,12 @@
         android:layout_height="0dp"
         android:layout_weight="1">
 
+        <FrameLayout
+            android:id="@+id/terminal_session_page_config_container"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone" />
+
         <com.termux.view.TerminalView
             android:id="@+id/terminal_session_page_terminal_view"
             android:layout_width="match_parent"

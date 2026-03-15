@@ -13,6 +13,7 @@ import org.fossify.filemanager.R
 import org.fossify.filemanager.adapters.ManageFavoritesAdapter
 import org.fossify.filemanager.databinding.ActivityFavoritesBinding
 import org.fossify.filemanager.extensions.config
+import org.fossify.filemanager.helpers.FavoriteHelper
 
 class FavoritesActivity : SimpleActivity(), RefreshRecyclerViewListener {
     private val binding by viewBinding(ActivityFavoritesBinding::inflate)
@@ -71,8 +72,10 @@ class FavoritesActivity : SimpleActivity(), RefreshRecyclerViewListener {
 
     private fun addFavorite() {
         FilePickerDialog(this, pickFile = false, showHidden = config.shouldShowHidden(), canAddShowHiddenButton = true) {
-            config.addFavorite(it)
-            updateFavorites()
+            FavoriteHelper.showAddFavoriteDialog(this) { remark ->
+                config.addFavorite(it, remark)
+                updateFavorites()
+            }
         }
     }
 }

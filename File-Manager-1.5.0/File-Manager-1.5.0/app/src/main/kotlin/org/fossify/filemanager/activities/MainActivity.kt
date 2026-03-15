@@ -38,7 +38,6 @@ import org.fossify.commons.extensions.handleHiddenFolderPasswordProtection
 import org.fossify.commons.extensions.hasOTGConnected
 import org.fossify.commons.extensions.hasPermission
 import org.fossify.commons.extensions.hideKeyboard
-import org.fossify.commons.extensions.humanizePath
 import org.fossify.commons.extensions.internalStoragePath
 import org.fossify.commons.extensions.isPathOnOTG
 import org.fossify.commons.extensions.isPathOnSD
@@ -75,6 +74,7 @@ import org.fossify.filemanager.fragments.ItemsFragment
 import org.fossify.filemanager.fragments.MyViewPagerFragment
 import org.fossify.filemanager.fragments.RecentsFragment
 import org.fossify.filemanager.fragments.StorageFragment
+import org.fossify.filemanager.helpers.FavoriteHelper
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
 import org.fossify.filemanager.helpers.RootHelpers
 import org.fossify.filemanager.helpers.SessionSelfTestRunner
@@ -229,13 +229,14 @@ class MainActivity : SimpleActivity(), FileManagerHost {
         val currentViewType = config.getFolderViewType(currentFragment.currentPath)
         val favorites = config.favorites
         val isInTermux = isInTermuxStorage(currentFragment.currentPath)
+        val isFavorite = config.isFavorite(currentFragment.currentPath)
 
         binding.mainMenu.requireToolbar().menu.apply {
             findItem(R.id.sort).isVisible = currentFragment is ItemsFragment
             findItem(R.id.change_view_type).isVisible = currentFragment !is StorageFragment
 
-            findItem(R.id.add_favorite).isVisible = currentFragment is ItemsFragment && !favorites.contains(currentFragment.currentPath)
-            findItem(R.id.remove_favorite).isVisible = currentFragment is ItemsFragment && favorites.contains(currentFragment.currentPath)
+            findItem(R.id.add_favorite).isVisible = currentFragment is ItemsFragment && !isFavorite
+            findItem(R.id.remove_favorite).isVisible = currentFragment is ItemsFragment && isFavorite
             findItem(R.id.go_to_favorite).isVisible = currentFragment is ItemsFragment && favorites.isNotEmpty()
 
             findItem(R.id.toggle_filename).isVisible = currentViewType == VIEW_TYPE_GRID && currentFragment !is StorageFragment
@@ -695,8 +696,11 @@ class MainActivity : SimpleActivity(), FileManagerHost {
     }
 
     private fun addFavorite() {
-        config.addFavorite(getCurrentFragment()!!.currentPath)
-        refreshMenuItems()
+        FavoriteHelper.showAddFavoriteDialog(this) { remark ->
+            config.addFavorite(getCurrentFragment()!!.currentPath, remark)
+            refreshMenuItems()
+            getCurrentFragment()?.refreshFragment()
+        }
     }
 
     private fun removeFavorite() {
@@ -741,7 +745,7 @@ class MainActivity : SimpleActivity(), FileManagerHost {
         var currFavoriteIndex = -1
 
         favorites.forEachIndexed { index, path ->
-            val visiblePath = humanizePath(path).replace("/", " / ")
+            val visiblePath = FavoriteHelper.displayTitle(this, path)
             items.add(RadioItem(index, visiblePath, path))
             if (path == getCurrentFragment()!!.currentPath) {
                 currFavoriteIndex = index

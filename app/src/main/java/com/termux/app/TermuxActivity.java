@@ -46,6 +46,7 @@ import com.termux.app.terminal.TermuxActivityRootView;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
 import com.termux.app.terminal.TermuxTerminalSessionSurfaceBridge;
 import com.termux.app.terminal.TermuxTerminalTopBarBridge;
+import com.termux.app.terminal.TerminalConfigCanvasView;
 import com.termux.app.terminal.io.TermuxTerminalExtraKeys;
 import com.google.android.material.bottomnavigation.BottomNavigationView;
 import com.termux.shared.activities.ReportActivity;
@@ -90,6 +91,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -245,16 +248,30 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private static final String ARG_BOTTOM_NAV_TAB = "bottom_nav_tab";
     private static final String ARG_BOTTOM_NAV_PRIMARY_TAB = "bottom_nav_primary_tab";
     private static final String ARG_BOTTOM_NAV_FIXED_ON_IME = "bottom_nav_fixed_on_ime";
+    private static final String ARG_TERMINAL_CONFIG_TAB_SELECTED = "terminal_config_tab_selected";
+    private static final String ARG_TERMINAL_CONFIG_TMUX_PROFILE_ID = "terminal_config_tmux_profile_id";
+    private static final String ARG_TERMINAL_CONFIG_TMUX_PROFILE_TITLE = "terminal_config_tmux_profile_title";
+    private static final String ARG_TERMINAL_CONFIG_TMUX_TARGET_LABEL = "terminal_config_tmux_target_label";
+    private static final String ARG_TERMINAL_CONFIG_TMUX_ERROR = "terminal_config_tmux_error";
+    private static final String ARG_TERMINAL_CONFIG_TMUX_LOADING = "terminal_config_tmux_loading";
+    private static final String ARG_TERMINAL_CONFIG_TMUX_MISSING = "terminal_config_tmux_missing";
+    private static final String ARG_TERMINAL_CONFIG_TMUX_SESSIONS_JSON = "terminal_config_tmux_sessions_json";
+    private static final String ARG_TERMINAL_SOFT_KEYBOARD_VISIBILITY_KNOWN = "terminal_soft_keyboard_visibility_known";
+    private static final String ARG_TERMINAL_SOFT_KEYBOARD_VISIBLE = "terminal_soft_keyboard_visible";
+    private static final String ARG_TERMINAL_RESTORE_FOCUS = "terminal_restore_focus";
 
     private static final int TAB_EDITOR = 2;
     private static final int TAB_FILES = 3;
     private static final int TAB_TERMINAL = 4;
     private static final long EDITOR_TRANSITION_DURATION_MS = 180L;
+    private static final long TERMINAL_CONFIG_TRANSITION_DURATION_MS = 180L;
 
     private static final String LOG_TAG = "TermuxActivity";
     private BottomNavigationView mBottomNavigationView;
     private View mEditorPage;
     private View mFilesPage;
+    private View mTerminalConfigPage;
+    private TerminalConfigCanvasView mTerminalConfigCanvasView;
     private int mBottomNavTab = TAB_TERMINAL;
     private int mBottomNavPrimaryTab = TAB_TERMINAL;
     private int mNonTerminalWindowBackgroundColor = 0xFFFFFFFF;
@@ -268,6 +285,20 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private boolean mTerminalSessionSurfaceHasSnapshot = false;
     private boolean mBottomNavFixedOnImeEnabled = true;
     private boolean mSessionListUiUpdateScheduled = false;
+    private boolean mTerminalConfigTabSelected = false;
+    private boolean mPendingDisableTerminalConfigPage = false;
+    @Nullable private TerminalSession mLastSelectedTerminalSession;
+    private boolean mTerminalSoftKeyboardVisibilityKnown = false;
+    private boolean mTerminalSoftKeyboardVisible = false;
+    private boolean mTerminalRestoreFocus = false;
+    @Nullable private String mTerminalConfigTmuxProfileId;
+    @Nullable private String mTerminalConfigTmuxProfileTitle;
+    @Nullable private String mTerminalConfigTmuxTargetLabel;
+    @Nullable private String mTerminalConfigTmuxErrorMessage;
+    private boolean mTerminalConfigTmuxLoading = false;
+    private boolean mTerminalConfigTmuxMissing = false;
+    @NonNull
+    private final ArrayList<TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem> mTerminalConfigTmuxSessions = new ArrayList<>();
     private int mSessionUiBatchDepth = 0;
     private boolean mSessionUiUpdatePendingInBatch = false;
     private final Runnable mCoalescedSessionListUiUpdate = () -> {
@@ -301,6 +332,19 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mIsActivityRecreated = savedInstanceState.getBoolean(ARG_ACTIVITY_RECREATED, false);
         if (savedInstanceState != null)
             mBottomNavFixedOnImeEnabled = savedInstanceState.getBoolean(ARG_BOTTOM_NAV_FIXED_ON_IME, true);
+        if (savedInstanceState != null) {
+            mTerminalConfigTabSelected = savedInstanceState.getBoolean(ARG_TERMINAL_CONFIG_TAB_SELECTED, false);
+            mTerminalSoftKeyboardVisibilityKnown = savedInstanceState.getBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBILITY_KNOWN, false);
+            mTerminalSoftKeyboardVisible = savedInstanceState.getBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBLE, false);
+            mTerminalRestoreFocus = savedInstanceState.getBoolean(ARG_TERMINAL_RESTORE_FOCUS, false);
+            mTerminalConfigTmuxProfileId = savedInstanceState.getString(ARG_TERMINAL_CONFIG_TMUX_PROFILE_ID);
+            mTerminalConfigTmuxProfileTitle = savedInstanceState.getString(ARG_TERMINAL_CONFIG_TMUX_PROFILE_TITLE);
+            mTerminalConfigTmuxTargetLabel = savedInstanceState.getString(ARG_TERMINAL_CONFIG_TMUX_TARGET_LABEL);
+            mTerminalConfigTmuxErrorMessage = savedInstanceState.getString(ARG_TERMINAL_CONFIG_TMUX_ERROR);
+            mTerminalConfigTmuxLoading = savedInstanceState.getBoolean(ARG_TERMINAL_CONFIG_TMUX_LOADING, false);
+            mTerminalConfigTmuxMissing = savedInstanceState.getBoolean(ARG_TERMINAL_CONFIG_TMUX_MISSING, false);
+            restoreTerminalConfigTmuxSessions(savedInstanceState.getString(ARG_TERMINAL_CONFIG_TMUX_SESSIONS_JSON));
+        }
 
         // Delete ReportInfo serialized object files from cache older than 14 days
         ReportActivity.deleteReportInfoFilesOlderThanXDays(this, 14, false);
@@ -374,6 +418,18 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         ensureEditorLaunchers();
 
         setupBottomNavigation(savedInstanceState);
+        if (mTerminalConfigTabSelected) {
+            getWindow().getDecorView().post(() -> {
+                if (mBottomNavTab == TAB_TERMINAL) {
+                    selectTerminalConfigTab();
+                    if (mTerminalConfigTmuxProfileId != null && mTerminalConfigTmuxLoading) {
+                        openTerminalConfigTmuxProfile(mTerminalConfigTmuxProfileId);
+                    } else {
+                        refreshTerminalConfigPageData();
+                    }
+                }
+            });
+        }
         handleUiNavigationIntentIfNeeded(getIntent());
         handleEditorIntentIfNeeded(getIntent());
         FileOpenBridge.addListener(this);
@@ -457,6 +513,24 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
         if (mIsInvalidState) return;
 
+        boolean shouldRestoreTerminalFocus =
+            mBottomNavTab == TAB_TERMINAL && !mTerminalConfigTabSelected &&
+                mTerminalSoftKeyboardVisibilityKnown && mTerminalSoftKeyboardVisible && mTerminalRestoreFocus;
+        applyTerminalProgrammaticFocusPolicy(shouldRestoreTerminalFocus);
+
+        if (mTermuxTerminalViewClient != null) {
+            if (mBottomNavTab == TAB_TERMINAL && mTerminalConfigTabSelected) {
+                mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(false, false);
+            } else if (mBottomNavTab == TAB_TERMINAL && mTerminalSoftKeyboardVisibilityKnown) {
+                mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(
+                    mTerminalSoftKeyboardVisible,
+                    shouldRestoreTerminalFocus
+                );
+            } else {
+                mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(null, true);
+            }
+        }
+
         if (mTermuxTerminalSessionActivityClient != null)
             mTermuxTerminalSessionActivityClient.onResume();
 
@@ -507,6 +581,24 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             ensureFileManagerInitialized();
             resumeFileManager(false);
         }
+        if (mBottomNavTab == TAB_TERMINAL && mTerminalConfigTabSelected && mTerminalSessionSurfaceView != null) {
+            ensureTerminalConfigInitialized();
+            refreshTerminalConfigPageData();
+            mTerminalSessionSurfaceView.setConfigPageEnabled(true);
+            mTerminalSessionSurfaceView.setCurrentConfigPage(false);
+            if (mTerminalConfigCanvasView != null) {
+                mTerminalConfigCanvasView.requestFocus();
+            }
+            KeyboardUtils.hideSoftKeyboard(this, getWindow().getDecorView());
+            if (mTerminalConfigTmuxProfileId != null && mTerminalConfigTmuxLoading) {
+                openTerminalConfigTmuxProfile(mTerminalConfigTmuxProfileId);
+            }
+        } else if (mBottomNavTab == TAB_TERMINAL && !shouldRestoreTerminalFocus) {
+            EditText textInputView = findViewById(R.id.terminal_surface_text_input);
+            if (textInputView != null) textInputView.clearFocus();
+            if (mTerminalView != null) mTerminalView.clearFocus();
+            KeyboardUtils.hideSoftKeyboard(this, getWindow().getDecorView());
+        }
 
         mIsOnResumeAfterOnCreate = false;
     }
@@ -529,6 +621,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     @Override
     protected void onPause() {
+        snapshotTerminalUiStateBeforePause();
         super.onPause();
 
         if (mIsInvalidState) return;
@@ -801,6 +894,17 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         savedInstanceState.putInt(ARG_BOTTOM_NAV_TAB, mBottomNavTab);
         savedInstanceState.putInt(ARG_BOTTOM_NAV_PRIMARY_TAB, mBottomNavPrimaryTab);
         savedInstanceState.putBoolean(ARG_BOTTOM_NAV_FIXED_ON_IME, mBottomNavFixedOnImeEnabled);
+        savedInstanceState.putBoolean(ARG_TERMINAL_CONFIG_TAB_SELECTED, mTerminalConfigTabSelected);
+        savedInstanceState.putBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBILITY_KNOWN, mTerminalSoftKeyboardVisibilityKnown);
+        savedInstanceState.putBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBLE, mTerminalSoftKeyboardVisible);
+        savedInstanceState.putBoolean(ARG_TERMINAL_RESTORE_FOCUS, mTerminalRestoreFocus);
+        savedInstanceState.putString(ARG_TERMINAL_CONFIG_TMUX_PROFILE_ID, mTerminalConfigTmuxProfileId);
+        savedInstanceState.putString(ARG_TERMINAL_CONFIG_TMUX_PROFILE_TITLE, mTerminalConfigTmuxProfileTitle);
+        savedInstanceState.putString(ARG_TERMINAL_CONFIG_TMUX_TARGET_LABEL, mTerminalConfigTmuxTargetLabel);
+        savedInstanceState.putString(ARG_TERMINAL_CONFIG_TMUX_ERROR, mTerminalConfigTmuxErrorMessage);
+        savedInstanceState.putBoolean(ARG_TERMINAL_CONFIG_TMUX_LOADING, mTerminalConfigTmuxLoading);
+        savedInstanceState.putBoolean(ARG_TERMINAL_CONFIG_TMUX_MISSING, mTerminalConfigTmuxMissing);
+        savedInstanceState.putString(ARG_TERMINAL_CONFIG_TMUX_SESSIONS_JSON, serializeTerminalConfigTmuxSessions());
 
         if (mFileManagerController != null) {
             Bundle fileManagerState = new Bundle();
@@ -876,6 +980,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 resumeFileManager(true);
             });
         }
+
+        mTerminalConfigPage = findViewById(R.id.page_terminal_config);
     }
 
     public void setBottomNavigationFixedOnImeEnabled(boolean enabled) {
@@ -914,6 +1020,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             boolean showFiles = tab == TAB_FILES || (keepPreviousVisibleWhileEnteringEditor && previousTab == TAB_FILES);
             mFilesPage.setVisibility(showFiles ? View.VISIBLE : View.GONE);
         }
+        updateTerminalConfigPageVisibility();
 
         if (mEditorPage != null) {
             mEditorPage.animate().cancel();
@@ -1237,6 +1344,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private void pauseEditor() {
         if (mEditorController != null) {
+            mEditorController.onPause();
             mEditorController.getRootView().clearFocus();
         }
     }
@@ -1527,6 +1635,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 @Override
                 public void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser) {
                     if (session == null || mTermuxTerminalSessionActivityClient == null) return;
+                    mLastSelectedTerminalSession = session;
 
                     mSurfaceSelectionDispatchInProgress = true;
                     try {
@@ -1534,6 +1643,16 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                     } finally {
                         mSurfaceSelectionDispatchInProgress = false;
                     }
+                    refreshTerminalTopBar();
+                    if (mPendingDisableTerminalConfigPage && mTerminalSessionSurfaceView != null) {
+                        mPendingDisableTerminalConfigPage = false;
+                        mTerminalSessionSurfaceView.setConfigPageEnabled(false);
+                    }
+                }
+
+                @Override
+                public void onConfigPageSelected(boolean fromUser) {
+                    mTerminalConfigTabSelected = true;
                     refreshTerminalTopBar();
                 }
 
@@ -1588,21 +1707,21 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 new TerminalTopBarController.Callbacks() {
                     @Override
                     public void onAddSession() {
-                        if (mTermuxTerminalSessionActivityClient != null) {
-                            mTermuxTerminalSessionActivityClient.addNewLocalSession(null);
-                            refreshTerminalTopBar();
-                        }
+                        openTerminalConfigTab();
                     }
 
                     @Override
                     public void onAddLongPress() {
-                        if (mTermuxTerminalSessionActivityClient != null) {
-                            mTermuxTerminalSessionActivityClient.showPlusLongPressPanel();
-                        }
+                        // No-op. "+" now always opens the dedicated config tab.
                     }
 
                     @Override
                     public void onSelectSession(int index) {
+                        if (mTerminalConfigTabSelected) {
+                            mTerminalConfigTabSelected = false;
+                            mPendingDisableTerminalConfigPage = true;
+                            refreshTerminalTopBar();
+                        }
                         if (mTerminalSessionSurfaceView != null) {
                             mTerminalSessionSurfaceView.setCurrentSessionPage(index, true);
                         } else if (mTermuxTerminalSessionActivityClient != null) {
@@ -1641,7 +1760,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                             service.removeTermuxSession(terminalSession);
                         }
 
-                        if (sessionsSize <= 1) {
+                        if (sessionsSize <= 1 && !mTerminalConfigTabSelected) {
                             finishActivityIfNotFinishing();
                         }
                     }
@@ -1667,14 +1786,327 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mTerminalTopBarController == null || mTermuxTerminalTopBarBridge == null) return;
         TermuxTerminalTopBarBridge.Snapshot snapshot = mTermuxTerminalTopBarBridge.capture();
         mTerminalTopBarController.render(snapshot.models);
+        mTerminalTopBarView.setAddButtonSelected(mTerminalConfigTabSelected);
         mTermuxTerminalTopBarBridge.publish(snapshot);
     }
 
     private void refreshTerminalSessionSurface() {
         if (mTerminalSessionSurfaceView == null || mTermuxTerminalSessionSurfaceBridge == null) return;
+        updateTerminalConfigPageVisibility();
         TermuxTerminalSessionSurfaceBridge.Snapshot snapshot = mTermuxTerminalSessionSurfaceBridge.capture();
         mTerminalSessionSurfaceHasSnapshot = !snapshot.items.isEmpty();
-        mTerminalSessionSurfaceView.submitSessions(snapshot.items, snapshot.selectedIndex, false);
+        int selectedIndex = snapshot.selectedIndex;
+        if ((mTerminalConfigTabSelected || mPendingDisableTerminalConfigPage) && mTerminalSessionSurfaceView.isConfigPageEnabled()) {
+            int configIndex = mTerminalSessionSurfaceView.getConfigPageIndex();
+            if (configIndex >= 0) {
+                selectedIndex = configIndex;
+            }
+        }
+        mTerminalSessionSurfaceView.submitSessions(snapshot.items, selectedIndex, false);
+    }
+
+    private boolean ensureTerminalConfigInitialized() {
+        if (mTerminalSessionSurfaceView == null) return false;
+        if (mTerminalConfigCanvasView != null) return true;
+        mTerminalConfigCanvasView = new TerminalConfigCanvasView(this);
+        mTerminalConfigCanvasView.setCallbacks(new TerminalConfigCanvasView.Callbacks() {
+            @Override
+            public void onCreateLocalSession() {
+                if (mTermuxTerminalSessionActivityClient == null) return;
+                mTermuxTerminalSessionActivityClient.addNewLocalSession(null);
+                dismissTerminalConfigTab(false);
+            }
+
+            @Override
+            public void onAddSshProfile() {
+                if (mTermuxTerminalSessionActivityClient != null) {
+                    mTermuxTerminalSessionActivityClient.openProfileEditorFromConfigTab(null);
+                }
+            }
+
+            @Override
+            public void onConnectProfile(@NonNull String profileId) {
+                if (mTermuxTerminalSessionActivityClient == null) return;
+                mTermuxTerminalSessionActivityClient.connectProfileFromConfigTab(profileId);
+                dismissTerminalConfigTab(false);
+            }
+
+            @Override
+            public void onEditProfile(@NonNull String profileId) {
+                if (mTermuxTerminalSessionActivityClient != null) {
+                    mTermuxTerminalSessionActivityClient.openProfileEditorFromConfigTab(profileId);
+                }
+            }
+
+            @Override
+            public void onOpenTmuxProfile(@NonNull String profileId) {
+                openTerminalConfigTmuxProfile(profileId);
+            }
+
+            @Override
+            public void onBackFromTmux() {
+                clearTerminalConfigTmuxState();
+                refreshTerminalConfigPageData();
+            }
+
+            @Override
+            public void onRefreshTmux(@NonNull String profileId) {
+                openTerminalConfigTmuxProfile(profileId);
+            }
+
+            @Override
+            public void onInstallTmux(@NonNull String profileId) {
+                if (mTermuxTerminalSessionActivityClient == null) return;
+                mTermuxTerminalSessionActivityClient.installTmuxFromConfigTab(profileId, success -> {
+                    if (success) {
+                        openTerminalConfigTmuxProfile(profileId);
+                    }
+                });
+            }
+
+            @Override
+            public void onCreateTmux(@NonNull String profileId) {
+                if (mTermuxTerminalSessionActivityClient == null) return;
+                TextInputDialogUtils.textInput(
+                    TermuxActivity.this,
+                    R.string.title_ssh_persistence_new_session,
+                    null,
+                    R.string.action_ssh_persistence_new,
+                    text -> mTermuxTerminalSessionActivityClient.createTmuxSessionFromConfigTab(
+                        profileId,
+                        text,
+                        success -> {
+                            if (success) dismissTerminalConfigTab(false);
+                            else openTerminalConfigTmuxProfile(profileId);
+                        }
+                    ),
+                    android.R.string.cancel,
+                    text -> openTerminalConfigTmuxProfile(profileId),
+                    -1,
+                    null,
+                    null
+                );
+            }
+
+            @Override
+            public void onConnectTmux(@NonNull String profileId, @NonNull String tmuxSession, @NonNull String displayName) {
+                if (mTermuxTerminalSessionActivityClient == null) return;
+                mTermuxTerminalSessionActivityClient.connectTmuxSessionFromConfigTab(
+                    profileId,
+                    tmuxSession,
+                    displayName,
+                    success -> {
+                        if (success) dismissTerminalConfigTab(false);
+                        else openTerminalConfigTmuxProfile(profileId);
+                    }
+                );
+            }
+
+            @Override
+            public void onDestroyTmux(@NonNull String profileId, @NonNull String tmuxSession) {
+                if (mTermuxTerminalSessionActivityClient == null) return;
+                mTermuxTerminalSessionActivityClient.destroyTmuxSessionFromConfigTab(
+                    profileId,
+                    tmuxSession,
+                    success -> openTerminalConfigTmuxProfile(profileId)
+                );
+            }
+
+            @Override
+            public void onDeleteProfile(@NonNull String profileId) {
+                if (mTermuxTerminalSessionActivityClient != null) {
+                    mTermuxTerminalSessionActivityClient.deleteProfileFromConfigTab(profileId);
+                }
+            }
+
+            @Override
+            public void onCloseConfigTab() {
+                dismissTerminalConfigTab(true);
+            }
+        });
+        mTerminalSessionSurfaceView.setConfigPageView(mTerminalConfigCanvasView);
+        return true;
+    }
+
+    private void updateTerminalConfigPageVisibility() {
+        if (mTerminalSessionSurfaceView == null) return;
+        boolean enable = mBottomNavTab == TAB_TERMINAL && (mTerminalConfigTabSelected || mPendingDisableTerminalConfigPage);
+        mTerminalSessionSurfaceView.setConfigPageEnabled(enable);
+    }
+
+    private void refreshTerminalConfigPageData() {
+        if (!ensureTerminalConfigInitialized() || mTermuxTerminalSessionActivityClient == null) return;
+        mTerminalConfigCanvasView.setProfiles(mTermuxTerminalSessionActivityClient.getConfigProfileItems());
+        mTerminalConfigCanvasView.setTmuxState(
+            mTerminalConfigTmuxProfileId,
+            mTerminalConfigTmuxProfileTitle,
+            mTerminalConfigTmuxTargetLabel,
+            mTerminalConfigTmuxLoading,
+            mTerminalConfigTmuxMissing,
+            mTerminalConfigTmuxErrorMessage,
+            mTerminalConfigTmuxSessions
+        );
+        updateTerminalConfigPageVisibility();
+    }
+
+    public void notifyTerminalConfigTabDataChanged() {
+        runOnUiThread(this::refreshTerminalConfigPageData);
+    }
+
+    private void clearTerminalConfigTmuxState() {
+        mTerminalConfigTmuxProfileId = null;
+        mTerminalConfigTmuxProfileTitle = null;
+        mTerminalConfigTmuxTargetLabel = null;
+        mTerminalConfigTmuxErrorMessage = null;
+        mTerminalConfigTmuxLoading = false;
+        mTerminalConfigTmuxMissing = false;
+        mTerminalConfigTmuxSessions.clear();
+    }
+
+    @NonNull
+    private String serializeTerminalConfigTmuxSessions() {
+        JSONArray array = new JSONArray();
+        for (TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem item : mTerminalConfigTmuxSessions) {
+            if (item == null) continue;
+            JSONObject object = new JSONObject();
+            try {
+                object.put("name", item.name);
+                object.put("title", item.title);
+                object.put("summary", item.summary);
+                object.put("current", item.current);
+                array.put(object);
+            } catch (Exception ignored) {
+            }
+        }
+        return array.toString();
+    }
+
+    private void restoreTerminalConfigTmuxSessions(@Nullable String rawJson) {
+        mTerminalConfigTmuxSessions.clear();
+        if (TextUtils.isEmpty(rawJson)) return;
+        try {
+            JSONArray array = new JSONArray(rawJson);
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject object = array.optJSONObject(i);
+                if (object == null) continue;
+                String name = object.optString("name", "").trim();
+                if (name.isEmpty()) continue;
+                String title = object.optString("title", name);
+                String summary = object.optString("summary", "");
+                boolean current = object.optBoolean("current", false);
+                mTerminalConfigTmuxSessions.add(
+                    new TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem(name, title, summary, current)
+                );
+            }
+        } catch (Exception ignored) {
+            mTerminalConfigTmuxSessions.clear();
+        }
+    }
+
+    private void snapshotTerminalUiStateBeforePause() {
+        if (mBottomNavTab != TAB_TERMINAL) {
+            mTerminalSoftKeyboardVisibilityKnown = true;
+            mTerminalSoftKeyboardVisible = false;
+            mTerminalRestoreFocus = false;
+            return;
+        }
+        if (mTerminalConfigTabSelected) {
+            mTerminalSoftKeyboardVisibilityKnown = true;
+            mTerminalSoftKeyboardVisible = false;
+            mTerminalRestoreFocus = false;
+            return;
+        }
+        EditText textInputView = findViewById(R.id.terminal_surface_text_input);
+        boolean textInputViewHasFocus = textInputView != null && textInputView.hasFocus();
+        boolean terminalViewHasFocus = mTerminalView != null && mTerminalView.hasFocus();
+        mTerminalSoftKeyboardVisibilityKnown = true;
+        mTerminalSoftKeyboardVisible = !KeyboardUtils.areDisableSoftKeyboardFlagsSet(this) &&
+            KeyboardUtils.isSoftKeyboardVisible(this);
+        mTerminalRestoreFocus = mTerminalSoftKeyboardVisible && (textInputViewHasFocus || terminalViewHasFocus);
+    }
+
+    private void applyTerminalProgrammaticFocusPolicy(boolean allowProgrammaticFocus) {
+        if (mTermuxTerminalViewClient != null) {
+            mTermuxTerminalViewClient.setProgrammaticTerminalFocusAllowed(allowProgrammaticFocus);
+        }
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.setProgrammaticFocusAllowed(allowProgrammaticFocus);
+        }
+    }
+
+    private void openTerminalConfigTmuxProfile(@NonNull String profileId) {
+        if (mTermuxTerminalSessionActivityClient == null) return;
+        mTerminalConfigTmuxProfileId = profileId;
+        mTerminalConfigTmuxProfileTitle = profileId;
+        mTerminalConfigTmuxTargetLabel = "";
+        mTerminalConfigTmuxErrorMessage = null;
+        mTerminalConfigTmuxMissing = false;
+        mTerminalConfigTmuxLoading = true;
+        mTerminalConfigTmuxSessions.clear();
+        refreshTerminalConfigPageData();
+        mTermuxTerminalSessionActivityClient.loadTmuxSnapshotForConfigTab(profileId, snapshot -> runOnUiThread(() -> {
+            if (!TextUtils.equals(profileId, mTerminalConfigTmuxProfileId)) return;
+            mTerminalConfigTmuxProfileId = snapshot.profileId;
+            mTerminalConfigTmuxProfileTitle = snapshot.profileTitle;
+            mTerminalConfigTmuxTargetLabel = snapshot.targetLabel;
+            mTerminalConfigTmuxErrorMessage = snapshot.errorMessage;
+            mTerminalConfigTmuxMissing = snapshot.tmuxMissing;
+            mTerminalConfigTmuxLoading = false;
+            mTerminalConfigTmuxSessions.clear();
+            mTerminalConfigTmuxSessions.addAll(snapshot.sessions);
+            refreshTerminalConfigPageData();
+        }));
+    }
+
+    private void selectTerminalConfigTab() {
+        if (!ensureTerminalConfigInitialized()) return;
+        if (mBottomNavTab != TAB_TERMINAL) {
+            setBottomNavTab(TAB_TERMINAL);
+        }
+        activateTerminalConfigTabState();
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.setCurrentConfigPage(true);
+        }
+    }
+
+    private void openTerminalConfigTab() {
+        selectTerminalConfigTab();
+    }
+
+    private void activateTerminalConfigTabState() {
+        if (!ensureTerminalConfigInitialized()) return;
+        mTerminalConfigTabSelected = true;
+        mPendingDisableTerminalConfigPage = false;
+        applyTerminalProgrammaticFocusPolicy(false);
+        if (mTerminalSessionSurfaceView != null) {
+            mTerminalSessionSurfaceView.setConfigPageEnabled(true);
+        }
+        refreshTerminalConfigPageData();
+        refreshTerminalTopBar();
+
+        EditText textInputView = findViewById(R.id.terminal_surface_text_input);
+        if (textInputView != null) textInputView.clearFocus();
+        if (mTerminalView != null) mTerminalView.clearFocus();
+        if (mTerminalConfigCanvasView != null) {
+            mTerminalConfigCanvasView.requestFocus();
+        }
+        if (getWindow() != null) {
+            KeyboardUtils.hideSoftKeyboard(this, getWindow().getDecorView());
+        }
+    }
+
+    private void dismissTerminalConfigTab(boolean returnToPreviousTerminal) {
+        if (!mTerminalConfigTabSelected) return;
+        mTerminalConfigTabSelected = false;
+        mPendingDisableTerminalConfigPage = true;
+        applyTerminalProgrammaticFocusPolicy(false);
+        refreshTerminalTopBar();
+        if (returnToPreviousTerminal) {
+            TerminalSession currentSession = getCurrentSession();
+            if (currentSession != null && mTerminalSessionSurfaceView != null) {
+                requestTerminalSessionSurfaceSelection(currentSession, true);
+            }
+        }
     }
 
     public void applyTerminalSessionSurfaceSettings() {
@@ -1709,6 +2141,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     public void onTerminalSessionSelectionCommitted(@Nullable TerminalSession session) {
         if (session == null || mSurfaceSelectionDispatchInProgress) return;
+        mLastSelectedTerminalSession = session;
         refreshTerminalSessionSurface();
         refreshTerminalTopBar();
     }
@@ -1870,14 +2303,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private void setNewSessionButtonView() {
         View newSessionButton = findViewById(R.id.new_session_button);
-        newSessionButton.setOnClickListener(v -> mTermuxTerminalSessionActivityClient.addNewSession(false, null));
-        newSessionButton.setOnLongClickListener(v -> {
-            TextInputDialogUtils.textInput(TermuxActivity.this, R.string.title_create_named_session, null,
-                R.string.action_create_named_session_confirm, text -> mTermuxTerminalSessionActivityClient.addNewSession(false, text),
-                R.string.action_new_session_failsafe, text -> mTermuxTerminalSessionActivityClient.addNewSession(true, text),
-                -1, null, null);
-            return true;
-        });
+        newSessionButton.setOnClickListener(v -> openTerminalConfigTab());
+        newSessionButton.setOnLongClickListener(null);
+        newSessionButton.setLongClickable(false);
     }
 
     private void setToggleKeyboardView() {
@@ -2281,13 +2709,19 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     public TerminalSession getCurrentSession() {
         if (mTerminalView != null) {
             TerminalSession currentSession = mTerminalView.getCurrentSession();
-            if (currentSession != null) return currentSession;
+            if (currentSession != null) {
+                mLastSelectedTerminalSession = currentSession;
+                return currentSession;
+            }
         }
         if (mTerminalSessionSurfaceView != null) {
             TerminalSession currentSession = mTerminalSessionSurfaceView.getCurrentSession();
-            if (currentSession != null) return currentSession;
+            if (currentSession != null) {
+                mLastSelectedTerminalSession = currentSession;
+                return currentSession;
+            }
         }
-        return null;
+        return mLastSelectedTerminalSession;
     }
 
     public TermuxAppSharedPreferences getPreferences() {

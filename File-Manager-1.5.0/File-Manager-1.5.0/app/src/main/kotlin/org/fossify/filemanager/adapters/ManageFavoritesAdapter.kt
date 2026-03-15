@@ -4,6 +4,7 @@ import android.view.*
 import android.widget.PopupMenu
 import org.fossify.commons.activities.BaseSimpleActivity
 import org.fossify.commons.adapters.MyRecyclerViewAdapter
+import org.fossify.commons.extensions.beGoneIf
 import org.fossify.commons.extensions.getPopupMenuTheme
 import org.fossify.commons.extensions.getProperTextColor
 import org.fossify.commons.extensions.setupViewBackground
@@ -12,6 +13,7 @@ import org.fossify.commons.views.MyRecyclerView
 import org.fossify.filemanager.R
 import org.fossify.filemanager.databinding.ItemManageFavoriteBinding
 import org.fossify.filemanager.extensions.config
+import org.fossify.filemanager.helpers.FavoriteHelper
 
 class ManageFavoritesAdapter(
     activity: BaseSimpleActivity, var favorites: ArrayList<String>, val listener: RefreshRecyclerViewListener?,
@@ -63,9 +65,15 @@ class ManageFavoritesAdapter(
     private fun setupView(view: View, favorite: String, isSelected: Boolean) {
         ItemManageFavoriteBinding.bind(view).apply {
             root.setupViewBackground(activity)
+            val hasRemark = config.getFavoriteRemark(favorite) != null
             manageFavoriteTitle.apply {
-                text = favorite
+                text = FavoriteHelper.displayTitle(activity, favorite)
                 setTextColor(activity.getProperTextColor())
+            }
+            manageFavoriteSubtitle.apply {
+                text = FavoriteHelper.displayPath(activity, favorite)
+                setTextColor(activity.getProperTextColor())
+                beGoneIf(!hasRemark)
             }
 
             manageFavoriteHolder.isSelected = isSelected
