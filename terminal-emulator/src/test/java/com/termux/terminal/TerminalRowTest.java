@@ -283,6 +283,40 @@ public class TerminalRowTest extends TestCase {
 		assertEquals(2, row.findStartOfColumn(2));
 	}
 
+	public void testCopyIntervalFastPathAscii() {
+		TerminalRow src = new TerminalRow(10, TextStyle.NORMAL);
+		TerminalRow dst = new TerminalRow(10, TextStyle.NORMAL);
+
+		for (int i = 0; i < 10; i++) {
+			src.setChar(i, 'A' + i, TextStyle.NORMAL);
+			dst.setChar(i, '.', TextStyle.NORMAL);
+		}
+
+		dst.copyInterval(src, 2, 8, 1);
+
+		// Expect: . C D E F G H . . .
+		assertEquals('.', dst.mText[0]);
+		assertEquals('C', dst.mText[1]);
+		assertEquals('D', dst.mText[2]);
+		assertEquals('E', dst.mText[3]);
+		assertEquals('F', dst.mText[4]);
+		assertEquals('G', dst.mText[5]);
+		assertEquals('H', dst.mText[6]);
+		assertEquals('.', dst.mText[7]);
+		assertEquals('.', dst.mText[8]);
+		assertEquals('.', dst.mText[9]);
+
+		// Overlapping self-copy should behave like memmove (System.arraycopy does).
+		TerminalRow self = new TerminalRow(10, TextStyle.NORMAL);
+		for (int i = 0; i < 10; i++) self.setChar(i, '0' + i, TextStyle.NORMAL);
+		self.copyInterval(self, 0, 9, 1);
+		assertEquals('0', self.mText[0]);
+		assertEquals('0', self.mText[1]);
+		assertEquals('1', self.mText[2]);
+		assertEquals('2', self.mText[3]);
+		assertEquals('3', self.mText[4]);
+	}
+
 	public void testOverwritingDoubleDisplayWidthWithSelf() {
 		row.setChar(0, ONE_JAVA_CHAR_DISPLAY_WIDTH_TWO_1, 0);
 		row.setChar(0, ONE_JAVA_CHAR_DISPLAY_WIDTH_TWO_1, 0);

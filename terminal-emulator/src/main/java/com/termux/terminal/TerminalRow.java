@@ -60,6 +60,16 @@ public final class TerminalRow {
 
     /** NOTE: The sourceX2 is exclusive. */
     public void copyInterval(TerminalRow line, int sourceX1, int sourceX2, int destinationX) {
+        // Fast path when both rows contain only single-width BMP characters (no surrogate pairs, no wide chars,
+        // no combining sequences). This is common for tmux and other TUI apps and avoids per-cell setChar() overhead.
+        if (!mHasNonOneWidthOrSurrogateChars && !line.mHasNonOneWidthOrSurrogateChars) {
+            final int length = sourceX2 - sourceX1;
+            if (length <= 0) return;
+            System.arraycopy(line.mText, sourceX1, mText, destinationX, length);
+            System.arraycopy(line.mStyle, sourceX1, mStyle, destinationX, length);
+            return;
+        }
+
         mHasNonOneWidthOrSurrogateChars |= line.mHasNonOneWidthOrSurrogateChars;
         final int x1 = line.findStartOfColumn(sourceX1);
         final int x2 = line.findStartOfColumn(sourceX2);
