@@ -24,7 +24,8 @@ public final class TerminalRenderer {
 
     // Cache glyph widths for non-ASCII code points. Terminal output often reuses a small set of
     // Unicode symbols (e.g. tmux box-drawing). Caching avoids repeated measureText() calls.
-    private static final int WIDTH_CACHE_SIZE = 1024; // must be power of two
+    private static final int WIDTH_CACHE_SIZE = 4096; // must be power of two
+    private static final int WIDTH_CACHE_PROBE_STEPS = 4;
     private final int[] mWidthCacheKeys = new int[WIDTH_CACHE_SIZE];
     private final float[] mWidthCacheValues = new float[WIDTH_CACHE_SIZE];
 
@@ -64,9 +65,21 @@ public final class TerminalRenderer {
 
         // Cheap hash, overwrite on collision (good enough for small working sets).
         int slot = (codePoint * 0x9E3779B9) & (WIDTH_CACHE_SIZE - 1);
-        if (mWidthCacheKeys[slot] == codePoint) return mWidthCacheValues[slot];
+        for (int i = 0; i < WIDTH_CACHE_PROBE_STEPS; i++) {
+            int idx = (slot + i) & (WIDTH_CACHE_SIZE - 1);
+            if (mWidthCacheKeys[idx] == codePoint) return mWidthCacheValues[idx];
+        }
 
         float measured = mTextPaint.measureText(line, start, charsForCodePoint);
+        // Insert into the first free slot if present; otherwise overwrite the base slot.
+        for (int i = 0; i < WIDTH_CACHE_PROBE_STEPS; i++) {
+            int idx = (slot + i) & (WIDTH_CACHE_SIZE - 1);
+            if (mWidthCacheKeys[idx] == 0 || mWidthCacheKeys[idx] == codePoint) {
+                mWidthCacheKeys[idx] = codePoint;
+                mWidthCacheValues[idx] = measured;
+                return measured;
+            }
+        }
         mWidthCacheKeys[slot] = codePoint;
         mWidthCacheValues[slot] = measured;
         return measured;
