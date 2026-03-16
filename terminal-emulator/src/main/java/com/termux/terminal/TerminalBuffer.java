@@ -20,6 +20,9 @@ public final class TerminalBuffer {
     /** The index in the circular buffer where the visible screen starts. */
     private int mScreenFirstRow = 0;
 
+    /** Scratch buffer for row rotations (IL/DL). */
+    private TerminalRow[] mRowSwapTmp;
+
     /**
      * Create a transcript screen.
      *
@@ -426,6 +429,85 @@ public final class TerminalBuffer {
         // Clearing a row should never keep a stale wrap flag, otherwise selection/join logic may
         // treat the blank row as a continuation of previous output.
         mLines[blankRow].mLineWrap = false;
+    }
+
+    /**
+     * Rotate screen rows in-place by moving {@link TerminalRow} references.
+     *
+     * <p>This is used as a fast-path for operations like CSI L/M (insert/delete lines) which
+     * logically shift whole rows within a region. Callers are expected to clear the vacated rows
+     * (e.g. to create blank inserted/deleted lines) after the rotation.
+     *
+     * @param startRow External start row (inclusive), in [0, mScreenRows).
+     * @param regionHeight Number of rows in region. Must be > 0 and within screen bounds.
+     * @param shift Positive rotates down (last rows move to front), negative rotates up.
+     */
+    void rotateScreenRows(int startRow, int regionHeight, int shift) {
+        if (regionHeight <= 1 || shift == 0) return;
+        if (startRow < 0 || startRow >= mScreenRows || startRow + regionHeight > mScreenRows) {
+            throw new IllegalArgumentException("rotateScreenRows(" + startRow + ", " + regionHeight + ", " + shift + "), mScreenRows=" + mScreenRows);
+        }
+
+        int k = shift % regionHeight;
+        if (k == 0) return;
+        if (k < 0) {
+            rotateScreenRowsUp(startRow, regionHeight, -k);
+        } else {
+            rotateScreenRowsDown(startRow, regionHeight, k);
+        }
+    }
+
+    private TerminalRow[] ensureRowSwapTmp(int size) {
+        if (mRowSwapTmp == null || mRowSwapTmp.length < size) {
+            mRowSwapTmp = new TerminalRow[size];
+        }
+        return mRowSwapTmp;
+    }
+
+    private void rotateScreenRowsDown(int startRow, int regionHeight, int downBy) {
+        // Save bottom segment.
+        TerminalRow[] tmp = ensureRowSwapTmp(downBy);
+        for (int i = 0; i < downBy; i++) {
+            int extRow = startRow + regionHeight - downBy + i;
+            tmp[i] = mLines[externalToInternalRow(extRow)];
+        }
+
+        // Shift remaining rows down.
+        for (int extRow = startRow + regionHeight - downBy - 1; extRow >= startRow; extRow--) {
+            int from = externalToInternalRow(extRow);
+            int to = externalToInternalRow(extRow + downBy);
+            mLines[to] = mLines[from];
+        }
+
+        // Restore saved segment to top.
+        for (int i = 0; i < downBy; i++) {
+            int to = externalToInternalRow(startRow + i);
+            mLines[to] = tmp[i];
+            tmp[i] = null;
+        }
+    }
+
+    private void rotateScreenRowsUp(int startRow, int regionHeight, int upBy) {
+        // Save top segment.
+        TerminalRow[] tmp = ensureRowSwapTmp(upBy);
+        for (int i = 0; i < upBy; i++) {
+            int extRow = startRow + i;
+            tmp[i] = mLines[externalToInternalRow(extRow)];
+        }
+
+        // Shift remaining rows up.
+        for (int extRow = startRow + upBy; extRow < startRow + regionHeight; extRow++) {
+            int from = externalToInternalRow(extRow);
+            int to = externalToInternalRow(extRow - upBy);
+            mLines[to] = mLines[from];
+        }
+
+        // Restore saved segment to bottom.
+        for (int i = 0; i < upBy; i++) {
+            int to = externalToInternalRow(startRow + regionHeight - upBy + i);
+            mLines[to] = tmp[i];
+            tmp[i] = null;
+        }
     }
 
     /**

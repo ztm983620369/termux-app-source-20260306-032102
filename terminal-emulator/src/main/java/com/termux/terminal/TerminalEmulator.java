@@ -1628,7 +1628,12 @@ public final class TerminalEmulator {
                 int linesAfterCursor = mBottomMargin - mCursorRow;
                 int linesToInsert = Math.min(getArg0(1), linesAfterCursor);
                 int linesToMove = linesAfterCursor - linesToInsert;
-                mScreen.blockCopy(0, mCursorRow, mColumns, linesToMove, 0, mCursorRow + linesToInsert);
+                if (linesToMove > 0 && linesToInsert > 0) {
+                    // Fast path: rotate full rows (no per-cell copy). Vacated lines are cleared below.
+                    mScreen.rotateScreenRows(mCursorRow, linesAfterCursor, linesToInsert);
+                } else if (linesToMove > 0) {
+                    mScreen.blockCopy(0, mCursorRow, mColumns, linesToMove, 0, mCursorRow + linesToInsert);
+                }
                 blockClear(0, mCursorRow, mColumns, linesToInsert);
             }
             break;
@@ -1638,7 +1643,12 @@ public final class TerminalEmulator {
                 int linesAfterCursor = mBottomMargin - mCursorRow;
                 int linesToDelete = Math.min(getArg0(1), linesAfterCursor);
                 int linesToMove = linesAfterCursor - linesToDelete;
-                mScreen.blockCopy(0, mCursorRow + linesToDelete, mColumns, linesToMove, 0, mCursorRow);
+                if (linesToMove > 0 && linesToDelete > 0) {
+                    // Fast path: rotate full rows (no per-cell copy). Vacated lines are cleared below.
+                    mScreen.rotateScreenRows(mCursorRow, linesAfterCursor, -linesToDelete);
+                } else if (linesToMove > 0) {
+                    mScreen.blockCopy(0, mCursorRow + linesToDelete, mColumns, linesToMove, 0, mCursorRow);
+                }
                 blockClear(0, mCursorRow + linesToMove, mColumns, linesToDelete);
             }
             break;
