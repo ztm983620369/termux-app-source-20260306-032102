@@ -997,6 +997,46 @@ public final class SftpProtocolManager {
                                                      @NonNull String targetVirtualPath,
                                                      long expectedRemoteModifiedMs,
                                                      long expectedRemoteSize) {
+        return uploadLocalFileToVirtualPathInternal(
+            context,
+            localFilePath,
+            targetVirtualPath,
+            expectedRemoteModifiedMs,
+            expectedRemoteSize,
+            true
+        );
+    }
+
+    /**
+     * Fast path upload used by editor auto-save pipelines.
+     * <p>
+     * This skips the expensive post-upload digest verification (which may re-download the uploaded
+     * content) and only validates the remote size. The transport is still atomic: the upload lands
+     * in a temp remote file and is then renamed into place.
+     */
+    @NonNull
+    public UploadResult uploadLocalFileToVirtualPathFast(@NonNull Context context,
+                                                         @NonNull String localFilePath,
+                                                         @NonNull String targetVirtualPath,
+                                                         long expectedRemoteModifiedMs,
+                                                         long expectedRemoteSize) {
+        return uploadLocalFileToVirtualPathInternal(
+            context,
+            localFilePath,
+            targetVirtualPath,
+            expectedRemoteModifiedMs,
+            expectedRemoteSize,
+            false
+        );
+    }
+
+    @NonNull
+    private UploadResult uploadLocalFileToVirtualPathInternal(@NonNull Context context,
+                                                              @NonNull String localFilePath,
+                                                              @NonNull String targetVirtualPath,
+                                                              long expectedRemoteModifiedMs,
+                                                              long expectedRemoteSize,
+                                                              boolean verifyDigest) {
         if (TextUtils.isEmpty(localFilePath)) {
             return UploadResult.fail("\u8986\u76d6\u5931\u8d25\uff1a\u672c\u5730\u6587\u4ef6\u8def\u5f84\u4e3a\u7a7a\u3002");
         }
@@ -1056,7 +1096,11 @@ public final class SftpProtocolManager {
                         }
                         outputStream.flush();
                     }
-                    verifyUploadedTempFile(channel, tempRemotePath, localFile, localSize, null);
+                    if (verifyDigest) {
+                        verifyUploadedTempFile(channel, tempRemotePath, localFile, localSize, null);
+                    } else {
+                        verifyUploadedTempFileSizeOnly(channel, tempRemotePath, localSize);
+                    }
                     replaceRemoteFile(channel, tempRemotePath, normalizedTarget);
                 } catch (Exception e) {
                     try {
@@ -2419,6 +2463,21 @@ public final class SftpProtocolManager {
             if (!TextUtils.equals(localDigest, remoteDigest)) {
                 throw new IllegalStateException("\u4e0a\u4f20\u540e\u8fdc\u7a0b\u91c7\u6837\u6821\u9a8c\u5931\u8d25\u3002");
             }
+        }
+    }
+
+    private static void verifyUploadedTempFileSizeOnly(@NonNull ChannelSftp channel,
+                                                       @NonNull String remoteTempPath,
+                                                       long expectedSize) throws Exception {
+        SftpATTRS attrs = channel.stat(normalizeRemotePath(remoteTempPath));
+        if (attrs == null || attrs.isDir()) {
+            throw new IllegalStateException("\u8fdc\u7a0b\u4e34\u65f6\u6587\u4ef6\u7f3a\u5931\u6216\u7c7b\u578b\u9519\u8bef\u3002");
+        }
+        long remoteSize = Math.max(0L, attrs.getSize());
+        if (expectedSize >= 0L && remoteSize != expectedSize) {
+            throw new IllegalStateException(
+                "\u4e0a\u4f20\u540e\u8fdc\u7a0b\u5927\u5c0f\u6821\u9a8c\u5931\u8d25\uff1aexpected=" + expectedSize + " actual=" + remoteSize
+            );
         }
     }
 

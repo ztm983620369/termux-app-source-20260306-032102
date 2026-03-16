@@ -239,6 +239,28 @@ public final class SessionFileCoordinator {
     }
 
     @NonNull
+    public SftpProtocolManager.UploadResult uploadLocalFileToVirtualPathFast(@NonNull Context context,
+                                                                             @NonNull String localFilePath,
+                                                                             @NonNull String targetVirtualPath,
+                                                                             long expectedRemoteModifiedMs,
+                                                                             long expectedRemoteSize) {
+        initialize(context);
+        SftpProtocolManager.UploadResult result = SftpProtocolManager.getInstance()
+            .uploadLocalFileToVirtualPathFast(
+                context,
+                localFilePath,
+                targetVirtualPath,
+                expectedRemoteModifiedMs,
+                expectedRemoteSize
+            );
+        if (!result.success) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "uploadLocalFileToVirtualPathFast",
+                null, "\u8986\u76d6\u8fdc\u7a0b\u6587\u4ef6\u5931\u8d25", result.messageCn);
+        }
+        return result;
+    }
+
+    @NonNull
     public SftpProtocolManager.RemoteTransferResult transferVirtualPaths(@NonNull Context context,
                                                                          @NonNull List<String> sourceVirtualPaths,
                                                                          @NonNull String destinationVirtualDir,

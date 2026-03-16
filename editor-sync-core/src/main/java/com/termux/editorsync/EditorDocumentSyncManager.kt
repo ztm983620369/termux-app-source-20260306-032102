@@ -2,6 +2,7 @@ package com.termux.editorsync
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.system.Os
 import com.termux.sessionsync.SessionFileCoordinator
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -164,7 +165,7 @@ class EditorDocumentSyncManager(
 
             fun verifyWriteRead(targetFile: File, payload: ByteArray): String? {
                 val error = runCatching {
-                    writeAtomic(targetFile, payload)
+                    writeAtomic(targetFile, payload, true)
                     val readBack = targetFile.readBytes()
                     if (!readBack.contentEquals(payload)) {
                         "mismatch bytes=${payload.size} read=${readBack.size}"
@@ -304,7 +305,7 @@ class EditorDocumentSyncManager(
 
             val error = runCatching {
                 if (hash != lastSavedHash.get()) {
-                    persist(target, payload)
+                    persist(target, payload, trigger)
                     lastSavedHash.set(hash)
                 }
             }.exceptionOrNull()
@@ -350,23 +351,34 @@ class EditorDocumentSyncManager(
         }
     }
 
-    private fun persist(target: EditorSyncTarget, payload: ByteArray) {
-        writeAtomic(File(target.localPath), payload)
+    private fun persist(target: EditorSyncTarget, payload: ByteArray, trigger: EditorSaveTrigger) {
+        val shouldSyncDisk = trigger != EditorSaveTrigger.AUTO || !target.supportsRemoteSync()
+        writeAtomic(File(target.localPath), payload, shouldSyncDisk)
         if (target.supportsRemoteSync()) {
-            syncRemoteTarget(target)
+            syncRemoteTarget(target, trigger)
         }
     }
 
-    private fun syncRemoteTarget(target: EditorSyncTarget) {
+    private fun syncRemoteTarget(target: EditorSyncTarget, trigger: EditorSaveTrigger) {
         val originPath = target.originPath ?: return
         val localFile = File(target.localPath)
-        val result = sessionFileCoordinator.uploadLocalFileToVirtualPath(
-            context.applicationContext,
-            localFile.absolutePath,
-            originPath,
-            target.originModifiedMs ?: -1L,
-            target.originSize ?: -1L
-        )
+        val result = if (trigger == EditorSaveTrigger.AUTO) {
+            sessionFileCoordinator.uploadLocalFileToVirtualPathFast(
+                context.applicationContext,
+                localFile.absolutePath,
+                originPath,
+                target.originModifiedMs ?: -1L,
+                target.originSize ?: -1L
+            )
+        } else {
+            sessionFileCoordinator.uploadLocalFileToVirtualPath(
+                context.applicationContext,
+                localFile.absolutePath,
+                originPath,
+                target.originModifiedMs ?: -1L,
+                target.originSize ?: -1L
+            )
+        }
         if (!result.success || result.uploadedFiles <= 0) {
             throw IllegalStateException(result.messageCn.ifBlank { "remote sync failed" })
         }
@@ -389,7 +401,7 @@ class EditorDocumentSyncManager(
         }
     }
 
-    private fun writeAtomic(target: File, bytes: ByteArray) {
+    private fun writeAtomic(target: File, bytes: ByteArray, syncDisk: Boolean) {
         val parent = target.parentFile ?: throw IllegalStateException("no parent dir for $target")
         if (!parent.exists() && !parent.mkdirs()) {
             throw IllegalStateException("parent dir not exists: ${parent.absolutePath}")
@@ -401,33 +413,41 @@ class EditorDocumentSyncManager(
         FileOutputStream(tmp).use { out ->
             out.write(bytes)
             out.flush()
-            runCatching { out.fd.sync() }
-            runCatching { out.channel.force(true) }
+            if (syncDisk) runCatching { out.fd.sync() }
         }
 
+        // Prefer atomic replace in-place (POSIX rename replaces destination if it exists).
+        runCatching {
+            Os.rename(tmp.absolutePath, target.absolutePath)
+            return
+        }.onFailure {
+            // Fall back to legacy java.io rename behavior.
+        }
+
+        if (tmp.renameTo(target)) {
+            return
+        }
+
+        // Last-resort fallback: preserve original if possible and rewrite target directly.
         if (target.exists()) {
             val backup = File(parent, ".${target.name}.editor-sync.bak")
             if (backup.exists()) runCatching { backup.delete() }
             runCatching { target.renameTo(backup) }
-            if (!tmp.renameTo(target)) {
+            runCatching {
                 FileOutputStream(target, false).use { out ->
                     out.write(bytes)
                     out.flush()
-                    runCatching { out.fd.sync() }
-                    runCatching { out.channel.force(true) }
+                    if (syncDisk) runCatching { out.fd.sync() }
                 }
-            }
+            }.onFailure { throw it }
             runCatching { backup.delete() }
         } else {
-            if (!tmp.renameTo(target)) {
-                FileOutputStream(target, false).use { out ->
-                    out.write(bytes)
-                    out.flush()
-                    runCatching { out.fd.sync() }
-                    runCatching { out.channel.force(true) }
-                }
-                runCatching { tmp.delete() }
+            FileOutputStream(target, false).use { out ->
+                out.write(bytes)
+                out.flush()
+                if (syncDisk) runCatching { out.fd.sync() }
             }
+            runCatching { tmp.delete() }
         }
     }
 
