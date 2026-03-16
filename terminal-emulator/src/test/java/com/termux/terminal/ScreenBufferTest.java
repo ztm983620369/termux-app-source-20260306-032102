@@ -67,4 +67,21 @@ public class ScreenBufferTest extends TerminalTestCase {
 		assertEquals("ONE", mTerminal.getScreen().getWordAtLocation(0, -1));
 		assertEquals("TWO", mTerminal.getScreen().getWordAtLocation(0, 0));
 	}
+
+	public void testBlockSetPartialClearPreservesStyles() {
+		TerminalBuffer screen = new TerminalBuffer(5, 3, 3);
+
+		long styleA = 111L;
+		long styleB = 222L;
+		screen.blockSet(0, 0, 5, 1, 'A', styleA);
+		screen.blockSet(2, 0, 2, 1, ' ', styleB);
+
+		assertEquals("AA  A", screen.getTranscriptText());
+
+		assertEquals(styleA, screen.getStyleAt(0, 0));
+		assertEquals(styleA, screen.getStyleAt(0, 1));
+		assertEquals(styleB, screen.getStyleAt(0, 2));
+		assertEquals(styleB, screen.getStyleAt(0, 3));
+		assertEquals(styleA, screen.getStyleAt(0, 4));
+	}
 }

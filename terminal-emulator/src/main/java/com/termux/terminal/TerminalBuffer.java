@@ -557,6 +557,26 @@ public final class TerminalBuffer {
             return;
         }
 
+        // Fast path: partial clears on ASCII rows. This covers common sequences like EL/ED and the
+        // blanking step after DCH. We must not take this path if the line may contain non-1-width
+        // code points (wide, surrogate pairs, combining), since those require setChar() to handle
+        // clearing halves of wide chars correctly.
+        if (val == ' ') {
+            for (int y = 0; y < h; y++) {
+                int row = externalToInternalRow(sy + y);
+                TerminalRow line = allocateFullLineIfNecessary(row);
+                if (!line.mHasNonOneWidthOrSurrogateChars) {
+                    Arrays.fill(line.mText, sx, sx + w, ' ');
+                    Arrays.fill(line.mStyle, sx, sx + w, style);
+                } else {
+                    for (int x = 0; x < w; x++) {
+                        setChar(sx + x, sy + y, val, style);
+                    }
+                }
+            }
+            return;
+        }
+
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 setChar(sx + x, sy + y, val, style);
