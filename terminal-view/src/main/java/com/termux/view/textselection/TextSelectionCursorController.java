@@ -9,7 +9,6 @@ import android.net.Uri;
 import android.os.Build;
 import android.text.SpannableStringBuilder;
 import android.text.TextUtils;
-import android.util.Patterns;
 import android.view.ActionMode;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -20,9 +19,14 @@ import androidx.annotation.Nullable;
 
 import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalRow;
+import com.termux.terminal.UrlDetector;
 import com.termux.terminal.WcWidth;
 import com.termux.view.R;
 import com.termux.view.TerminalView;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 
 public class TextSelectionCursorController implements CursorController {
 
@@ -45,6 +49,13 @@ public class TextSelectionCursorController implements CursorController {
     public final int ACTION_MORE = 3;
     public final int ACTION_OPEN = 4;
 
+    private int mCachedUrlSelX1 = Integer.MIN_VALUE;
+    private int mCachedUrlSelY1 = Integer.MIN_VALUE;
+    private int mCachedUrlSelX2 = Integer.MIN_VALUE;
+    private int mCachedUrlSelY2 = Integer.MIN_VALUE;
+    @Nullable
+    private LinkedHashSet<String> mCachedDetectedUrls;
+
     public TextSelectionCursorController(TerminalView terminalView) {
         this.terminalView = terminalView;
         mStartHandle = new TextSelectionHandleView(terminalView, this, TextSelectionHandleView.LEFT);
@@ -56,6 +67,7 @@ public class TextSelectionCursorController implements CursorController {
     @Override
     public void show(MotionEvent event) {
         setInitialTextSelectionPosition(event);
+        invalidateDetectedUrlCache();
         mStartHandle.positionAtCursor(mSelX1, mSelY1, true);
         mEndHandle.positionAtCursor(mSelX2 + 1, mSelY2, true);
 
@@ -95,6 +107,7 @@ public class TextSelectionCursorController implements CursorController {
         mSelX1 = mSelY1 = mSelX2 = mSelY2 = -1;
         mIsSelectingText = false;
         terminalView.hideTextSelectionPreview();
+        invalidateDetectedUrlCache();
 
         return true;
     }
@@ -137,7 +150,7 @@ public class TextSelectionCursorController implements CursorController {
                 ClipboardManager clipboard = (ClipboardManager) terminalView.getContext().getSystemService(Context.CLIPBOARD_SERVICE);
                 menu.add(Menu.NONE, ACTION_COPY, Menu.NONE, R.string.copy_text).setShowAsAction(showPrimary);
                 menu.add(Menu.NONE, ACTION_OPEN, Menu.NONE, R.string.open_url)
-                    .setVisible(getSelectedTextUrl() != null)
+                    .setVisible(!getDetectedUrlsForSelection().isEmpty())
                     .setShowAsAction(showPrimary);
                 menu.add(Menu.NONE, ACTION_PASTE, Menu.NONE, R.string.paste_text)
                     .setEnabled(clipboard != null && clipboard.hasPrimaryClip())
@@ -151,7 +164,7 @@ public class TextSelectionCursorController implements CursorController {
                 MenuItem openItem = menu.findItem(ACTION_OPEN);
                 if (openItem == null) return false;
 
-                boolean shouldShowOpen = getSelectedTextUrl() != null;
+                boolean shouldShowOpen = !getDetectedUrlsForSelection().isEmpty();
                 if (openItem.isVisible() != shouldShowOpen) {
                     openItem.setVisible(shouldShowOpen);
                     return true;
@@ -173,8 +186,8 @@ public class TextSelectionCursorController implements CursorController {
                         terminalView.stopTextSelectionMode();
                         break;
                     case ACTION_OPEN:
-                        String url = getSelectedTextUrl();
-                        if (url != null) {
+                        String url = getBestDetectedUrlForSelection();
+                        if (!TextUtils.isEmpty(url)) {
                             terminalView.stopTextSelectionMode();
                             openUrl(url);
                         }
@@ -218,7 +231,7 @@ public class TextSelectionCursorController implements CursorController {
 
             @Override
             public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
-                return false;
+                return callback.onPrepareActionMode(mode, menu);
             }
 
             @Override
@@ -256,31 +269,80 @@ public class TextSelectionCursorController implements CursorController {
     }
 
     @Nullable
-    private String getSelectedTextUrl() {
-        String selectedText = getSelectedText();
-        if (TextUtils.isEmpty(selectedText)) return null;
-
-        String candidate = selectedText.trim();
-        if (candidate.isEmpty()) return null;
-
-        // Remove wrappers often included by terminals or markdown output.
-        if ((candidate.startsWith("<") && candidate.endsWith(">")) ||
-            (candidate.startsWith("\"") && candidate.endsWith("\"")) ||
-            (candidate.startsWith("'") && candidate.endsWith("'"))) {
-            candidate = candidate.substring(1, candidate.length() - 1).trim();
-            if (candidate.isEmpty()) return null;
-        }
-
-        if (!Patterns.WEB_URL.matcher(candidate).matches()) return null;
-
-        if (!hasUrlScheme(candidate)) candidate = "https://" + candidate;
-        return candidate;
+    private String getBestDetectedUrlForSelection() {
+        LinkedHashSet<String> urls = getDetectedUrlsForSelection();
+        if (urls.isEmpty()) return null;
+        return urls.iterator().next();
     }
 
-    private boolean hasUrlScheme(String url) {
-        Uri uri = Uri.parse(url);
-        String scheme = uri.getScheme();
-        return !TextUtils.isEmpty(scheme);
+    private void invalidateDetectedUrlCache() {
+        mCachedUrlSelX1 = Integer.MIN_VALUE;
+        mCachedUrlSelY1 = Integer.MIN_VALUE;
+        mCachedUrlSelX2 = Integer.MIN_VALUE;
+        mCachedUrlSelY2 = Integer.MIN_VALUE;
+        mCachedDetectedUrls = null;
+    }
+
+    private boolean isDetectedUrlCacheValid() {
+        return mCachedDetectedUrls != null &&
+            mCachedUrlSelX1 == mSelX1 && mCachedUrlSelY1 == mSelY1 &&
+            mCachedUrlSelX2 == mSelX2 && mCachedUrlSelY2 == mSelY2;
+    }
+
+    private LinkedHashSet<String> getDetectedUrlsForSelection() {
+        if (isDetectedUrlCacheValid()) return mCachedDetectedUrls;
+
+        mCachedUrlSelX1 = mSelX1;
+        mCachedUrlSelY1 = mSelY1;
+        mCachedUrlSelX2 = mSelX2;
+        mCachedUrlSelY2 = mSelY2;
+
+        LinkedHashSet<String> urls = new LinkedHashSet<>();
+        if (terminalView.mEmulator == null) {
+            mCachedDetectedUrls = urls;
+            return urls;
+        }
+
+        TerminalBuffer screen = terminalView.mEmulator.getScreen();
+        final int columns = terminalView.mEmulator.mColumns;
+
+        // Prefer local context near selection (fast, avoids scanning huge selection ranges).
+        List<String> probes = new ArrayList<>(8);
+        probes.add(screen.getWordAtLocation(mSelX1, mSelY1));
+        probes.add(screen.getWordAtLocation(mSelX2, mSelY2));
+
+        // For small selections, also scan selected text directly (helps when selection spans multiple tokens).
+        int rowSpan = Math.abs(mSelY2 - mSelY1) + 1;
+        if (rowSpan == 1) {
+            int midX = (mSelX1 + mSelX2) / 2;
+            probes.add(screen.getWordAtLocation(midX, mSelY1));
+        } else if (rowSpan == 2) {
+            int midStartX = (mSelX1 + (columns - 1)) / 2;
+            probes.add(screen.getWordAtLocation(midStartX, mSelY1));
+
+            int midEndX = mSelX2 / 2;
+            probes.add(screen.getWordAtLocation(midEndX, mSelY2));
+        } else {
+            // Probe an intermediate row where selection is full-width to avoid false positives from
+            // sampling outside the selected range on the start/end rows.
+            int midY = (mSelY1 + mSelY2) / 2;
+            if (midY == mSelY1) midY++;
+            else if (midY == mSelY2) midY--;
+            int midX = columns / 2;
+            probes.add(screen.getWordAtLocation(midX, midY));
+        }
+        if (rowSpan <= 6) {
+            probes.add(getSelectedText());
+        }
+
+        for (String probe : probes) {
+            if (TextUtils.isEmpty(probe)) continue;
+            urls.addAll(UrlDetector.extractUrls(probe, /*allowWithoutScheme*/ true));
+            if (urls.size() >= 4) break; // keep UI decision fast and deterministic
+        }
+
+        mCachedDetectedUrls = urls;
+        return urls;
     }
 
     private void openUrl(String url) {
@@ -389,6 +451,7 @@ public class TextSelectionCursorController implements CursorController {
             mSelX2 = snapSelectionEndColumn(screen, mSelY2, mSelX2, columns);
         }
 
+        invalidateDetectedUrlCache();
         terminalView.invalidate();
         updateSelectionPreviewForHandle(handle);
     }
@@ -431,6 +494,7 @@ public class TextSelectionCursorController implements CursorController {
     public void decrementYTextSelectionCursors(int decrement) {
         mSelY1 -= decrement;
         mSelY2 -= decrement;
+        invalidateDetectedUrlCache();
     }
 
     public boolean onTouchEvent(MotionEvent event) {

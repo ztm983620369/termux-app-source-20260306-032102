@@ -61,5 +61,10 @@ public class ScreenBufferTest extends TerminalTestCase {
 		assertEquals("GHI", mTerminal.getScreen().getWordAtLocation(0, 2));
 		assertEquals("", mTerminal.getScreen().getWordAtLocation(1, 2));
 		assertEquals("", mTerminal.getScreen().getWordAtLocation(2, 2));
+
+		// Transcript row support (negative y).
+		withTerminalSized(10, 3).enterString("ONE\r\nTWO\r\nTHREE\r\nFOUR");
+		assertEquals("ONE", mTerminal.getScreen().getWordAtLocation(0, -1));
+		assertEquals("TWO", mTerminal.getScreen().getWordAtLocation(0, 0));
 	}
 }

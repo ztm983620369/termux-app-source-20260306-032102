@@ -106,15 +106,24 @@ public final class TerminalBuffer {
     }
 
     public String getWordAtLocation(int x, int y) {
-        // Set y1 and y2 to the lines where the wrapped line starts and ends.
-        // I.e. if a line that is wrapped to 3 lines starts at line 4, and this
-        // is called with y=5, then y1 would be set to 4 and y2 would be set to 6.
+        // Support both visible screen (0..mScreenRows-1) and transcript (-activeTranscriptRows..-1).
+        final int minRow = -getActiveTranscriptRows();
+        final int maxRow = mScreenRows - 1;
+        if (y < minRow) y = minRow;
+        if (y > maxRow) y = maxRow;
+        if (x < 0) x = 0;
+        if (x >= mColumns) x = mColumns - 1;
+
+        // Set y1 and y2 to the rows where the wrapped line starts and ends.
+        // A row "continues" if it wraps to the next row (mLineWrap), or if it completely fills the
+        // screen width. The latter is a heuristic to handle long tokens that were split without
+        // line-wrap metadata (e.g. due to explicit newlines or output formatting).
         int y1 = y;
         int y2 = y;
-        while (y1 > 0 && !getSelectedText(0, y1 - 1, mColumns, y, true, true).contains("\n")) {
+        while (y1 > minRow && (getLineWrap(y1 - 1) || rowFillsScreenWidth(y1 - 1))) {
             y1--;
         }
-        while (y2 < mScreenRows && !getSelectedText(0, y, mColumns, y2 + 1, true, true).contains("\n")) {
+        while (y2 < maxRow && (getLineWrap(y2) || rowFillsScreenWidth(y2))) {
             y2++;
         }
 
@@ -123,6 +132,7 @@ public final class TerminalBuffer {
         // The index of x in text
         int textOffset = (y - y1) * mColumns + x;
 
+        if (textOffset < 0) textOffset = 0;
         if (textOffset >= text.length()) {
           // The click was to the right of the last word on the line, so
           // there's no word to return
@@ -142,6 +152,16 @@ public final class TerminalBuffer {
           return "";
         }
         return text.substring(x1 + 1, x2);
+    }
+
+    private boolean rowFillsScreenWidth(int row) {
+        if (row < -getActiveTranscriptRows() || row >= mScreenRows) return false;
+        TerminalRow line = allocateFullLineIfNecessary(externalToInternalRow(row));
+        if (line == null) return false;
+        // Consider the row "filled" if its last cell is not whitespace. This matches the
+        // getSelectedText(..., joinFullLines=true) heuristic for joining full-width lines.
+        int lastColumnIndex = line.findStartOfColumn(mColumns - 1);
+        return line.mText[lastColumnIndex] != ' ';
     }
 
     public int getActiveTranscriptRows() {
