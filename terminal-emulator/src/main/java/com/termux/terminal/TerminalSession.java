@@ -3,6 +3,7 @@ package com.termux.terminal;
 import android.annotation.SuppressLint;
 import android.os.Handler;
 import android.os.Message;
+import android.os.SystemClock;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -16,6 +17,7 @@ import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A terminal session, consisting of a process coupled to a terminal interface.
@@ -33,6 +35,18 @@ public final class TerminalSession extends TerminalOutput {
     private static final int MSG_NEW_INPUT = 1;
     private static final int MSG_PROCESS_EXITED = 4;
 
+    /**
+     * Main-thread processing budget for terminal output.
+     *
+     * <p>tmux and other TUIs can produce large bursts of output. If we process all pending bytes in
+     * one go on the UI thread, we risk jank and input lag. Instead we drain the queue in bounded
+     * slices and reschedule immediately if more work remains.
+     */
+    private static final int PROCESS_INPUT_TIME_SLICE_MS = 8;
+    private static final int PROCESS_INPUT_MAX_BYTES_PER_SLICE = 256 * 1024;
+    private static final int PROCESS_INPUT_BUFFER_SIZE = 32 * 1024;
+    private static final int IO_QUEUE_CAPACITY_BYTES = 64 * 1024;
+
     public final String mHandle = UUID.randomUUID().toString();
 
     TerminalEmulator mEmulator;
@@ -41,12 +55,12 @@ public final class TerminalSession extends TerminalOutput {
      * A queue written to from a separate thread when the process outputs, and read by main thread to process by
      * terminal emulator.
      */
-    final ByteQueue mProcessToTerminalIOQueue = new ByteQueue(4096);
+    final ByteQueue mProcessToTerminalIOQueue = new ByteQueue(IO_QUEUE_CAPACITY_BYTES);
     /**
      * A queue written to from the main thread due to user interaction, and read by another thread which forwards by
      * writing to the {@link #mTerminalFileDescriptor}.
      */
-    final ByteQueue mTerminalToProcessIOQueue = new ByteQueue(4096);
+    final ByteQueue mTerminalToProcessIOQueue = new ByteQueue(IO_QUEUE_CAPACITY_BYTES);
     /** Buffer to write translate code points into utf8 before writing to mTerminalToProcessIOQueue */
     private final byte[] mUtf8InputBuffer = new byte[5];
 
@@ -69,6 +83,7 @@ public final class TerminalSession extends TerminalOutput {
     public String mSessionName;
 
     final Handler mMainThreadHandler = new MainThreadHandler();
+    private final AtomicBoolean mNewInputScheduled = new AtomicBoolean(false);
 
     private final String mShellPath;
     private final String mCwd;
@@ -86,6 +101,12 @@ public final class TerminalSession extends TerminalOutput {
         this.mEnv = env;
         this.mTranscriptRows = transcriptRows;
         this.mClient = client;
+    }
+
+    private void scheduleProcessNewInput() {
+        if (mNewInputScheduled.compareAndSet(false, true)) {
+            mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+        }
     }
 
     /**
@@ -134,12 +155,12 @@ public final class TerminalSession extends TerminalOutput {
             @Override
             public void run() {
                 try (InputStream termIn = new FileInputStream(terminalFileDescriptorWrapped)) {
-                    final byte[] buffer = new byte[4096];
+                    final byte[] buffer = new byte[PROCESS_INPUT_BUFFER_SIZE];
                     while (true) {
                         int read = termIn.read(buffer);
                         if (read == -1) return;
                         if (!mProcessToTerminalIOQueue.write(buffer, 0, read)) return;
-                        mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+                        scheduleProcessNewInput();
                     }
                 } catch (Exception e) {
                     // Ignore, just shutting down.
@@ -336,15 +357,34 @@ public final class TerminalSession extends TerminalOutput {
     @SuppressLint("HandlerLeak")
     class MainThreadHandler extends Handler {
 
-        final byte[] mReceiveBuffer = new byte[4 * 1024];
+        final byte[] mReceiveBuffer = new byte[PROCESS_INPUT_BUFFER_SIZE];
 
         @Override
         public void handleMessage(Message msg) {
-            int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
-            if (bytesRead > 0) {
+            // Allow the reader thread to schedule another message while we're processing.
+            mNewInputScheduled.set(false);
+
+            int totalBytesRead = 0;
+            boolean appended = false;
+            long startUptimeMs = SystemClock.uptimeMillis();
+
+            while (true) {
+                int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
+                if (bytesRead <= 0) break;
+
                 mEmulator.append(mReceiveBuffer, bytesRead);
-                notifyScreenUpdate();
+                totalBytesRead += bytesRead;
+                appended = true;
+
+                if (totalBytesRead >= PROCESS_INPUT_MAX_BYTES_PER_SLICE ||
+                    SystemClock.uptimeMillis() - startUptimeMs >= PROCESS_INPUT_TIME_SLICE_MS) {
+                    // Yield to keep UI responsive; reschedule immediately to continue draining.
+                    scheduleProcessNewInput();
+                    break;
+                }
             }
+
+            if (appended) notifyScreenUpdate();
 
             if (msg.what == MSG_PROCESS_EXITED) {
                 int exitCode = (Integer) msg.obj;
