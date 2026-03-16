@@ -95,6 +95,9 @@
     <string name="termux_terminal_view_terminal_margin_adjustment_title">终端边距调整</string>
     <string name="termux_terminal_view_terminal_margin_adjustment_off">终端边距调整将被禁用。</string>
     <string name="termux_terminal_view_terminal_margin_adjustment_on">终端边距调整将被启用。建议开启，以尝试修复软键盘遮挡额外按键或终端视图的问题；如果在你的设备上导致屏幕闪烁，请关闭。（默认）</string>
+    <string name="termux_terminal_view_full_screen_swipe_title">全屏滑动</string>
+    <string name="termux_terminal_view_full_screen_swipe_off">仅底部小键盘区域可触发会话原生左右滑动。（默认）</string>
+    <string name="termux_terminal_view_full_screen_swipe_on">整个终端屏幕均可触发会话原生左右滑动。</string>
     <string name="termux_api_preferences_summary">Termux:API 应用偏好设置</string>
     <string name="termux_float_preferences_summary">Termux:Float 应用偏好设置</string>
     <string name="termux_tasker_preferences_summary">Termux:Tasker 应用偏好设置</string>

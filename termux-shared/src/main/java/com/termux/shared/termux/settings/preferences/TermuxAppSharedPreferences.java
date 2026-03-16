@@ -82,6 +82,18 @@ public class TermuxAppSharedPreferences extends AppSharedPreferences {
         return !currentValue;
     }
 
+    public boolean isTerminalFullScreenSwipeEnabled() {
+        return SharedPreferenceUtils.getBoolean(
+            mSharedPreferences,
+            TERMUX_APP.KEY_TERMINAL_FULL_SCREEN_SWIPE,
+            TERMUX_APP.DEFAULT_VALUE_TERMINAL_FULL_SCREEN_SWIPE
+        );
+    }
+
+    public void setTerminalFullScreenSwipeEnabled(boolean value) {
+        SharedPreferenceUtils.setBoolean(mSharedPreferences, TERMUX_APP.KEY_TERMINAL_FULL_SCREEN_SWIPE, value, false);
+    }
+
 
 
     public boolean isTerminalMarginAdjustmentEnabled() {

@@ -318,6 +318,11 @@
                     It should be enabled to try to fix the issue where soft keyboard covers part of extra keys/terminal view.
                     If it causes screen flickering on your devices, then disable it. (Default)</string>
 
+                <!-- Full Screen Swipe -->
+                <string name="termux_terminal_view_full_screen_swipe_title">Full-Screen Swipe</string>
+                <string name="termux_terminal_view_full_screen_swipe_off">Only the bottom keyboard area can start native swipes between sessions. (Default)</string>
+                <string name="termux_terminal_view_full_screen_swipe_on">The whole terminal screen can start native swipes between sessions.</string>
+
 
 
     <!-- Termux:API App Preferences -->

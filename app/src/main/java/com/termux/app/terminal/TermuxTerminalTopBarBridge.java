@@ -29,6 +29,7 @@ public final class TermuxTerminalTopBarBridge {
         @Nullable TermuxService getTermuxService();
         @Nullable TermuxTerminalSessionActivityClient getSessionClient();
         @Nullable TerminalSession getCurrentSession();
+        @Nullable TerminalSession getTopBarSelectedSession();
     }
 
     public static final class Snapshot {
@@ -57,6 +58,7 @@ public final class TermuxTerminalTopBarBridge {
 
         long nowMs = System.currentTimeMillis();
         TerminalSession current = host.getCurrentSession();
+        TerminalSession topBarSelected = host.getTopBarSelectedSession();
         TermuxTerminalSessionActivityClient sessionClient = host.getSessionClient();
         Set<String> pinnedSessionHandles = sessionClient == null
             ? Collections.emptySet()
@@ -71,7 +73,7 @@ public final class TermuxTerminalTopBarBridge {
             TerminalSession session = termuxSession.getTerminalSession();
             if (session == null) continue;
 
-            boolean selected = session == current;
+            boolean selected = session == (topBarSelected != null ? topBarSelected : current);
             boolean pinned = !TextUtils.isEmpty(session.mHandle) &&
                 pinnedSessionHandles.contains(session.mHandle);
             String pinnedDisplayName = pinned && sessionClient != null

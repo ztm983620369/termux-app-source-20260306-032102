@@ -33,6 +33,8 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         void onSessionPageSwipeTouchDown();
         void onSessionPageChangeStarted();
         void onSessionPageChangeFinished();
+        void onSessionPagePreviewSelected(int index, @Nullable TerminalSession session);
+        void onConfigPagePreviewSelected();
         void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser);
         void onConfigPageSelected(boolean fromUser);
         void onActiveTerminalViewChanged(@NonNull TerminalView terminalView, @Nullable TerminalSession session);
@@ -75,6 +77,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     private boolean mSessionPageSwipeTouchActive;
     private boolean mSessionPageChangeInProgress;
     private boolean mProgrammaticFocusAllowed = true;
+    private boolean mFullScreenSessionSwipeEnabled;
 
     public TerminalSessionSurfaceView(Context context) {
         super(context);
@@ -126,7 +129,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
                 if (TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) {
                     return holder.root;
                 }
-                return holder.extraKeysContainer;
+                return mFullScreenSessionSwipeEnabled ? holder.root : holder.extraKeysContainer;
             });
             programmaticViewPager.setSwipeGestureListener(new ProgrammaticViewPager.SwipeGestureListener() {
                 @Override
@@ -171,6 +174,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             @Override
             public void onPageSelected(int position) {
                 mSelectedSessionIndex = sessionPagerAdapter.clampIndex(position);
+                dispatchPreviewPageSelected(mSelectedSessionIndex);
                 if (pagerStateMachine.getState() == TerminalSessionSurfacePagerStateMachine.State.IDLE) {
                     dispatchActivePageChanged(mSelectedSessionIndex, true);
                 }
@@ -400,6 +404,14 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         mProgrammaticFocusAllowed = allowed;
     }
 
+    /**
+     * If enabled, horizontal session paging swipes may start from anywhere on the terminal page.
+     * If disabled, swipes are restricted to the bottom extra keys region.
+     */
+    public void setFullScreenSessionSwipeEnabled(boolean enabled) {
+        mFullScreenSessionSwipeEnabled = enabled;
+    }
+
     public void focusToolbarTextInput() {
         mProgrammaticFocusAllowed = true;
         EditText editText = findViewById(R.id.terminal_surface_text_input);
@@ -437,6 +449,19 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         if (mCallbacks != null) {
             mCallbacks.onSessionPageChangeFinished();
         }
+    }
+
+    private void dispatchPreviewPageSelected(int position) {
+        if (mCallbacks == null) return;
+        PageHolder holder = sessionPagerAdapter.findHolder(position);
+        if (holder == null) return;
+
+        if (TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) {
+            mCallbacks.onConfigPagePreviewSelected();
+            return;
+        }
+
+        mCallbacks.onSessionPagePreviewSelected(position, holder.session);
     }
 
     private void dispatchActivePageChanged(int position, boolean fromUser) {

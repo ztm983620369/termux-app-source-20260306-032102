@@ -286,8 +286,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private boolean mBottomNavFixedOnImeEnabled = true;
     private boolean mSessionListUiUpdateScheduled = false;
     private boolean mTerminalConfigTabSelected = false;
-    private boolean mPendingDisableTerminalConfigPage = false;
     @Nullable private TerminalSession mLastSelectedTerminalSession;
+    @Nullable private TerminalSession mTopBarPreviewSession;
+    private boolean mTopBarPreviewConfigSelected = false;
     private boolean mTerminalSoftKeyboardVisibilityKnown = false;
     private boolean mTerminalSoftKeyboardVisible = false;
     private boolean mTerminalRestoreFocus = false;
@@ -512,6 +513,10 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         Logger.logVerbose(LOG_TAG, "onResume");
 
         if (mIsInvalidState) return;
+
+        if (mTerminalSessionSurfaceView != null && mPreferences != null) {
+            mTerminalSessionSurfaceView.setFullScreenSessionSwipeEnabled(mPreferences.isTerminalFullScreenSwipeEnabled());
+        }
 
         boolean shouldRestoreTerminalFocus =
             mBottomNavTab == TAB_TERMINAL && !mTerminalConfigTabSelected &&
@@ -1633,9 +1638,30 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 }
 
                 @Override
+                public void onSessionPagePreviewSelected(int index, @Nullable TerminalSession session) {
+                    if (session == null) return;
+                    mTopBarPreviewSession = session;
+                    mTopBarPreviewConfigSelected = false;
+                    refreshTerminalTopBar();
+                }
+
+                @Override
+                public void onConfigPagePreviewSelected() {
+                    mTopBarPreviewSession = null;
+                    mTopBarPreviewConfigSelected = true;
+                    refreshTerminalTopBar();
+                }
+
+                @Override
                 public void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser) {
                     if (session == null || mTermuxTerminalSessionActivityClient == null) return;
                     mLastSelectedTerminalSession = session;
+                    clearTopBarSelectionPreview();
+
+                    if (mTerminalConfigTabSelected) {
+                        mTerminalConfigTabSelected = false;
+                        applyTerminalProgrammaticFocusPolicy(false);
+                    }
 
                     mSurfaceSelectionDispatchInProgress = true;
                     try {
@@ -1644,16 +1670,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                         mSurfaceSelectionDispatchInProgress = false;
                     }
                     refreshTerminalTopBar();
-                    if (mPendingDisableTerminalConfigPage && mTerminalSessionSurfaceView != null) {
-                        mPendingDisableTerminalConfigPage = false;
-                        mTerminalSessionSurfaceView.setConfigPageEnabled(false);
-                    }
                 }
 
                 @Override
                 public void onConfigPageSelected(boolean fromUser) {
-                    mTerminalConfigTabSelected = true;
-                    refreshTerminalTopBar();
+                    clearTopBarSelectionPreview();
+                    activateTerminalConfigTabState();
                 }
 
                 @Override
@@ -1673,6 +1695,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             });
             mTerminalView = mTerminalSessionSurfaceView.getCurrentTerminalView();
             updateTerminalContextMenuRegistration(mTerminalView);
+            if (mPreferences != null) {
+                mTerminalSessionSurfaceView.setFullScreenSessionSwipeEnabled(mPreferences.isTerminalFullScreenSwipeEnabled());
+            }
         }
         if (mTerminalTopBarView != null) {
             mTermuxTerminalTopBarBridge = new TermuxTerminalTopBarBridge(
@@ -1700,6 +1725,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                     public TerminalSession getCurrentSession() {
                         return TermuxActivity.this.getCurrentSession();
                     }
+
+                    @Nullable
+                    @Override
+                    public TerminalSession getTopBarSelectedSession() {
+                        return TermuxActivity.this.getTopBarSelectedSession();
+                    }
                 }
             );
             mTerminalTopBarController = new TerminalTopBarController(
@@ -1717,9 +1748,10 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
                     @Override
                     public void onSelectSession(int index) {
+                        clearTopBarSelectionPreview();
                         if (mTerminalConfigTabSelected) {
                             mTerminalConfigTabSelected = false;
-                            mPendingDisableTerminalConfigPage = true;
+                            applyTerminalProgrammaticFocusPolicy(false);
                             refreshTerminalTopBar();
                         }
                         if (mTerminalSessionSurfaceView != null) {
@@ -1786,21 +1818,32 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mTerminalTopBarController == null || mTermuxTerminalTopBarBridge == null) return;
         TermuxTerminalTopBarBridge.Snapshot snapshot = mTermuxTerminalTopBarBridge.capture();
         mTerminalTopBarController.render(snapshot.models);
-        mTerminalTopBarView.setAddButtonSelected(mTerminalConfigTabSelected);
+        mTerminalTopBarView.setAddButtonSelected(isTerminalConfigTabSelectedForTopBar());
         mTermuxTerminalTopBarBridge.publish(snapshot);
+    }
+
+    private void clearTopBarSelectionPreview() {
+        mTopBarPreviewSession = null;
+        mTopBarPreviewConfigSelected = false;
+    }
+
+    @Nullable
+    private TerminalSession getTopBarSelectedSession() {
+        return mTopBarPreviewConfigSelected ? null : mTopBarPreviewSession;
+    }
+
+    private boolean isTerminalConfigTabSelectedForTopBar() {
+        return mTerminalConfigTabSelected || mTopBarPreviewConfigSelected;
     }
 
     private void refreshTerminalSessionSurface() {
         if (mTerminalSessionSurfaceView == null || mTermuxTerminalSessionSurfaceBridge == null) return;
-        updateTerminalConfigPageVisibility();
         TermuxTerminalSessionSurfaceBridge.Snapshot snapshot = mTermuxTerminalSessionSurfaceBridge.capture();
         mTerminalSessionSurfaceHasSnapshot = !snapshot.items.isEmpty();
+        updateTerminalConfigPageVisibility();
         int selectedIndex = snapshot.selectedIndex;
-        if ((mTerminalConfigTabSelected || mPendingDisableTerminalConfigPage) && mTerminalSessionSurfaceView.isConfigPageEnabled()) {
-            int configIndex = mTerminalSessionSurfaceView.getConfigPageIndex();
-            if (configIndex >= 0) {
-                selectedIndex = configIndex;
-            }
+        if (mTerminalConfigTabSelected && mTerminalSessionSurfaceView.isConfigPageEnabled()) {
+            selectedIndex = snapshot.items.size();
         }
         mTerminalSessionSurfaceView.submitSessions(snapshot.items, selectedIndex, false);
     }
@@ -1930,7 +1973,10 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private void updateTerminalConfigPageVisibility() {
         if (mTerminalSessionSurfaceView == null) return;
-        boolean enable = mBottomNavTab == TAB_TERMINAL && (mTerminalConfigTabSelected || mPendingDisableTerminalConfigPage);
+        boolean enable = mBottomNavTab == TAB_TERMINAL && (mTerminalConfigTabSelected || mTerminalSessionSurfaceHasSnapshot);
+        if (enable) {
+            ensureTerminalConfigInitialized();
+        }
         mTerminalSessionSurfaceView.setConfigPageEnabled(enable);
     }
 
@@ -2075,8 +2121,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private void activateTerminalConfigTabState() {
         if (!ensureTerminalConfigInitialized()) return;
+        clearTopBarSelectionPreview();
         mTerminalConfigTabSelected = true;
-        mPendingDisableTerminalConfigPage = false;
         applyTerminalProgrammaticFocusPolicy(false);
         if (mTerminalSessionSurfaceView != null) {
             mTerminalSessionSurfaceView.setConfigPageEnabled(true);
@@ -2097,8 +2143,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private void dismissTerminalConfigTab(boolean returnToPreviousTerminal) {
         if (!mTerminalConfigTabSelected) return;
+        clearTopBarSelectionPreview();
         mTerminalConfigTabSelected = false;
-        mPendingDisableTerminalConfigPage = true;
         applyTerminalProgrammaticFocusPolicy(false);
         refreshTerminalTopBar();
         if (returnToPreviousTerminal) {

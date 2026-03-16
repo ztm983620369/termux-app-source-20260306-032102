@@ -69,6 +69,10 @@ package com.termux.shared.termux.settings.preferences;
  * - 0.16.0 (2022-06-11)
  *      - Added following to `TERMUX_APP`:
  *          `KEY_APP_SHELL_NUMBER_SINCE_BOOT` and `KEY_TERMINAL_SESSION_NUMBER_SINCE_BOOT`.
+ *
+ * - 0.17.0 (2026-03-16)
+ *      - Added following to `TERMUX_APP`:
+ *          `KEY_TERMINAL_FULL_SCREEN_SWIPE` and `DEFAULT_VALUE_TERMINAL_FULL_SCREEN_SWIPE`.
  */
 
 import com.termux.shared.shell.command.ExecutionCommand;
@@ -101,6 +105,13 @@ public final class TermuxPreferenceConstants {
          */
         public static final String KEY_SHOW_TERMINAL_TOOLBAR = "show_extra_keys";
         public static final boolean DEFAULT_VALUE_SHOW_TERMINAL_TOOLBAR = true;
+
+        /**
+         * Defines the key for whether native session paging swipes can start from anywhere on the
+         * terminal surface instead of only from the bottom extra keys region.
+         */
+        public static final String KEY_TERMINAL_FULL_SCREEN_SWIPE = "terminal_full_screen_swipe";
+        public static final boolean DEFAULT_VALUE_TERMINAL_FULL_SCREEN_SWIPE = false;
 
 
         /**
