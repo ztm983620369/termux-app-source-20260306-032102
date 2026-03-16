@@ -22,6 +22,12 @@ public final class TerminalRenderer {
     final Typeface mTypeface;
     private final Paint mTextPaint = new Paint();
 
+    // Cache glyph widths for non-ASCII code points. Terminal output often reuses a small set of
+    // Unicode symbols (e.g. tmux box-drawing). Caching avoids repeated measureText() calls.
+    private static final int WIDTH_CACHE_SIZE = 1024; // must be power of two
+    private final int[] mWidthCacheKeys = new int[WIDTH_CACHE_SIZE];
+    private final float[] mWidthCacheValues = new float[WIDTH_CACHE_SIZE];
+
     /** The width of a single mono spaced character obtained by {@link Paint#measureText(String)} on a single 'X'. */
     final float mFontWidth;
     /** The {@link Paint#getFontSpacing()}. See http://www.fampennings.nl/maarten/android/08numgrid/font.png */
@@ -51,6 +57,19 @@ public final class TerminalRenderer {
             sb.setCharAt(0, (char) i);
             asciiMeasures[i] = mTextPaint.measureText(sb, 0, 1);
         }
+    }
+
+    private float getMeasuredCodePointWidth(int codePoint, char[] line, int start, int charsForCodePoint) {
+        if (codePoint < asciiMeasures.length) return asciiMeasures[codePoint];
+
+        // Cheap hash, overwrite on collision (good enough for small working sets).
+        int slot = (codePoint * 0x9E3779B9) & (WIDTH_CACHE_SIZE - 1);
+        if (mWidthCacheKeys[slot] == codePoint) return mWidthCacheValues[slot];
+
+        float measured = mTextPaint.measureText(line, start, charsForCodePoint);
+        mWidthCacheKeys[slot] = codePoint;
+        mWidthCacheValues[slot] = measured;
+        return measured;
     }
 
     /** Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection. */
@@ -107,8 +126,7 @@ public final class TerminalRenderer {
                 // This could happen for some fonts which are not truly monospace, or for more exotic characters such as
                 // smileys which android font renders as wide.
                 // If this is detected, we draw this code point scaled to match what wcwidth() expects.
-                final float measuredCodePointWidth = (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint] : mTextPaint.measureText(line,
-                    currentCharIndex, charsForCodePoint);
+                final float measuredCodePointWidth = getMeasuredCodePointWidth(codePoint, line, currentCharIndex, charsForCodePoint);
                 final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
 
                 if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideSelection != lastRunInsideSelection || fontWidthMismatch || lastRunFontWidthMismatch) {
