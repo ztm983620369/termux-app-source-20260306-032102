@@ -423,6 +423,9 @@ public final class TerminalBuffer {
         } else {
             mLines[blankRow].clear(style);
         }
+        // Clearing a row should never keep a stale wrap flag, otherwise selection/join logic may
+        // treat the blank row as a continuation of previous output.
+        mLines[blankRow].mLineWrap = false;
     }
 
     /**
@@ -459,6 +462,19 @@ public final class TerminalBuffer {
             throw new IllegalArgumentException(
                 "Illegal arguments! blockSet(" + sx + ", " + sy + ", " + w + ", " + h + ", " + val + ", " + mColumns + ", " + mScreenRows + ")");
         }
+
+        // Fast path: full-width clears are extremely common (tmux, full-screen TUIs).
+        // Avoid per-cell setChar() overhead when we can clear whole rows at once.
+        if (val == ' ' && sx == 0 && w == mColumns) {
+            for (int y = 0; y < h; y++) {
+                int row = externalToInternalRow(sy + y);
+                TerminalRow line = allocateFullLineIfNecessary(row);
+                line.clear(style);
+                line.mLineWrap = false;
+            }
+            return;
+        }
+
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 setChar(sx + x, sy + y, val, style);
