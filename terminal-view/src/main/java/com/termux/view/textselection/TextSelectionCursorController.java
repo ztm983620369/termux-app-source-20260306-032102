@@ -1,14 +1,21 @@
 package com.termux.view.textselection;
 
+import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
+import android.text.Spannable;
+import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
 import android.text.TextUtils;
+import android.text.style.URLSpan;
+import android.text.util.Linkify;
 import android.view.ActionMode;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -19,12 +26,12 @@ import androidx.annotation.Nullable;
 
 import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalRow;
-import com.termux.terminal.UrlDetector;
 import com.termux.terminal.WcWidth;
 import com.termux.view.R;
 import com.termux.view.TerminalView;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 
@@ -55,6 +62,11 @@ public class TextSelectionCursorController implements CursorController {
     private int mCachedUrlSelY2 = Integer.MIN_VALUE;
     @Nullable
     private LinkedHashSet<String> mCachedDetectedUrls;
+
+    private static final int MAX_URLS_TO_SHOW = 32;
+    private static final int MAX_URL_SCAN_CHARS = 24_000;
+    private static final int URL_EXTRACT_CHUNK_ROWS = 32;
+    private static final int URL_FULL_SCAN_MAX_ROWS = 60;
 
     public TextSelectionCursorController(TerminalView terminalView) {
         this.terminalView = terminalView;
@@ -186,10 +198,13 @@ public class TextSelectionCursorController implements CursorController {
                         terminalView.stopTextSelectionMode();
                         break;
                     case ACTION_OPEN:
-                        String url = getBestDetectedUrlForSelection();
-                        if (!TextUtils.isEmpty(url)) {
+                        // Re-compute from the actual selected text so we always act on exactly what
+                        // the user selected.
+                        LinkedHashSet<String> urls = extractUrlsForCurrentSelection();
+                        if (urls.isEmpty()) urls = getDetectedUrlsForSelection();
+                        if (!urls.isEmpty()) {
                             terminalView.stopTextSelectionMode();
-                            openUrl(url);
+                            openUrls(urls);
                         }
                         break;
                     case ACTION_PASTE:
@@ -268,13 +283,6 @@ public class TextSelectionCursorController implements CursorController {
         }, ActionMode.TYPE_FLOATING);
     }
 
-    @Nullable
-    private String getBestDetectedUrlForSelection() {
-        LinkedHashSet<String> urls = getDetectedUrlsForSelection();
-        if (urls.isEmpty()) return null;
-        return urls.iterator().next();
-    }
-
     private void invalidateDetectedUrlCache() {
         mCachedUrlSelX1 = Integer.MIN_VALUE;
         mCachedUrlSelY1 = Integer.MIN_VALUE;
@@ -306,43 +314,143 @@ public class TextSelectionCursorController implements CursorController {
         TerminalBuffer screen = terminalView.mEmulator.getScreen();
         final int columns = terminalView.mEmulator.mColumns;
 
-        // Prefer local context near selection (fast, avoids scanning huge selection ranges).
-        List<String> probes = new ArrayList<>(8);
+        List<CharSequence> probes = new ArrayList<>(6);
+
+        // Fallback: also probe local context near the handles to keep "Open" visible when the
+        // selection is large (avoids scanning huge selection ranges).
         probes.add(screen.getWordAtLocation(mSelX1, mSelY1));
         probes.add(screen.getWordAtLocation(mSelX2, mSelY2));
-
-        // For small selections, also scan selected text directly (helps when selection spans multiple tokens).
         int rowSpan = Math.abs(mSelY2 - mSelY1) + 1;
-        if (rowSpan == 1) {
+        if (rowSpan <= URL_FULL_SCAN_MAX_ROWS) {
+            // Safe for UI thread: bounded selection size. Use full selection text to avoid missing URLs
+            // when the selection spans multiple tokens.
+            CharSequence selectionText = truncateForUrlScan(
+                screen.getSelectedText(mSelX1, mSelY1, mSelX2, mSelY2, /*joinBackLines*/ true, /*joinFullLines*/ true)
+            );
+            probes.add(selectionText);
+        } else if (rowSpan == 1) {
             int midX = (mSelX1 + mSelX2) / 2;
             probes.add(screen.getWordAtLocation(midX, mSelY1));
-        } else if (rowSpan == 2) {
-            int midStartX = (mSelX1 + (columns - 1)) / 2;
-            probes.add(screen.getWordAtLocation(midStartX, mSelY1));
-
-            int midEndX = mSelX2 / 2;
-            probes.add(screen.getWordAtLocation(midEndX, mSelY2));
-        } else {
-            // Probe an intermediate row where selection is full-width to avoid false positives from
-            // sampling outside the selected range on the start/end rows.
+        } else if (rowSpan >= 3) {
+            // Probe an intermediate row where selection is likely full-width to reduce sampling outside
+            // the selected range on the start/end rows.
             int midY = (mSelY1 + mSelY2) / 2;
             if (midY == mSelY1) midY++;
             else if (midY == mSelY2) midY--;
             int midX = columns / 2;
             probes.add(screen.getWordAtLocation(midX, midY));
         }
-        if (rowSpan <= 6) {
-            probes.add(getSelectedText());
-        }
 
-        for (String probe : probes) {
+        for (CharSequence probe : probes) {
             if (TextUtils.isEmpty(probe)) continue;
-            urls.addAll(UrlDetector.extractUrls(probe, /*allowWithoutScheme*/ true));
-            if (urls.size() >= 4) break; // keep UI decision fast and deterministic
+            urls.addAll(extractUrlsWithLinkify(probe));
+            if (urls.size() >= MAX_URLS_TO_SHOW) break;
         }
 
         mCachedDetectedUrls = urls;
         return urls;
+    }
+
+    private LinkedHashSet<String> extractUrlsForCurrentSelection() {
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        if (terminalView.mEmulator == null) return out;
+
+        TerminalBuffer screen = terminalView.mEmulator.getScreen();
+        final int columns = terminalView.mEmulator.mColumns;
+        final int rowSpan = Math.abs(mSelY2 - mSelY1) + 1;
+
+        if (rowSpan <= URL_FULL_SCAN_MAX_ROWS) {
+            CharSequence selectionText = truncateForUrlScan(
+                screen.getSelectedText(mSelX1, mSelY1, mSelX2, mSelY2, /*joinBackLines*/ true, /*joinFullLines*/ true)
+            );
+            return extractUrlsWithLinkify(selectionText);
+        }
+
+        // For huge selections, avoid constructing a giant String on the UI thread.
+        int startRow = mSelY1;
+        while (startRow <= mSelY2 && out.size() < MAX_URLS_TO_SHOW) {
+            int endRow = Math.min(mSelY2, startRow + URL_EXTRACT_CHUNK_ROWS - 1);
+            int x1 = (startRow == mSelY1) ? mSelX1 : 0;
+            int x2 = (endRow == mSelY2) ? mSelX2 : columns;
+
+            CharSequence chunk = truncateForUrlScan(
+                screen.getSelectedText(x1, startRow, x2, endRow, /*joinBackLines*/ true, /*joinFullLines*/ true)
+            );
+            out.addAll(extractUrlsWithLinkify(chunk));
+
+            if (endRow >= mSelY2) break;
+            // Overlap 1 row to avoid missing a URL that wraps across chunk boundaries.
+            startRow = endRow;
+        }
+
+        return out;
+    }
+
+    private static CharSequence truncateForUrlScan(CharSequence text) {
+        if (text == null) return "";
+        if (text.length() <= MAX_URL_SCAN_CHARS) return text;
+        return text.subSequence(0, MAX_URL_SCAN_CHARS);
+    }
+
+    private static LinkedHashSet<String> extractUrlsWithLinkify(@Nullable CharSequence text) {
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        if (TextUtils.isEmpty(text)) return out;
+
+        Spannable spannable = new SpannableString(text);
+        // Use the platform URL detector instead of maintaining our own matching logic here.
+        Linkify.addLinks(spannable, Linkify.WEB_URLS);
+
+        URLSpan[] spans = spannable.getSpans(0, spannable.length(), URLSpan.class);
+        if (spans == null || spans.length == 0) return out;
+
+        // Make extraction deterministic: order by appearance in the text.
+        Arrays.sort(spans, (a, b) -> Integer.compare(spannable.getSpanStart(a), spannable.getSpanStart(b)));
+
+        for (URLSpan span : spans) {
+            if (span == null) continue;
+            String url = span.getURL();
+            if (TextUtils.isEmpty(url)) continue;
+            out.add(url);
+            if (out.size() >= MAX_URLS_TO_SHOW) break;
+        }
+
+        return out;
+    }
+
+    @Nullable
+    private static Activity findActivity(Context context) {
+        Context current = context;
+        while (current instanceof ContextWrapper) {
+            if (current instanceof Activity) return (Activity) current;
+            current = ((ContextWrapper) current).getBaseContext();
+        }
+        return null;
+    }
+
+    private void openUrls(LinkedHashSet<String> urls) {
+        if (urls == null || urls.isEmpty()) return;
+
+        if (urls.size() == 1) {
+            openUrl(urls.iterator().next());
+            return;
+        }
+
+        Activity activity = findActivity(terminalView.getContext());
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+            // Best effort: no valid Activity context to show a dialog.
+            openUrl(urls.iterator().next());
+            return;
+        }
+
+        final String[] items = urls.toArray(new String[0]);
+        new AlertDialog.Builder(activity)
+            .setTitle(R.string.open_url_choose_title)
+            .setItems(items, (dialog, which) -> {
+                if (which < 0 || which >= items.length) return;
+                openUrl(items[which]);
+            })
+            .setNegativeButton(android.R.string.cancel, null)
+            .show();
     }
 
     private void openUrl(String url) {

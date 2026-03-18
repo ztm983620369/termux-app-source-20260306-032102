@@ -205,9 +205,6 @@ class ItemsAdapter(
             findItem(R.id.cab_open_with).isVisible = isOneFileSelected()
             findItem(R.id.cab_open_as).isVisible = isOneFileSelected()
             findItem(R.id.cab_set_as).isVisible = isOneFileSelected()
-            findItem(R.id.cab_create_shortcut).isVisible = isOneItemSelected()
-
-            checkHideBtnVisibility(this)
         }
     }
 
@@ -220,12 +217,8 @@ class ItemsAdapter(
             R.id.cab_confirm_selection -> confirmSelection()
             R.id.cab_rename -> displayRenameDialog()
             R.id.cab_properties -> showProperties()
-            R.id.cab_share -> shareFiles()
             R.id.add_favorite -> addSelectedItemToFavorites()
             R.id.remove_favorite -> removeSelectedItemFromFavorites()
-            R.id.cab_hide -> toggleFileVisibility(true)
-            R.id.cab_unhide -> toggleFileVisibility(false)
-            R.id.cab_create_shortcut -> createShortcut()
             R.id.cab_copy_path -> copyPath()
             R.id.cab_set_as -> setAs()
             R.id.cab_open_with -> openWith()
@@ -234,7 +227,6 @@ class ItemsAdapter(
             R.id.cab_move_to -> tryMoveFiles()
             R.id.cab_compress -> compressSelection()
             R.id.cab_decompress -> decompressSelection()
-            R.id.cab_select_all -> selectAll()
             R.id.cab_delete -> if (config.skipDeleteConfirmation) deleteFiles() else askConfirmDelete()
         }
     }
@@ -315,21 +307,6 @@ class ItemsAdapter(
         return isOneItemSelected() && getItemWithKey(selectedKeys.first())?.isDirectory == false
     }
 
-    private fun checkHideBtnVisibility(menu: Menu) {
-        var hiddenCnt = 0
-        var unhiddenCnt = 0
-        getSelectedFileDirItems().map { it.name }.forEach {
-            if (it.startsWith(".")) {
-                hiddenCnt++
-            } else {
-                unhiddenCnt++
-            }
-        }
-
-        menu.findItem(R.id.cab_hide).isVisible = unhiddenCnt > 0
-        menu.findItem(R.id.cab_unhide).isVisible = hiddenCnt > 0
-    }
-
     private data class LongPressAction(val id: Int, val title: String)
 
     private fun showLongPressActionDialog(position: Int) {
@@ -383,11 +360,9 @@ class ItemsAdapter(
         }
         actions.add(LongPressAction(R.id.cab_rename, activity.getString(R.string.rename)))
         actions.add(LongPressAction(R.id.cab_properties, activity.getString(R.string.properties)))
-        actions.add(LongPressAction(R.id.cab_share, activity.getString(R.string.share)))
 
         if (isOneItemSelected()) {
             actions.add(LongPressAction(R.id.cab_copy_path, activity.getString(R.string.copy_path)))
-            actions.add(LongPressAction(R.id.cab_create_shortcut, activity.getString(R.string.create_shortcut)))
             val selectedPath = getFirstSelectedItemPath()
             val isFavorite = config.isFavorite(selectedPath)
             actions.add(
@@ -402,12 +377,6 @@ class ItemsAdapter(
             actions.add(LongPressAction(R.id.cab_open_as, activity.getString(R.string.open_as)))
             actions.add(LongPressAction(R.id.cab_set_as, activity.getString(R.string.set_as)))
         }
-        if (unhiddenCnt > 0) {
-            actions.add(LongPressAction(R.id.cab_hide, activity.getString(R.string.hide)))
-        }
-        if (hiddenCnt > 0) {
-            actions.add(LongPressAction(R.id.cab_unhide, activity.getString(R.string.unhide)))
-        }
 
         actions.add(LongPressAction(R.id.cab_copy_to, activity.getString(R.string.copy_to)))
         actions.add(LongPressAction(R.id.cab_move_to, activity.getString(R.string.move_to)))
@@ -418,7 +387,6 @@ class ItemsAdapter(
             actions.add(LongPressAction(R.id.cab_decompress, activity.getString(R.string.decompress)))
         }
 
-        actions.add(LongPressAction(R.id.cab_select_all, activity.getString(R.string.select_all)))
         actions.add(LongPressAction(R.id.cab_delete, activity.getString(R.string.delete)))
         return actions
     }
@@ -428,10 +396,8 @@ class ItemsAdapter(
             R.id.cab_confirm_selection,
             R.id.cab_rename,
             R.id.cab_properties,
-            R.id.cab_share,
             R.id.add_favorite,
             R.id.remove_favorite,
-            R.id.cab_create_shortcut,
             R.id.cab_copy_path,
             R.id.cab_set_as,
             R.id.cab_open_with,

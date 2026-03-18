@@ -2,5 +2,6 @@
   <string name="paste_text">粘贴</string>
   <string name="copy_text">复制</string>
   <string name="open_url">打开</string>
+  <string name="open_url_choose_title">选择要打开的链接</string>
   <string name="text_selection_more">操作</string>
 </resources>
