@@ -1,0 +1,17 @@
+package com.termux.sshconnectioncore;
+
+public enum SshConnectionFailureCategory {
+    NONE,
+    INVALID_PROFILE,
+    TRUST_MISSING_APPROVAL,
+    TRUST_CONFLICT,
+    AUTH_FAILED,
+    NETWORK_UNREACHABLE,
+    DNS_FAILED,
+    CONNECTION_REFUSED,
+    TIMEOUT,
+    REMOTE_CAPABILITY_MISSING,
+    ENGINE_MISMATCH,
+    CANCELLED,
+    INTERNAL_ERROR
+}

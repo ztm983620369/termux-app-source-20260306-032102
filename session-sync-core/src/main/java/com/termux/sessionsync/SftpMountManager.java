@@ -6,6 +6,8 @@ import android.text.TextUtils;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.termux.sshconnectioncore.SshKnownHostsFiles;
+
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -109,7 +111,13 @@ public final class SftpMountManager {
                     "", "挂载失败：无法创建挂载目录。");
             }
 
-            String command = buildMountCommand(sshfsBin, sshpassBin, parsed, mountPath);
+            String command = buildMountCommand(
+                sshfsBin,
+                sshpassBin,
+                parsed,
+                mountPath,
+                SshKnownHostsFiles.resolveManagedKnownHostsPath(context)
+            );
             CommandResult result = runShellCommand(command, DEFAULT_TIMEOUT_MS);
             if (result.timedOut) {
                 return SftpMountResult.fail(mountPath, result.exitCode, true, result.stdout, result.stderr,
@@ -193,7 +201,8 @@ public final class SftpMountManager {
 
     @NonNull
     private static String buildMountCommand(@NonNull File sshfsBin, @NonNull File sshpassBin,
-                                            @NonNull ParsedSshCommand parsed, @NonNull String mountPath) {
+                                            @NonNull ParsedSshCommand parsed, @NonNull String mountPath,
+                                            @NonNull String managedKnownHostsPath) {
         ArrayList<String> args = new ArrayList<>();
         if (!TextUtils.isEmpty(parsed.password)) {
             args.add(sshpassBin.getAbsolutePath());
@@ -217,9 +226,22 @@ public final class SftpMountManager {
 
         for (String opt : parsed.sshOptions) {
             if (TextUtils.isEmpty(opt)) continue;
+            String lower = opt.trim().toLowerCase(Locale.ROOT);
+            if (lower.startsWith("userknownhostsfile=")
+                || lower.startsWith("globalknownhostsfile=")
+                || lower.startsWith("hashknownhosts=")) {
+                continue;
+            }
             args.add("-o");
             args.add(opt);
         }
+
+        args.add("-o");
+        args.add("UserKnownHostsFile=" + managedKnownHostsPath);
+        args.add("-o");
+        args.add("GlobalKnownHostsFile=/dev/null");
+        args.add("-o");
+        args.add("HashKnownHosts=no");
 
         return "mkdir -p " + quoteArg(mountPath) + " && " + joinShellArgs(args);
     }
@@ -262,7 +284,7 @@ public final class SftpMountManager {
         } else if (lower.contains("could not resolve hostname") || lower.contains("name or service not known")) {
             return "挂载失败：域名解析失败（主机名错误或 DNS 不可用）。";
         } else if (lower.contains("host key verification failed")) {
-            return "挂载失败：主机指纹校验失败，请先在终端手动确认主机指纹。";
+            return "挂载失败：主机指纹待批准或待替换，请先在“指纹管理”中处理后再重试。";
         } else if (lower.contains("no such file or directory")) {
             return "挂载失败：远端路径不存在，或本地挂载路径异常。";
         } else if (lower.contains("read-only file system")) {

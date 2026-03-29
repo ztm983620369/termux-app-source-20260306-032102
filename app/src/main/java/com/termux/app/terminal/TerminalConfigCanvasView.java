@@ -27,6 +27,7 @@ public final class TerminalConfigCanvasView extends View {
         void onCreateLocalSession();
         void onAddSshProfile();
         void onConnectProfile(@NonNull String profileId);
+        void onManageTrustProfile(@NonNull String profileId);
         void onEditProfile(@NonNull String profileId);
         void onOpenTmuxProfile(@NonNull String profileId);
         void onBackFromTmux();
@@ -45,6 +46,7 @@ public final class TerminalConfigCanvasView extends View {
     private static final int ACTION_PROFILE_EDIT = 11;
     private static final int ACTION_PROFILE_TMUX = 12;
     private static final int ACTION_PROFILE_DELETE = 13;
+    private static final int ACTION_PROFILE_TRUST = 14;
     private static final int ACTION_CLOSE = 20;
     private static final int ACTION_TMUX_BACK = 21;
     private static final int ACTION_TMUX_REFRESH = 22;
@@ -293,7 +295,7 @@ public final class TerminalConfigCanvasView extends View {
         }
 
         for (TermuxTerminalSessionActivityClient.ConfigProfileItem profile : profiles) {
-            float cardHeight = 116f * density;
+            float cardHeight = 152f * density;
             RectF card = new RectF(left, top, right, top + cardHeight);
             canvas.drawRoundRect(card, cardRadiusPx, cardRadiusPx, cardPaint);
             hitTargets.add(new HitTarget(card.left, card.top, card.right, card.bottom, ACTION_PROFILE_CONNECT, profile.id));
@@ -302,13 +304,19 @@ public final class TerminalConfigCanvasView extends View {
                 bodyPaint, card.width() - 32f * density);
             drawSingleLine(canvas, profile.summary, card.left + 16f * density, card.top + 52f * density,
                 smallPaint, card.width() - 32f * density);
+            drawSingleLine(canvas, profile.trustSummary, card.left + 16f * density, card.top + 74f * density,
+                smallPaint, card.width() - 32f * density);
 
-            float chipTop = card.bottom - actionChipHeightPx - 14f * density;
+            float chipTopRow1 = card.bottom - (actionChipHeightPx * 2f) - actionChipGapPx - 14f * density;
+            float chipTopRow2 = card.bottom - actionChipHeightPx - 14f * density;
             float chipLeft = card.left + 16f * density;
-            chipLeft = drawActionChip(canvas, chipLeft, chipTop, "连接", ACTION_PROFILE_CONNECT, profile.id, false);
-            chipLeft = drawActionChip(canvas, chipLeft, chipTop, "tmux", ACTION_PROFILE_TMUX, profile.id, false);
-            chipLeft = drawActionChip(canvas, chipLeft, chipTop, "编辑", ACTION_PROFILE_EDIT, profile.id, false);
-            drawActionChip(canvas, chipLeft, chipTop, "删除", ACTION_PROFILE_DELETE, profile.id, true);
+            chipLeft = drawActionChip(canvas, chipLeft, chipTopRow1, "连接", ACTION_PROFILE_CONNECT, profile.id, false);
+            chipLeft = drawActionChip(canvas, chipLeft, chipTopRow1, "tmux", ACTION_PROFILE_TMUX, profile.id, false);
+            drawActionChip(canvas, chipLeft, chipTopRow1, "指纹", ACTION_PROFILE_TRUST, profile.id, false);
+
+            chipLeft = card.left + 16f * density;
+            chipLeft = drawActionChip(canvas, chipLeft, chipTopRow2, "编辑", ACTION_PROFILE_EDIT, profile.id, false);
+            drawActionChip(canvas, chipLeft, chipTopRow2, "删除", ACTION_PROFILE_DELETE, profile.id, true);
 
             top += cardHeight + cardGapPx;
         }
@@ -524,6 +532,9 @@ public final class TerminalConfigCanvasView extends View {
                     return;
                 case ACTION_PROFILE_CONNECT:
                     if (target.profileId != null) c.onConnectProfile(target.profileId);
+                    return;
+                case ACTION_PROFILE_TRUST:
+                    if (target.profileId != null) c.onManageTrustProfile(target.profileId);
                     return;
                 case ACTION_PROFILE_EDIT:
                     if (target.profileId != null) c.onEditProfile(target.profileId);

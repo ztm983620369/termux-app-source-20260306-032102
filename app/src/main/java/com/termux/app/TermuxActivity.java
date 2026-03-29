@@ -1875,6 +1875,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             }
 
             @Override
+            public void onManageTrustProfile(@NonNull String profileId) {
+                if (mTermuxTerminalSessionActivityClient != null) {
+                    mTermuxTerminalSessionActivityClient.openTrustManagerFromConfigTab(profileId);
+                }
+            }
+
+            @Override
             public void onEditProfile(@NonNull String profileId) {
                 if (mTermuxTerminalSessionActivityClient != null) {
                     mTermuxTerminalSessionActivityClient.openProfileEditorFromConfigTab(profileId);

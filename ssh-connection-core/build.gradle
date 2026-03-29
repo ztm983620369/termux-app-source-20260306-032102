@@ -1,7 +1,7 @@
 apply plugin: 'com.android.library'
 
 android {
-    namespace "com.termux.sessionsync"
+    namespace "com.termux.sshconnectioncore"
 
     compileSdkVersion project.properties.compileSdkVersion.toInteger()
 
@@ -23,7 +23,5 @@ android {
 
 dependencies {
     implementation "androidx.annotation:annotation:1.9.0"
-    implementation "com.github.mwiede:jsch:0.2.20"
-    api project(":ssh-connection-core")
     testImplementation "junit:junit:4.13.2"
 }

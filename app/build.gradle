@@ -56,6 +56,7 @@ android {
         implementation project(":terminal-session-surface")
         implementation project(":terminal-session-core")
         implementation project(":terminal-session-runtime")
+        implementation project(":ssh-connection-core")
         implementation project(":system-status-surface")
         implementation project(":ui-shell")
         implementation(project(":sora-demo")) {
@@ -254,6 +255,45 @@ abstract class DownloadBootstrapsTask extends org.gradle.api.DefaultTask {
         def baseUrl = bootstrapBaseUrl.get().toString().trim().replaceAll("/+\$", "")
 
         def getProxyForUrl = { URL url ->
+            def getSystemProxy = { URL targetUrl ->
+                def httpSchemes = targetUrl.protocol == "https" ? ["https", "http"] :
+                    (targetUrl.protocol == "http" ? ["http"] : [])
+
+                for (def scheme : httpSchemes) {
+                    def host = System.getProperty("${scheme}.proxyHost")
+                    def portValue = System.getProperty("${scheme}.proxyPort")
+                    if (host != null && host.toString().trim() && portValue != null && portValue.toString().trim()) {
+                        try {
+                            def port = Integer.parseInt(portValue.toString().trim())
+                            if (port > 0) {
+                                return new java.net.Proxy(
+                                    java.net.Proxy.Type.HTTP,
+                                    new java.net.InetSocketAddress(host.toString().trim(), port)
+                                )
+                            }
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                }
+
+                def socksHost = System.getProperty("socksProxyHost")
+                def socksPortValue = System.getProperty("socksProxyPort")
+                if (socksHost != null && socksHost.toString().trim() && socksPortValue != null && socksPortValue.toString().trim()) {
+                    try {
+                        def socksPort = Integer.parseInt(socksPortValue.toString().trim())
+                        if (socksPort > 0) {
+                            return new java.net.Proxy(
+                                java.net.Proxy.Type.SOCKS,
+                                new java.net.InetSocketAddress(socksHost.toString().trim(), socksPort)
+                            )
+                        }
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+
+                return null
+            }
+
             def envKeys = []
             if (url.protocol == "https") {
                 envKeys = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
@@ -268,7 +308,7 @@ abstract class DownloadBootstrapsTask extends org.gradle.api.DefaultTask {
                 proxySpec = System.getenv(key)
                 if (proxySpec != null && proxySpec.toString().trim()) break
             }
-            if (proxySpec == null || !proxySpec.toString().trim()) return null
+            if (proxySpec == null || !proxySpec.toString().trim()) return getSystemProxy(url)
 
             def proxyUrl
             try {
@@ -277,11 +317,11 @@ abstract class DownloadBootstrapsTask extends org.gradle.api.DefaultTask {
                 try {
                     proxyUrl = new URI("http://" + proxySpec.toString().trim())
                 } catch (Exception ignored2) {
-                    return null
+                    return getSystemProxy(url)
                 }
             }
 
-            if (proxyUrl.host == null || proxyUrl.port <= 0) return null
+            if (proxyUrl.host == null || proxyUrl.port <= 0) return getSystemProxy(url)
 
             def proxyType = java.net.Proxy.Type.HTTP
             if (proxyUrl.scheme != null && proxyUrl.scheme.toLowerCase().startsWith("socks")) {

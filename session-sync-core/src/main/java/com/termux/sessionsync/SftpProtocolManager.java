@@ -13,6 +13,7 @@ import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.SftpATTRS;
 import com.jcraft.jsch.SftpException;
 import com.jcraft.jsch.SftpProgressMonitor;
+import com.termux.sshconnectioncore.ResolvedSshEndpoint;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -3052,11 +3053,18 @@ public final class SftpProtocolManager {
                 throw new IllegalStateException(parsed.errorMessage);
             }
 
+            ResolvedSshEndpoint resolvedEndpoint = SessionEntrySshEndpointResolver.resolve(entry);
+            if (resolvedEndpoint == null) {
+                resolvedEndpoint = SessionEntrySshEndpointResolver.fallback(
+                    entry, parsed.host, parsed.port, parsed.user, parsed.identityPath);
+            }
+
             JSch jsch = new JSch();
             File homeDir = new File(context.getFilesDir(), "home");
             addSshIdentities(jsch, homeDir, parsed);
             SshHostTrustStore trustStore = SshHostTrustStore.getInstance();
             trustStore.initialize(context);
+            trustStore.setActiveEndpoint(resolvedEndpoint);
             jsch.setHostKeyRepository(trustStore);
 
             com.jcraft.jsch.Session session = jsch.getSession(parsed.user, parsed.host, parsed.port);
@@ -3074,13 +3082,33 @@ public final class SftpProtocolManager {
                 session.setTimeout(20_000);
             } catch (Throwable ignored) {
             }
-            session.connect(15_000);
+            try {
+                session.connect(15_000);
+            } catch (Exception connectError) {
+                throw decorateTrustFailure(trustStore, resolvedEndpoint, connectError);
+            } finally {
+                trustStore.clearActiveEndpoint();
+            }
 
             ClientHolder newHolder = new ClientHolder(clientKey, entry.id, session);
             mClients.put(clientKey, newHolder);
             cleanupPendingRemoteTempPaths(context, entry, newHolder);
             return newHolder;
         }
+    }
+
+    @NonNull
+    private static Exception decorateTrustFailure(@NonNull SshHostTrustStore trustStore,
+                                                  @NonNull ResolvedSshEndpoint endpoint,
+                                                  @NonNull Exception error) {
+        com.termux.sshconnectioncore.SshPendingTrustRecord pending =
+            trustStore.findPendingByAuthority(endpoint.authorityKey);
+        if (pending == null) return error;
+
+        String message = pending.replacementRequired
+            ? "检测到主机指纹发生变化，需先在“指纹管理”中替换后再重试。"
+            : "首次检测到该服务器主机指纹，需先在“指纹管理”中批准后再重试。";
+        return new IllegalStateException(message, error);
     }
 
     @NonNull
@@ -3406,7 +3434,7 @@ public final class SftpProtocolManager {
         if (lower.contains("reject hostkey")
             || lower.contains("hostkey has been changed")
             || lower.contains("host key has been changed")) {
-            return "\u4e3b\u673a\u6307\u7eb9\u6821\u9a8c\u5931\u8d25\uff08\u670d\u52a1\u5668\u5bc6\u94a5\u53ef\u80fd\u53d1\u751f\u53d8\u66f4\uff09\u3002";
+            return "\u4e3b\u673a\u6307\u7eb9\u5f85\u6279\u51c6\u6216\u5f85\u66ff\u6362\uff0c\u8bf7\u5148\u5728\u201c\u6307\u7eb9\u7ba1\u7406\u201d\u4e2d\u5904\u7406\u540e\u518d\u91cd\u8bd5\u3002";
         }
         if (lower.contains("connection refused")) {
             return "\u8fde\u63a5\u88ab\u62d2\u7edd\uff08\u7aef\u53e3\u672a\u5f00\u653e\u6216\u0020\u0073\u0073\u0068\u0064\u0020\u672a\u542f\u52a8\uff09\u3002";

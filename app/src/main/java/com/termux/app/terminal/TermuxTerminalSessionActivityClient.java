@@ -42,6 +42,17 @@ import com.termux.shared.termux.shell.command.environment.TermuxShellEnvironment
 import com.termux.shared.termux.settings.properties.TermuxPropertyConstants;
 import com.termux.shared.termux.terminal.io.BellHandler;
 import com.termux.shared.logger.Logger;
+import com.termux.sessionsync.SavedSshProfileStore;
+import com.termux.sessionsync.SessionEntry;
+import com.termux.sessionsync.SessionFileCoordinator;
+import com.termux.sessionsync.SftpProtocolManager;
+import com.termux.sshconnectioncore.LegacySshCommandProfileResolver;
+import com.termux.sshconnectioncore.SshPendingTrustRecord;
+import com.termux.sshconnectioncore.ResolvedSshEndpoint;
+import com.termux.sshconnectioncore.SshCommandKnownHostsOptions;
+import com.termux.sshconnectioncore.SshKnownHostsFiles;
+import com.termux.sshconnectioncore.SshProfileResolutionResult;
+import com.termux.sshconnectioncore.SshTrustRecord;
 import com.termux.terminal.TerminalColors;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
@@ -779,13 +790,18 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         @NonNull public final String id;
         @NonNull public final String title;
         @NonNull public final String summary;
+        @NonNull public final String trustSummary;
+        public final boolean hasPendingTrust;
         public final boolean hasPassword;
 
         public ConfigProfileItem(@NonNull String id, @NonNull String title,
-                                 @NonNull String summary, boolean hasPassword) {
+                                 @NonNull String summary, @NonNull String trustSummary,
+                                 boolean hasPendingTrust, boolean hasPassword) {
             this.id = id;
             this.title = title;
             this.summary = summary;
+            this.trustSummary = trustSummary;
+            this.hasPendingTrust = hasPendingTrust;
             this.hasPassword = hasPassword;
         }
     }
@@ -840,12 +856,18 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     public ArrayList<ConfigProfileItem> getConfigProfileItems() {
         ArrayList<SshProfile> profiles = loadSshProfiles();
         ArrayList<ConfigProfileItem> items = new ArrayList<>(profiles.size());
+        SessionFileCoordinator coordinator = SessionFileCoordinator.getInstance();
+        coordinator.initialize(mActivity);
         for (SshProfile profile : profiles) {
             if (profile == null) continue;
+            SessionEntry entry = findSessionEntryForProfileId(profile.id);
+            SshPendingTrustRecord pending = entry == null ? null : coordinator.getPendingTrustForEntry(mActivity, entry);
             items.add(new ConfigProfileItem(
                 profile.id,
                 profile.displayName,
                 buildSshProfileSummary(profile),
+                buildTrustSummary(coordinator, entry, pending),
+                pending != null,
                 !TextUtils.isEmpty(profile.password)
             ));
         }
@@ -862,6 +884,16 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         return null;
     }
 
+    @Nullable
+    private SessionEntry findSessionEntryForProfileId(@Nullable String profileId) {
+        if (TextUtils.isEmpty(profileId)) return null;
+        String entryId = SavedSshProfileStore.PROFILE_ENTRY_ID_PREFIX + profileId;
+        for (SessionEntry entry : SavedSshProfileStore.loadSessionEntries(mActivity)) {
+            if (entry != null && entryId.equals(entry.id)) return entry;
+        }
+        return null;
+    }
+
     public void connectProfileFromConfigTab(@Nullable String profileId) {
         SshProfile profile = findSshProfileById(profileId);
         if (profile == null) {
@@ -873,6 +905,20 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     public void openProfileEditorFromConfigTab(@Nullable String profileId) {
         showSshProfileEditorDialog(findSshProfileById(profileId), false);
+    }
+
+    public void openTrustManagerFromConfigTab(@Nullable String profileId) {
+        SshProfile profile = findSshProfileById(profileId);
+        if (profile == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            return;
+        }
+        SessionEntry entry = findSessionEntryForProfileId(profile.id);
+        if (entry == null) {
+            mActivity.showToast("未找到对应的共享 SSH 会话映射。", true);
+            return;
+        }
+        showTrustManagerDialog(profile, entry);
     }
 
     public void openPersistenceManagerFromConfigTab(@Nullable String profileId) {
@@ -1277,6 +1323,105 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         return sb.toString();
     }
 
+    @NonNull
+    private String buildTrustSummary(@NonNull SessionFileCoordinator coordinator,
+                                     @Nullable SessionEntry entry,
+                                     @Nullable SshPendingTrustRecord pending) {
+        if (entry == null) return "指纹：未建立共享会话映射";
+        if (pending != null) {
+            return pending.replacementRequired
+                ? "指纹：待替换 · " + abbreviateFingerprint(pending.observedFingerprintSha256)
+                : "指纹：待批准 · " + abbreviateFingerprint(pending.observedFingerprintSha256);
+        }
+        ArrayList<SshTrustRecord> records = new ArrayList<>(coordinator.listTrustedHostsForEntry(mActivity, entry));
+        if (records.isEmpty()) return "指纹：暂无已信任记录";
+
+        SshTrustRecord latest = records.get(0);
+        for (SshTrustRecord record : records) {
+            if (record != null && record.lastSeenAtMs > latest.lastSeenAtMs) {
+                latest = record;
+            }
+        }
+        return "指纹：" + records.size() + " 条 · "
+            + latest.algorithm + " · "
+            + abbreviateFingerprint(latest.fingerprintSha256);
+    }
+
+    @NonNull
+    private String abbreviateFingerprint(@Nullable String raw) {
+        String value = raw == null ? "" : raw.trim();
+        if (value.isEmpty()) return "-";
+        if (value.length() <= 26) return value;
+        return value.substring(0, 18) + "..." + value.substring(value.length() - 6);
+    }
+
+    private void showTrustManagerDialog(@NonNull SshProfile profile, @NonNull SessionEntry entry) {
+        SessionFileCoordinator coordinator = SessionFileCoordinator.getInstance();
+        coordinator.initialize(mActivity);
+        ArrayList<SshTrustRecord> records = new ArrayList<>(coordinator.listTrustedHostsForEntry(mActivity, entry));
+        SshPendingTrustRecord pending = coordinator.getPendingTrustForEntry(mActivity, entry);
+        SshProfileResolutionResult resolution = LegacySshCommandProfileResolver.resolve(profile.id, entry.sshCommand);
+        String authority = resolution.success && resolution.endpoint != null
+            ? resolution.endpoint.authorityKey
+            : entry.id;
+
+        StringBuilder message = new StringBuilder();
+        message.append("Authority:\n").append(authority).append("\n\n");
+        if (pending != null) {
+            message.append(pending.replacementRequired ? "待替换指纹:\n" : "待批准指纹:\n")
+                .append("• ").append(pending.algorithm).append('\n')
+                .append("  ").append(pending.observedFingerprintSha256).append('\n');
+            if (!TextUtils.isEmpty(pending.existingFingerprintSha256)) {
+                message.append("现有指纹:\n")
+                    .append("  ").append(pending.existingFingerprintSha256).append('\n');
+            }
+            message.append('\n');
+        }
+        if (records.isEmpty()) {
+            message.append("当前没有已信任的主机指纹记录。");
+        } else {
+            message.append("已信任指纹:\n");
+            for (SshTrustRecord record : records) {
+                if (record == null) continue;
+                message.append("• ").append(record.algorithm)
+                    .append('\n')
+                    .append("  ").append(record.fingerprintSha256)
+                    .append('\n');
+            }
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(mActivity)
+            .setTitle("SSH 指纹管理")
+            .setMessage(message.toString())
+            .setNegativeButton(android.R.string.cancel, null);
+        if (pending != null) {
+            builder.setNeutralButton(pending.replacementRequired ? "替换指纹" : "批准指纹", (dialog, which) -> {
+                boolean approved = coordinator.approvePendingTrustForEntry(mActivity, entry);
+                if (approved) {
+                    mActivity.showToast(
+                        pending.replacementRequired ? "已替换主机指纹。" : "已批准主机指纹。",
+                        false
+                    );
+                } else {
+                    mActivity.showToast("未找到待处理的主机指纹。", true);
+                }
+                mActivity.notifyTerminalConfigTabDataChanged();
+            });
+        }
+        if (!records.isEmpty()) {
+            builder.setPositiveButton("清除指纹", (dialog, which) -> {
+                boolean cleared = coordinator.clearTrustedHostForEntry(mActivity, entry);
+                if (cleared) {
+                    mActivity.showToast("已清除该配置的主机指纹。下次连接将重新建立信任。", false);
+                } else {
+                    mActivity.showToast("未找到可清除的主机指纹记录。", true);
+                }
+                mActivity.notifyTerminalConfigTabDataChanged();
+            });
+        }
+        builder.show();
+    }
+
     private Button createProfileActionButton(int textRes, boolean isLastInRow) {
         Button button = new Button(mActivity);
         button.setText(textRes);
@@ -1300,28 +1445,76 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     private void connectWithSshProfile(@NonNull SshProfile profile) {
         SshLaunchConfig config = resolveSshLaunchConfig(profile);
         if (config == null) return;
-        ensureSshpassAndRunIfNeeded(profile, () ->
-            launchSshProfileSession(config.sessionName, config.targetLabel, config.sshCommand));
+        runWithProfileTrustReady(profile, config, () ->
+            ensureSshpassAndRunIfNeeded(profile, () ->
+                launchSshProfileSession(config.sessionName, config.targetLabel, config.sshCommand)));
     }
 
     private void createPersistentSessionWithSshProfile(@NonNull SshProfile profile) {
         SshLaunchConfig config = resolveSshLaunchConfig(profile);
         if (config == null) return;
-        ensureSshpassAndRunIfNeeded(profile, () -> {
-            TerminalSession anchorSession = mActivity.getCurrentSession();
-            if (anchorSession == null) {
-                mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_launch_failed), true);
-                return;
-            }
-            mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_creating, config.targetLabel), false);
-            prepareSshLock(anchorSession, config.sshCommand, false);
-        });
+        runWithProfileTrustReady(profile, config, () ->
+            ensureSshpassAndRunIfNeeded(profile, () -> {
+                TerminalSession anchorSession = mActivity.getCurrentSession();
+                if (anchorSession == null) {
+                    mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_launch_failed), true);
+                    return;
+                }
+                mActivity.showToast(mActivity.getString(R.string.msg_ssh_persistence_creating, config.targetLabel), false);
+                prepareSshLock(anchorSession, config.sshCommand, false);
+            }));
     }
 
     private void showSshPersistenceManagerDialog(@NonNull SshProfile profile) {
         SshLaunchConfig config = resolveSshLaunchConfig(profile);
         if (config == null) return;
-        ensureSshpassAndRunIfNeeded(profile, () -> loadTmuxSessionsAndShowPersistenceDialog(profile, config));
+        runWithProfileTrustReady(profile, config, () ->
+            ensureSshpassAndRunIfNeeded(profile, () -> loadTmuxSessionsAndShowPersistenceDialog(profile, config)));
+    }
+
+    private void runWithProfileTrustReady(@NonNull SshProfile profile,
+                                          @NonNull SshLaunchConfig config,
+                                          @NonNull Runnable onReady) {
+        SessionEntry entry = findSessionEntryForProfileId(profile.id);
+        if (entry == null) {
+            onReady.run();
+            return;
+        }
+
+        SessionFileCoordinator coordinator = SessionFileCoordinator.getInstance();
+        coordinator.initialize(mActivity);
+        SshPendingTrustRecord pending = coordinator.getPendingTrustForEntry(mActivity, entry);
+        if (pending != null) {
+            showTrustManagerDialog(profile, entry);
+            return;
+        }
+        if (!coordinator.listTrustedHostsForEntry(mActivity, entry).isEmpty()) {
+            onReady.run();
+            return;
+        }
+
+        mActivity.showToast("正在预检服务器指纹...", false);
+        runSshBackgroundTask("ssh-profile-trust-probe", () -> {
+            SftpProtocolManager.ProbeResult probe = SftpProtocolManager.getInstance().probeSession(mActivity, entry);
+            mActivity.runOnUiThread(() -> {
+                SshPendingTrustRecord refreshedPending = coordinator.getPendingTrustForEntry(mActivity, entry);
+                if (refreshedPending != null) {
+                    mActivity.showToast(
+                        refreshedPending.replacementRequired
+                            ? "检测到服务器指纹变化，请先替换指纹。"
+                            : "首次检测到服务器指纹，请先批准后再连接。",
+                        true
+                    );
+                    showTrustManagerDialog(profile, entry);
+                    return;
+                }
+                if (probe.success) {
+                    onReady.run();
+                } else {
+                    mActivity.showToast(probe.messageCn, true);
+                }
+            });
+        });
     }
 
     private void loadTmuxSessionsAndShowPersistenceDialog(@NonNull SshProfile profile,
@@ -1687,12 +1880,23 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             sshCommand = buildSshCommandForProfile(profile, target);
         }
 
-        if (TextUtils.isEmpty(sshCommand)) {
+        String managedSshCommand = SshCommandKnownHostsOptions.inject(
+            sshCommand,
+            SshKnownHostsFiles.resolveManagedKnownHostsPath(mActivity)
+        );
+
+        if (TextUtils.isEmpty(managedSshCommand)) {
             mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
             return null;
         }
 
-        return new SshLaunchConfig(sessionName, targetLabel, sshCommand);
+        SshProfileResolutionResult resolution = LegacySshCommandProfileResolver.resolve(profile.id, managedSshCommand);
+        if (!resolution.success || resolution.endpoint == null) {
+            mActivity.showToast(mActivity.getString(R.string.msg_ssh_profile_invalid), true);
+            return null;
+        }
+
+        return new SshLaunchConfig(sessionName, targetLabel, managedSshCommand, resolution.endpoint);
     }
 
     private void launchSshProfileSession(@NonNull String sessionName, @NonNull String targetLabel,
@@ -1836,9 +2040,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             "elif grep -Eqi \"Could not resolve hostname|Name or service not known|Temporary failure in name resolution\" \"$TERMUX_SSH_ERR_FILE\"; then " +
             "echo \"[SSH][CN] DNS 解析失败。\"; " +
             "elif grep -qi \"Host key verification failed\" \"$TERMUX_SSH_ERR_FILE\"; then " +
-            "echo \"[SSH][CN] 主机指纹校验失败。\"; " +
+            "echo \"[SSH][CN] 主机指纹待批准：请先在“指纹管理”中批准后再连接。\"; " +
             "elif grep -qi \"REMOTE HOST IDENTIFICATION HAS CHANGED\" \"$TERMUX_SSH_ERR_FILE\"; then " +
-            "echo \"[SSH][CN] 远程主机指纹发生变化。\"; " +
+            "echo \"[SSH][CN] 远程主机指纹发生变化：请先在“指纹管理”中替换后再连接。\"; " +
             "elif grep -qi \"Too many authentication failures\" \"$TERMUX_SSH_ERR_FILE\"; then " +
             "echo \"[SSH][CN] 认证失败次数过多。\"; " +
             "elif grep -qi \"kex_exchange_identification\" \"$TERMUX_SSH_ERR_FILE\"; then " +
@@ -1876,11 +2080,14 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         @NonNull final String sessionName;
         @NonNull final String targetLabel;
         @NonNull final String sshCommand;
+        @NonNull final ResolvedSshEndpoint endpoint;
 
-        SshLaunchConfig(@NonNull String sessionName, @NonNull String targetLabel, @NonNull String sshCommand) {
+        SshLaunchConfig(@NonNull String sessionName, @NonNull String targetLabel,
+                        @NonNull String sshCommand, @NonNull ResolvedSshEndpoint endpoint) {
             this.sessionName = sessionName;
             this.targetLabel = targetLabel;
             this.sshCommand = sshCommand;
+            this.endpoint = endpoint;
         }
     }
 
@@ -3091,7 +3298,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (raw.contains("no route to host")) return "网络不可达";
         if (raw.contains("could not resolve hostname") || raw.contains("name or service not known") ||
             raw.contains("temporary failure in name resolution")) return "DNS 解析失败";
-        if (raw.contains("host key verification failed")) return "主机指纹校验失败";
+        if (raw.contains("host key verification failed")) return "主机指纹待批准或待替换";
         if (raw.contains("sshpass")) return "sshpass 不可用或执行失败";
         if (result.exitCode == 255) return "SSH 连接未建立（exit 255）";
         if (result.exitCode != 0) return "检查命令失败（exit " + result.exitCode + "）";
@@ -3643,7 +3850,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         }
         cmd.append(" -o ConnectTimeout=8");
         cmd.append(" -o ServerAliveInterval=8 -o ServerAliveCountMax=1");
-        cmd.append(" -o StrictHostKeyChecking=accept-new");
+        cmd.append(" -o StrictHostKeyChecking=yes");
         cmd.append(" ").append(quoteArg(remoteCommand));
         return cmd.toString();
     }

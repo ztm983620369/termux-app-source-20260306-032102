@@ -47,7 +47,7 @@ public final class SshTmuxCommandFactory {
         }
         cmd.append(" -o ConnectTimeout=8");
         cmd.append(" -o ServerAliveInterval=8 -o ServerAliveCountMax=1");
-        cmd.append(" -o StrictHostKeyChecking=accept-new");
+        cmd.append(" -o StrictHostKeyChecking=yes");
         cmd.append(" ").append(quoteArg(remoteCommand));
         return cmd.toString();
     }

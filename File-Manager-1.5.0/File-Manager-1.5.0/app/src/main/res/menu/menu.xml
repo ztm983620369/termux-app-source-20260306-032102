@@ -84,6 +84,10 @@
         android:title="@string/industrial_self_test_title"
         app:showAsAction="never" />
     <item
+        android:id="@+id/manage_session_trust"
+        android:title="@string/manage_session_trust"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/about"
         android:icon="@drawable/ic_info_vector"
         android:title="@string/about"

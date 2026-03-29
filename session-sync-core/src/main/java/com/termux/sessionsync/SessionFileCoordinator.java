@@ -6,6 +6,11 @@ import android.text.TextUtils;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.termux.sshconnectioncore.ResolvedSshEndpoint;
+import com.termux.sshconnectioncore.SshPendingTrustRecord;
+import com.termux.sshconnectioncore.SshTrustRecord;
+import com.termux.sshconnectioncore.SshTrustSource;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -372,6 +377,82 @@ public final class SessionFileCoordinator {
         } catch (Exception ignored) {
         }
         return root.toString();
+    }
+
+    @NonNull
+    public List<SshTrustRecord> listTrustedHosts(@NonNull Context context) {
+        initialize(context);
+        return SshHostTrustStore.getInstance().snapshotRecords();
+    }
+
+    @NonNull
+    public List<SshTrustRecord> listTrustedHostsForEntry(@NonNull Context context, @NonNull SessionEntry entry) {
+        initialize(context);
+        ResolvedSshEndpoint endpoint = SessionEntrySshEndpointResolver.resolve(entry);
+        ArrayList<SshTrustRecord> out = new ArrayList<>();
+        if (endpoint == null) return out;
+        for (SshTrustRecord record : SshHostTrustStore.getInstance().snapshotRecords()) {
+            if (record == null) continue;
+            if (endpoint.authorityKey.equals(record.authorityKey)) {
+                out.add(record);
+            }
+        }
+        return out;
+    }
+
+    @Nullable
+    public SshPendingTrustRecord getPendingTrustForEntry(@NonNull Context context, @NonNull SessionEntry entry) {
+        initialize(context);
+        ResolvedSshEndpoint endpoint = SessionEntrySshEndpointResolver.resolve(entry);
+        if (endpoint == null) return null;
+        return SshHostTrustStore.getInstance().findPendingByAuthority(endpoint.authorityKey);
+    }
+
+    @NonNull
+    public List<SshPendingTrustRecord> listPendingTrustedHosts(@NonNull Context context) {
+        initialize(context);
+        return SshHostTrustStore.getInstance().snapshotPendingRecords();
+    }
+
+    public boolean approvePendingTrustForEntry(@NonNull Context context, @NonNull SessionEntry entry) {
+        initialize(context);
+        ResolvedSshEndpoint endpoint = SessionEntrySshEndpointResolver.resolve(entry);
+        if (endpoint == null) return false;
+        SshPendingTrustRecord pending = SshHostTrustStore.getInstance().findPendingByAuthority(endpoint.authorityKey);
+        if (pending == null) return false;
+        SshTrustSource source = pending.replacementRequired
+            ? SshTrustSource.USER_REPLACED
+            : SshTrustSource.USER_APPROVED;
+        boolean approved = SshHostTrustStore.getInstance().approvePendingAuthority(endpoint.authorityKey, source);
+        if (approved) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "approvePendingTrustForEntry",
+                endpoint.authorityKey, "已批准主机指纹", entry.displayName);
+        }
+        return approved;
+    }
+
+    public boolean dismissPendingTrustForEntry(@NonNull Context context, @NonNull SessionEntry entry) {
+        initialize(context);
+        ResolvedSshEndpoint endpoint = SessionEntrySshEndpointResolver.resolve(entry);
+        if (endpoint == null) return false;
+        boolean dismissed = SshHostTrustStore.getInstance().dismissPendingAuthority(endpoint.authorityKey);
+        if (dismissed) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "dismissPendingTrustForEntry",
+                endpoint.authorityKey, "已忽略待处理主机指纹", entry.displayName);
+        }
+        return dismissed;
+    }
+
+    public boolean clearTrustedHostForEntry(@NonNull Context context, @NonNull SessionEntry entry) {
+        initialize(context);
+        ResolvedSshEndpoint endpoint = SessionEntrySshEndpointResolver.resolve(entry);
+        if (endpoint == null) return false;
+        boolean cleared = SshHostTrustStore.getInstance().clearAuthority(endpoint.authorityKey);
+        if (cleared) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "clearTrustedHostForEntry",
+                endpoint.authorityKey, "已清除主机指纹信任", entry.displayName);
+        }
+        return cleared;
     }
 
     @NonNull

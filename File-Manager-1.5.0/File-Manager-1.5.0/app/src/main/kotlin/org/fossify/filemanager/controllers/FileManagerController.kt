@@ -26,6 +26,8 @@ import com.termux.sessionsync.SavedSshProfileStore
 import com.termux.sessionsync.SessionFileCoordinator
 import com.termux.sessionsync.SessionFileMode
 import com.termux.sessionsync.SessionTransport
+import com.termux.sshconnectioncore.SshPendingTrustRecord
+import com.termux.sshconnectioncore.SshTrustRecord
 import org.fossify.commons.dialogs.RadioGroupDialog
 import org.fossify.commons.extensions.appLockManager
 import org.fossify.commons.extensions.beGoneIf
@@ -435,6 +437,8 @@ class FileManagerController(
             findItem(R.id.more_apps_from_us).isVisible = !activity.resources.getBoolean(R.bool.hide_google_relations)
             findItem(R.id.self_test).isVisible = !isCreateDocumentIntent
             findItem(R.id.self_test).title = "\u5de5\u4e1a\u7ea7\u81ea\u68c0"
+            findItem(R.id.manage_session_trust).isVisible =
+                !isCreateDocumentIntent && mSessionFileCoordinator.resolveSelectedEntry(activity) != null
             findItem(R.id.settings).isVisible = !isCreateDocumentIntent
             findItem(R.id.about).isVisible = !isCreateDocumentIntent
         }
@@ -494,6 +498,7 @@ class FileManagerController(
                     R.id.column_count -> changeColumnCount()
                     R.id.more_apps_from_us -> activity.launchMoreAppsFromUsIntent()
                     R.id.self_test -> runSessionIndustrialSelfTest()
+                    R.id.manage_session_trust -> showCurrentSessionTrustDialog()
                     R.id.settings -> launchSettings()
                     R.id.about -> launchAbout()
                     else -> return@setOnMenuItemClickListener false
@@ -938,6 +943,65 @@ class FileManagerController(
     private fun launchSettings() {
         activity.hideKeyboard()
         activity.startActivity(Intent(activity.applicationContext, SettingsActivity::class.java))
+    }
+
+    private fun showCurrentSessionTrustDialog() {
+        val entry = mSessionFileCoordinator.resolveSelectedEntry(activity)
+        if (entry == null) {
+            activity.toast("当前未选择远程服务器。")
+            return
+        }
+
+        val records = ArrayList<SshTrustRecord>(mSessionFileCoordinator.listTrustedHostsForEntry(activity, entry))
+        val pending = mSessionFileCoordinator.getPendingTrustForEntry(activity, entry)
+        val message = StringBuilder()
+            .append("服务器：").append(entry.displayName).append('\n').append('\n')
+        if (pending != null) {
+            message.append(if (pending.replacementRequired) "待替换指纹：" else "待批准指纹：")
+                .append('\n')
+                .append("• ").append(pending.algorithm).append('\n')
+                .append("  ").append(pending.observedFingerprintSha256).append('\n')
+            if (pending.existingFingerprintSha256.isNotEmpty()) {
+                message.append("现有指纹：").append('\n')
+                    .append("  ").append(pending.existingFingerprintSha256).append('\n')
+            }
+            message.append('\n')
+        }
+        if (records.isEmpty()) {
+            message.append("当前没有已信任的主机指纹记录。")
+        } else {
+            message.append("已信任指纹：").append('\n')
+            records.forEach { record ->
+                message.append("• ").append(record.algorithm).append('\n')
+                    .append("  ").append(record.fingerprintSha256).append('\n')
+            }
+        }
+
+        val builder = AlertDialog.Builder(activity)
+            .setTitle(R.string.manage_session_trust)
+            .setMessage(message.toString())
+            .setNegativeButton(android.R.string.cancel, null)
+        if (pending != null) {
+            builder.setNeutralButton(if (pending.replacementRequired) "替换指纹" else "批准指纹") { _, _ ->
+                val approved = mSessionFileCoordinator.approvePendingTrustForEntry(activity, entry)
+                if (approved) {
+                    activity.toast(if (pending.replacementRequired) "已替换当前服务器指纹。" else "已批准当前服务器指纹。")
+                } else {
+                    activity.toast("未找到待处理的主机指纹。")
+                }
+            }
+        }
+        if (records.isNotEmpty()) {
+            builder.setPositiveButton("清除指纹") { _, _ ->
+                val cleared = mSessionFileCoordinator.clearTrustedHostForEntry(activity, entry)
+                if (cleared) {
+                    activity.toast("已清除当前服务器指纹，下次连接将重新建立信任。")
+                } else {
+                    activity.toast("未找到可清除的主机指纹。")
+                }
+            }
+        }
+        builder.show()
     }
 
     private fun launchAbout() {

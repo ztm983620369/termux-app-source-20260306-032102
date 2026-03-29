@@ -6,6 +6,7 @@ include ':app', ':termux-shared', ':terminal-emulator', ':terminal-view', ':ui-s
         ':terminal-session-surface',
         ':terminal-session-core',
         ':terminal-session-runtime',
+        ':ssh-connection-core',
         ':editor-sync-core',
         ':system-status-surface',
         ':session-sync-core',

@@ -56,6 +56,7 @@
     <string name="industrial_self_test_running_message">Running active checks against your saved servers. Please wait and keep the app alive.</string>
     <string name="industrial_self_test_report_copied">Self-test report copied</string>
     <string name="industrial_self_test_open_report_folder">Open report folder</string>
+    <string name="manage_session_trust">Manage server fingerprint</string>
 
     <!-- Storage analysis -->
     <string name="storage_analysis">Storage analysis</string>
