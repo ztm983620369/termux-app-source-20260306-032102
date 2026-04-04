@@ -20,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.widget.PopupMenu
 import androidx.viewpager.widget.ViewPager
 import com.stericson.RootTools.RootTools
 import com.termux.sessionsync.SavedSshProfileStore
@@ -28,6 +29,8 @@ import com.termux.sessionsync.SessionFileMode
 import com.termux.sessionsync.SessionTransport
 import com.termux.sshconnectioncore.SshPendingTrustRecord
 import com.termux.sshconnectioncore.SshTrustRecord
+import com.termux.workspaceshell.model.WorkspaceShellState
+import com.termux.workspaceshell.ui.WorkspaceChromePalette
 import org.fossify.commons.dialogs.RadioGroupDialog
 import org.fossify.commons.extensions.appLockManager
 import org.fossify.commons.extensions.beGoneIf
@@ -84,6 +87,7 @@ import org.fossify.filemanager.fragments.ItemsFragment
 import org.fossify.filemanager.fragments.MyViewPagerFragment
 import org.fossify.filemanager.fragments.RecentsFragment
 import org.fossify.filemanager.fragments.StorageFragment
+import org.fossify.filemanager.fragments.WorkspaceFilesFragment
 import org.fossify.filemanager.helpers.FavoriteHelper
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
 import org.fossify.filemanager.helpers.NavigatorFolderHelper
@@ -108,6 +112,11 @@ class FileManagerController(
     companion object {
         private const val BACK_PRESS_TIMEOUT = 5000
         private const val PICKED_PATH = "picked_path"
+        private const val WORKSPACE_FILES_STATE = "workspace_files_state"
+        private const val MENU_SWITCH_CORE_NAV = 10001
+        private const val MENU_SWITCH_FILES = 10002
+        private const val MENU_SWITCH_RECENTS = 10003
+        private const val MENU_SWITCH_STORAGE = 10004
     }
 
     private var wasBackJustPressed = false
@@ -147,13 +156,12 @@ class FileManagerController(
     }
 
     fun onCreate(savedInstanceState: Bundle?) {
-        activity.isSearchBarEnabled = true
-        // Termux host already provides its own status-bar area. Avoid applying top window insets twice.
-        binding.mainMenu.setApplyWindowInsets(false)
+        activity.isSearchBarEnabled = false
         mSessionFileCoordinator.initialize(activity)
         mSelectedSessionId = mSessionFileCoordinator.getSelectedSessionKey(activity)
         setupOptionsMenu()
         applyContainerColors()
+        syncWorkspaceChrome()
         refreshMenuItems()
         val scopedHome = clampToVisibleTermuxPath(activity.config.homeFolder, termuxHomePath)
         if (activity.config.homeFolder != scopedHome) {
@@ -174,7 +182,7 @@ class FileManagerController(
         if (enableEdgeToEdge) {
             activity.setupEdgeToEdge(
                 padBottomSystem = listOf(binding.mainViewPager),
-                moveBottomSystem = listOf(binding.mainFab)
+                moveBottomSystem = listOf(binding.mainFab, binding.mainMoreFab, binding.mainSearchFab)
             )
         }
 
@@ -198,6 +206,7 @@ class FileManagerController(
         applyContainerColors()
         refreshMenuItems()
         updateMenuColors()
+        syncWorkspaceChrome()
 
         getAllFragments().forEach {
             it?.onResume(activity.getProperTextColor())
@@ -227,6 +236,7 @@ class FileManagerController(
     fun onHostTabVisible() {
         applyContainerColors()
         updateMenuColors()
+        syncWorkspaceChrome()
         refreshMenuItems()
     }
 
@@ -235,39 +245,55 @@ class FileManagerController(
         activity.config.lastUsedViewPagerPage = binding.mainViewPager.currentItem
     }
 
+    fun onStop() {
+        getFilesFragment()?.flushWorkspaceSessionPersistence()
+    }
+
     fun onSaveInstanceState(outState: Bundle) {
-        outState.putString(PICKED_PATH, getItemsFragment()?.currentPath ?: "")
+        outState.putString(PICKED_PATH, getFilesFragment()?.activeItemsFragment()?.currentPath ?: "")
+        getFilesFragment()?.saveWorkspaceState()?.let {
+            outState.putBundle(WORKSPACE_FILES_STATE, it)
+        }
     }
 
     fun onRestoreInstanceState(savedInstanceState: Bundle) {
-        val path = savedInstanceState.getString(PICKED_PATH).takeIf { !it.isNullOrBlank() } ?: getPreferredStartPath()
+        val workspaceState = savedInstanceState.getBundle(WORKSPACE_FILES_STATE)
+        val path = savedInstanceState.getString(PICKED_PATH).takeIf { !it.isNullOrBlank() } ?: NavigatorFolderHelper.rootPath(activity)
 
         if (binding.mainViewPager.adapter == null) {
             binding.mainViewPager.onGlobalLayout {
-                openPath(path, true)
+                if (workspaceState != null) {
+                    getFilesFragment()?.restoreWorkspaceState(workspaceState)
+                } else {
+                    openPath(path, true)
+                }
+                syncWorkspaceChrome()
             }
         } else {
-            openPath(path, true)
+            if (workspaceState != null) {
+                getFilesFragment()?.restoreWorkspaceState(workspaceState)
+            } else {
+                openPath(path, true)
+            }
+            syncWorkspaceChrome()
         }
     }
 
     fun onBackPressedCompat(): Boolean {
         val currentFragment = getCurrentFragment()
-        if (binding.mainMenu.isSearchOpen) {
-            binding.mainMenu.closeSearch()
+        if (binding.workspaceChrome.isSearchVisible()) {
+            closeSearchPanel(clearQuery = true)
             return true
         } else if (currentFragment is RecentsFragment || currentFragment is StorageFragment) {
             return false
-        } else if (currentFragment is ItemsFragment) {
-            val currentPath = currentFragment.currentPath.trimEnd('/')
+        } else if (currentFragment is WorkspaceFilesFragment) {
+            if (currentFragment.handleBackPressedWithinWorkspaces()) {
+                syncWorkspaceChrome()
+                return true
+            }
+            val currentPath = currentFragment.activePath().trimEnd('/')
             val navigatorRoot = NavigatorFolderHelper.rootPath(activity).trimEnd('/')
-            val localRoot = TermuxPathScope.preferredLocalRoot(activity).trimEnd('/')
-            val atRoot = currentPath.isEmpty() ||
-                currentPath == "/" ||
-                currentPath == localRoot ||
-                currentPath == termuxRootPath ||
-                currentPath == navigatorRoot ||
-                isVirtualWorkspaceRoot(currentPath)
+            val atRoot = currentPath.isEmpty() || currentPath == navigatorRoot
             if (atRoot) {
                 if (!wasBackJustPressed && activity.config.pressBackTwice) {
                     wasBackJustPressed = true
@@ -282,10 +308,6 @@ class FileManagerController(
                     return true
                 }
             }
-
-            val parentPath = resolveParentPathForNavigation(currentPath)
-            openPath(parentPath, forceRefresh = true)
-            return true
         }
 
         return false
@@ -299,7 +321,8 @@ class FileManagerController(
         }
 
         val scopedPath = clampToVisibleTermuxPath(newPath, getPreferredStartPath())
-        getItemsFragment()?.openPath(scopedPath, forceRefresh)
+        getFilesFragment()?.openManagedPath(scopedPath, forceRefresh)
+        syncWorkspaceChrome()
     }
     override fun isTermuxScopedFileManager(): Boolean = true
 
@@ -338,17 +361,7 @@ class FileManagerController(
     }
 
     override fun toggleMainFabMenu() {
-        if (mainFabMenu?.isShowing == true) {
-            mainFabMenu?.dismiss()
-            return
-        }
-
-        if (getEffectiveTabs().size <= 1) {
-            openCreateNew()
-            return
-        }
-
-        showMainFabMenu()
+        openCreateNew()
     }
 
     override fun createDocumentConfirmed(path: String) {
@@ -403,36 +416,38 @@ class FileManagerController(
     override fun refreshMenuItems() {
         val currentFragment = getCurrentFragment() ?: return
         val isCreateDocumentIntent = intentProvider().action == Intent.ACTION_CREATE_DOCUMENT
-        val currentViewType = activity.config.getFolderViewType(currentFragment.currentPath)
-        val isNavigator = currentFragment is ItemsFragment && NavigatorFolderHelper.isNavigatorPath(activity, currentFragment.currentPath)
-        val isFavorite = activity.config.isFavorite(currentFragment.currentPath)
+        val currentItems = activeItemsFragment()
+        val currentPath = currentItems?.currentPath ?: currentFragment.currentPath
+        val currentViewType = activity.config.getFolderViewType(currentPath)
+        val isNavigator = currentItems != null && NavigatorFolderHelper.isNavigatorPath(activity, currentPath)
+        val isFavorite = currentItems != null && activity.config.isFavorite(currentPath)
 
-        binding.mainMenu.requireToolbar().menu.apply {
-            findItem(R.id.sort).isVisible = currentFragment is ItemsFragment && !isNavigator
+        binding.workspaceChrome.toolbar().menu.apply {
+            findItem(R.id.sort).isVisible = currentItems != null && !isNavigator
             findItem(R.id.change_view_type).isVisible = currentFragment !is StorageFragment
 
-            findItem(R.id.add_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && !isFavorite
-            findItem(R.id.remove_favorite).isVisible = currentFragment is ItemsFragment && !isNavigator && isFavorite
-            findItem(R.id.go_to_favorite).isVisible = currentFragment is ItemsFragment
+            findItem(R.id.add_favorite).isVisible = currentItems != null && !isNavigator && !isFavorite
+            findItem(R.id.remove_favorite).isVisible = currentItems != null && !isNavigator && isFavorite
+            findItem(R.id.go_to_favorite).isVisible = false
             findItem(R.id.go_to_favorite).title = NavigatorFolderHelper.displayTitle()
 
-            findItem(R.id.toggle_filename).isVisible = currentViewType == VIEW_TYPE_GRID && currentFragment !is StorageFragment && !isNavigator
+            findItem(R.id.toggle_filename).isVisible = currentItems != null && currentViewType == VIEW_TYPE_GRID && !isNavigator
             findItem(R.id.go_home).isVisible = false
-            findItem(R.id.set_as_home).isVisible = currentFragment is ItemsFragment && !isNavigator && currentFragment.currentPath != activity.config.homeFolder
+            findItem(R.id.set_as_home).isVisible = currentItems != null && !isNavigator && currentPath != activity.config.homeFolder
             findItem(R.id.toggle_termux_storage).isVisible = false
-            findItem(R.id.toggle_termux_system_dirs).isVisible = currentFragment is ItemsFragment && !isCreateDocumentIntent
+            findItem(R.id.toggle_termux_system_dirs).isVisible = currentItems != null && !isCreateDocumentIntent
             findItem(R.id.toggle_termux_system_dirs).title =
                 activity.getString(
                     if (activity.config.showTermuxSystemDirs) R.string.hide_termux_system_dirs
                     else R.string.show_termux_system_dirs
                 )
 
-            findItem(R.id.open_in_terminal).isVisible = currentFragment is ItemsFragment && !isCreateDocumentIntent && !isNavigator
+            findItem(R.id.open_in_terminal).isVisible = currentItems != null && !isCreateDocumentIntent && !isNavigator
 
-            findItem(R.id.temporarily_show_hidden).isVisible = !activity.config.shouldShowHidden() && currentFragment !is StorageFragment && !isNavigator
-            findItem(R.id.stop_showing_hidden).isVisible = activity.config.temporarilyShowHidden && currentFragment !is StorageFragment && !isNavigator
+            findItem(R.id.temporarily_show_hidden).isVisible = currentItems != null && !activity.config.shouldShowHidden() && !isNavigator
+            findItem(R.id.stop_showing_hidden).isVisible = currentItems != null && activity.config.temporarilyShowHidden && !isNavigator
 
-            findItem(R.id.column_count).isVisible = currentViewType == VIEW_TYPE_GRID && currentFragment !is StorageFragment && !isNavigator
+            findItem(R.id.column_count).isVisible = currentItems != null && currentViewType == VIEW_TYPE_GRID && !isNavigator
 
             findItem(R.id.more_apps_from_us).isVisible = !activity.resources.getBoolean(R.bool.hide_google_relations)
             findItem(R.id.self_test).isVisible = !isCreateDocumentIntent
@@ -451,8 +466,8 @@ class FileManagerController(
     }
 
     override fun openedDirectory() {
-        if (binding.mainMenu.isSearchOpen) {
-            binding.mainMenu.closeSearch()
+        if (binding.workspaceChrome.isSearchVisible()) {
+            closeSearchPanel(clearQuery = true)
         }
     }
 
@@ -461,50 +476,31 @@ class FileManagerController(
     }
 
     private fun setupOptionsMenu() {
-        binding.mainMenu.apply {
-            requireToolbar().inflateMenu(R.menu.menu)
-            toggleHideOnScroll(false)
-            setupMenu()
-
-            onSearchClosedListener = {
-                getAllFragments().forEach {
-                    it?.searchQueryChanged("")
+        binding.workspaceChrome.apply {
+            toolbar().inflateMenu(R.menu.menu)
+            tabsView().onTabSelectedListener = object : com.termux.workspaceshell.ui.WorkspaceTabsBarView.OnTabSelectedListener {
+                override fun onTabSelected(index: Int, tab: com.termux.workspaceshell.model.WorkspaceTabModel) {
+                    getFilesFragment()?.selectWorkspaceTab(tab.id)
+                    syncWorkspaceChrome()
+                    refreshMenuItems()
                 }
             }
-
-            onSearchTextChangedListener = { text ->
+            tabsView().onTabCloseListener = object : com.termux.workspaceshell.ui.WorkspaceTabsBarView.OnTabCloseListener {
+                override fun onTabClose(index: Int, tab: com.termux.workspaceshell.model.WorkspaceTabModel) {
+                    getFilesFragment()?.closeWorkspaceTab(tab.id)
+                    syncWorkspaceChrome()
+                    refreshMenuItems()
+                }
+            }
+            onSearchQueryChangedListener = { text ->
                 getCurrentFragment()?.searchQueryChanged(text)
+                syncWorkspaceChrome()
             }
-
-            requireToolbar().setOnMenuItemClickListener { menuItem ->
-                if (getCurrentFragment() == null) {
-                    return@setOnMenuItemClickListener true
-                }
-
-                when (menuItem.itemId) {
-                    R.id.go_home -> goHome()
-                    R.id.go_to_favorite -> goToFavorite()
-                    R.id.sort -> showSortingDialog()
-                    R.id.add_favorite -> addFavorite()
-                    R.id.remove_favorite -> removeFavorite()
-                    R.id.toggle_filename -> toggleFilenameVisibility()
-                    R.id.toggle_termux_storage -> toggleTermuxStorage()
-                    R.id.toggle_termux_system_dirs -> toggleTermuxSystemDirs()
-                    R.id.open_in_terminal -> openInTerminal(getCurrentFragment()?.currentPath ?: return@setOnMenuItemClickListener true)
-                    R.id.set_as_home -> setAsHome()
-                    R.id.change_view_type -> changeViewType()
-                    R.id.temporarily_show_hidden -> tryToggleTemporarilyShowHidden()
-                    R.id.stop_showing_hidden -> tryToggleTemporarilyShowHidden()
-                    R.id.column_count -> changeColumnCount()
-                    R.id.more_apps_from_us -> activity.launchMoreAppsFromUsIntent()
-                    R.id.self_test -> runSessionIndustrialSelfTest()
-                    R.id.manage_session_trust -> showCurrentSessionTrustDialog()
-                    R.id.settings -> launchSettings()
-                    R.id.about -> launchAbout()
-                    else -> return@setOnMenuItemClickListener false
-                }
-                return@setOnMenuItemClickListener true
+            onSearchCloseListener = {
+                (getCurrentFragment() as? WorkspaceFilesFragment)?.setSearchVisible(false)
+                syncWorkspaceChrome()
             }
+            toolbar().setOnMenuItemClickListener { menuItem -> handleChromeMenuAction(menuItem.itemId) }
         }
     }
 
@@ -525,7 +521,15 @@ class FileManagerController(
     }
 
     private fun updateMenuColors() {
-        binding.mainMenu.updateColors()
+        val backgroundColor = activity.getProperBackgroundColor()
+        val surfaceColor = blendColor(activity.getProperPrimaryColor(), backgroundColor, 0.12f)
+        val palette = WorkspaceChromePalette(
+            backgroundColor = backgroundColor,
+            surfaceColor = surfaceColor,
+            onSurfaceColor = activity.getProperTextColor(),
+            accentColor = activity.getProperPrimaryColor()
+        )
+        binding.workspaceChrome.setPalette(palette)
     }
 
     private fun applyContainerColors() {
@@ -537,6 +541,8 @@ class FileManagerController(
         getAllFragments().forEach { fragment ->
             fragment?.setBackgroundColor(backgroundColor)
         }
+        binding.mainSearchFab.backgroundTintList = android.content.res.ColorStateList.valueOf(activity.getProperPrimaryColor())
+        binding.mainMoreFab.backgroundTintList = android.content.res.ColorStateList.valueOf(activity.getProperPrimaryColor())
     }
 
     private fun storeStateVariables() {
@@ -579,7 +585,7 @@ class FileManagerController(
                 if (path != null) {
                     openPath(path)
                 } else {
-                    openPath(getPreferredStartPath())
+                    getFilesFragment()?.openHomeWorkspace(forceRefresh = true)
                 }
             }
 
@@ -589,7 +595,11 @@ class FileManagerController(
 
             binding.mainViewPager.currentItem = 0
         } else {
-            openPath(getPreferredStartPath())
+            val restoredWorkspace = shouldRestorePersistedWorkspace(intent) &&
+                getFilesFragment()?.restorePersistedWorkspaceSession() == true
+            if (!restoredWorkspace) {
+                getFilesFragment()?.openHomeWorkspace(forceRefresh = true)
+            }
         }
 
         if (refreshRecents) {
@@ -598,6 +608,15 @@ class FileManagerController(
 
         if (!hasExplicitPath && !mInitialSessionApplied) {
             mInitialSessionApplied = true
+        }
+        syncWorkspaceChrome()
+    }
+
+    private fun shouldRestorePersistedWorkspace(intent: Intent): Boolean {
+        return when (intent.action) {
+            null,
+            Intent.ACTION_MAIN -> true
+            else -> false
         }
     }
 
@@ -615,12 +634,17 @@ class FileManagerController(
                         (it as? ItemOperationsListener)?.finishActMode()
                     }
                     (getCurrentFragment() as? RecentsFragment)?.refreshFragment()
+                    if (getCurrentFragment() !is WorkspaceFilesFragment) {
+                        closeSearchPanel(clearQuery = false)
+                    }
+                    syncWorkspaceChrome()
                     refreshMenuItems()
                 }
             })
             currentItem = activity.config.lastUsedViewPagerPage
 
             onGlobalLayout {
+                syncWorkspaceChrome()
                 refreshMenuItems()
             }
         }
@@ -656,8 +680,26 @@ class FileManagerController(
             if (intentProvider().action == Intent.ACTION_CREATE_DOCUMENT) {
                 createDocumentConfirmed(currentPath)
             } else {
-                toggleMainFabMenu()
+                openCreateNew()
             }
+        }
+        binding.mainMoreFab.setOnClickListener {
+            showBottomOverflowMenu()
+        }
+        binding.mainSearchFab.setOnClickListener {
+            val currentFragment = getCurrentFragment() ?: return@setOnClickListener
+            if (currentFragment !is WorkspaceFilesFragment) {
+                return@setOnClickListener
+            }
+            val nextVisible = !currentFragment.isSearchVisible()
+            currentFragment.setSearchVisible(nextVisible)
+            if (!nextVisible) {
+                closeSearchPanel(clearQuery = true)
+            } else {
+                binding.workspaceChrome.setSearchVisible(true)
+                binding.workspaceChrome.focusSearch()
+            }
+            syncWorkspaceChrome()
         }
     }
 
@@ -665,6 +707,71 @@ class FileManagerController(
         val iconId = if (isCreateDocumentIntent) R.drawable.ic_check_vector else R.drawable.ic_plus_vector
         val icon = activity.resources.getColoredDrawableWithColor(iconId, activity.getProperPrimaryColor().getContrastColor())
         binding.mainFab.setImageDrawable(icon)
+    }
+
+    private fun showBottomOverflowMenu() {
+        val popup = PopupMenu(activity, binding.mainMoreFab, Gravity.END)
+        val menu = popup.menu
+        var order = 0
+        val currentFragment = getCurrentFragment() ?: return
+        val effectiveTabs = getEffectiveTabs()
+        val selectedTabId = effectiveTabs.getOrNull(binding.mainViewPager.currentItem)
+
+        if (currentFragment is WorkspaceFilesFragment) {
+            menu.add(0, MENU_SWITCH_CORE_NAV, order++, NavigatorFolderHelper.displayTitle())
+        }
+
+        fun addSwitchItem(itemId: Int, tabId: Int, title: String) {
+            if (!effectiveTabs.contains(tabId)) return
+            val item = menu.add(1, itemId, order++, title)
+            item.isCheckable = true
+            item.isChecked = selectedTabId == tabId
+        }
+
+        addSwitchItem(MENU_SWITCH_FILES, TAB_FILES, activity.getString(R.string.files_tab))
+        addSwitchItem(MENU_SWITCH_RECENTS, TAB_RECENT_FILES, activity.getString(R.string.recents))
+        addSwitchItem(MENU_SWITCH_STORAGE, TAB_STORAGE_ANALYSIS, activity.getString(R.string.storage))
+        menu.setGroupCheckable(1, true, true)
+
+        val toolbarMenu = binding.workspaceChrome.toolbar().menu
+        for (index in 0 until toolbarMenu.size()) {
+            val sourceItem = toolbarMenu.getItem(index)
+            if (!sourceItem.isVisible) continue
+            if (sourceItem.itemId == R.id.go_home || sourceItem.itemId == R.id.go_to_favorite) continue
+            val target = menu.add(2, sourceItem.itemId, order++, sourceItem.title)
+            sourceItem.icon?.let { target.icon = it }
+        }
+
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                MENU_SWITCH_CORE_NAV -> {
+                    goToFavorite()
+                    true
+                }
+                MENU_SWITCH_FILES -> {
+                    switchBottomView(TAB_FILES)
+                    true
+                }
+                MENU_SWITCH_RECENTS -> {
+                    switchBottomView(TAB_RECENT_FILES)
+                    true
+                }
+                MENU_SWITCH_STORAGE -> {
+                    switchBottomView(TAB_STORAGE_ANALYSIS)
+                    true
+                }
+                else -> handleChromeMenuAction(item.itemId)
+            }
+        }
+        popup.show()
+    }
+
+    private fun switchBottomView(tabId: Int) {
+        val index = getEffectiveTabs().indexOf(tabId)
+        if (index != -1) {
+            closeSearchPanel(clearQuery = false)
+            binding.mainViewPager.currentItem = index
+        }
     }
 
     private fun showMainFabMenu() {
@@ -712,7 +819,7 @@ class FileManagerController(
             icon.setImageDrawable(activity.resources.getColoredDrawableWithColor(iconRes, color))
             label.setTextColor(color)
             row.setOnClickListener {
-                binding.mainMenu.closeSearch()
+                closeSearchPanel(clearQuery = false)
                 binding.mainViewPager.currentItem = index
                 mainFabMenu?.dismiss()
             }
@@ -765,10 +872,10 @@ class FileManagerController(
         if (binding.mainViewPager.currentItem != filesIndex) {
             binding.mainViewPager.currentItem = filesIndex
             binding.mainViewPager.post {
-                (getCurrentFragment() as? ItemsFragment)?.showCreateNewItemDialog()
+                getFilesFragment()?.activeItemsFragment()?.showCreateNewItemDialog()
             }
         } else {
-            (getCurrentFragment() as? ItemsFragment)?.showCreateNewItemDialog()
+            getFilesFragment()?.activeItemsFragment()?.showCreateNewItemDialog()
         }
     }
 
@@ -785,28 +892,31 @@ class FileManagerController(
     }
 
     private fun goHome() {
-        val scopedHome = clampToVisibleTermuxPath(activity.config.homeFolder, termuxHomePath)
-        if (scopedHome != getCurrentFragment()!!.currentPath) {
-            openPath(scopedHome)
+        if (getCurrentFragment() is WorkspaceFilesFragment) {
+            getFilesFragment()?.openHomeWorkspace()
+            syncWorkspaceChrome()
         }
     }
 
     private fun showSortingDialog() {
-        ChangeSortingDialog(activity, getCurrentFragment()!!.currentPath) {
-            (getCurrentFragment() as? ItemsFragment)?.refreshFragment()
+        val path = activeFilePath().ifBlank { return }
+        ChangeSortingDialog(activity, path) {
+            activeItemsFragment()?.refreshFragment()
         }
     }
 
     private fun addFavorite() {
+        val path = activeFilePath().ifBlank { return }
         FavoriteHelper.showAddFavoriteDialog(activity) { remark ->
-            activity.config.addFavorite(getCurrentFragment()!!.currentPath, remark)
+            activity.config.addFavorite(path, remark)
             refreshMenuItems()
-            getCurrentFragment()?.refreshFragment()
+            activeItemsFragment()?.refreshFragment()
         }
     }
 
     private fun removeFavorite() {
-        activity.config.removeFavorite(getCurrentFragment()!!.currentPath)
+        val path = activeFilePath().ifBlank { return }
+        activity.config.removeFavorite(path)
         refreshMenuItems()
     }
 
@@ -844,12 +954,14 @@ class FileManagerController(
     }
 
     private fun setAsHome() {
-        activity.config.homeFolder = clampToVisibleTermuxPath(getCurrentFragment()!!.currentPath, termuxHomePath)
+        val path = activeFilePath().ifBlank { return }
+        activity.config.homeFolder = clampToVisibleTermuxPath(path, termuxHomePath)
         activity.toast(R.string.home_folder_updated)
     }
 
     private fun changeViewType() {
-        ChangeViewTypeDialog(activity, getCurrentFragment()!!.currentPath, getCurrentFragment() is ItemsFragment) {
+        val path = activeFilePath().ifBlank { return }
+        ChangeViewTypeDialog(activity, path, activeItemsFragment() != null) {
             getAllFragments().forEach {
                 it?.refreshFragment()
             }
@@ -1109,13 +1221,14 @@ class FileManagerController(
     private fun toggleTermuxSystemDirs() {
         activity.config.showTermuxSystemDirs = !activity.config.showTermuxSystemDirs
 
-        val currentPath = getCurrentFragment()?.currentPath.orEmpty()
+        val currentPath = activeFilePath()
         if (!TermuxPathScope.isVisibleInFileManager(activity, currentPath)) {
-            openPath(getPreferredStartPath(), forceRefresh = true)
+            getFilesFragment()?.openHomeWorkspace(forceRefresh = true)
         } else {
             refreshMenuItems()
-            getCurrentFragment()?.refreshFragment()
+            activeItemsFragment()?.refreshFragment()
         }
+        syncWorkspaceChrome()
     }
 
     private fun finishCreateDocumentIntent(path: String, filename: String) {
@@ -1129,21 +1242,98 @@ class FileManagerController(
     }
 
     private fun getRecentsFragment() = activity.findViewById<RecentsFragment>(R.id.recents_fragment)
-    private fun getItemsFragment() = activity.findViewById<ItemsFragment>(R.id.items_fragment)
+    private fun getFilesFragment(): WorkspaceFilesFragment? {
+        val fragment = activity.findViewById<WorkspaceFilesFragment>(R.id.workspace_files_fragment)
+        fragment?.workspaceStateChangedListener = {
+            syncWorkspaceChrome()
+            refreshMenuItems()
+        }
+        return fragment
+    }
     private fun getStorageFragment() = activity.findViewById<StorageFragment>(R.id.storage_fragment)
     private fun getAllFragments(): ArrayList<MyViewPagerFragment<*>?> =
-        arrayListOf(getItemsFragment(), getRecentsFragment(), getStorageFragment())
+        arrayListOf(getFilesFragment(), getRecentsFragment(), getStorageFragment())
+
+    private fun activeItemsFragment(): ItemsFragment? =
+        (getCurrentFragment() as? WorkspaceFilesFragment)?.activeItemsFragment()
+
+    private fun activeFilePath(): String = getFilesFragment()?.activeWorkspacePathForMenu().orEmpty()
+
+    private fun handleChromeMenuAction(itemId: Int): Boolean {
+        if (getCurrentFragment() == null) {
+            return true
+        }
+
+        when (itemId) {
+            R.id.go_home -> goHome()
+            R.id.go_to_favorite -> goToFavorite()
+            R.id.sort -> showSortingDialog()
+            R.id.add_favorite -> addFavorite()
+            R.id.remove_favorite -> removeFavorite()
+            R.id.toggle_filename -> toggleFilenameVisibility()
+            R.id.toggle_termux_storage -> toggleTermuxStorage()
+            R.id.toggle_termux_system_dirs -> toggleTermuxSystemDirs()
+            R.id.open_in_terminal -> openInTerminal(activeFilePath().ifBlank { return true })
+            R.id.set_as_home -> setAsHome()
+            R.id.change_view_type -> changeViewType()
+            R.id.temporarily_show_hidden -> tryToggleTemporarilyShowHidden()
+            R.id.stop_showing_hidden -> tryToggleTemporarilyShowHidden()
+            R.id.column_count -> changeColumnCount()
+            R.id.more_apps_from_us -> activity.launchMoreAppsFromUsIntent()
+            R.id.self_test -> runSessionIndustrialSelfTest()
+            R.id.manage_session_trust -> showCurrentSessionTrustDialog()
+            R.id.settings -> launchSettings()
+            R.id.about -> launchAbout()
+            else -> return false
+        }
+        return true
+    }
 
     private fun getCurrentFragment(): MyViewPagerFragment<*>? {
         val fragments = arrayListOf<MyViewPagerFragment<*>>()
         getEffectiveTabs().forEach { tab ->
             when (tab) {
-                TAB_FILES -> fragments.add(getItemsFragment())
-                TAB_RECENT_FILES -> fragments.add(getRecentsFragment())
-                TAB_STORAGE_ANALYSIS -> fragments.add(getStorageFragment())
+                TAB_FILES -> getFilesFragment()?.let { fragments.add(it) }
+                TAB_RECENT_FILES -> getRecentsFragment()?.let { fragments.add(it) }
+                TAB_STORAGE_ANALYSIS -> getStorageFragment()?.let { fragments.add(it) }
             }
         }
         return fragments.getOrNull(binding.mainViewPager.currentItem)
+    }
+
+    private fun closeSearchPanel(clearQuery: Boolean) {
+        binding.workspaceChrome.setSearchVisible(false, clearQuery = clearQuery)
+        if (clearQuery) {
+            getCurrentFragment()?.searchQueryChanged("")
+        }
+        getFilesFragment()?.setSearchVisible(false)
+        syncWorkspaceChrome()
+    }
+
+    private fun syncWorkspaceChrome() {
+        val currentFragment = getCurrentFragment()
+        val isFilesSelected = currentFragment is WorkspaceFilesFragment
+        binding.workspaceChrome.tabsView().visibility = if (isFilesSelected) View.VISIBLE else View.GONE
+        binding.mainSearchFab.visibility = if (isFilesSelected) View.VISIBLE else View.GONE
+        binding.mainMoreFab.visibility = if (currentFragment == null) View.GONE else View.VISIBLE
+
+        if (isFilesSelected) {
+            val filesFragment = getFilesFragment() ?: return
+            binding.workspaceChrome.render(filesFragment.shellState())
+        } else {
+            binding.workspaceChrome.setSearchVisible(false, clearQuery = false)
+            binding.workspaceChrome.render(WorkspaceShellState(emptyList(), "", false))
+        }
+    }
+
+    private fun blendColor(foreground: Int, background: Int, ratio: Float): Int {
+        val clamped = ratio.coerceIn(0f, 1f)
+        val inverse = 1f - clamped
+        val a = (Color.alpha(foreground) * clamped + Color.alpha(background) * inverse).toInt()
+        val r = (Color.red(foreground) * clamped + Color.red(background) * inverse).toInt()
+        val g = (Color.green(foreground) * clamped + Color.green(background) * inverse).toInt()
+        val b = (Color.blue(foreground) * clamped + Color.blue(background) * inverse).toInt()
+        return Color.argb(a, r, g, b)
     }
 
     private fun getTabsList() = arrayListOf(TAB_FILES, TAB_RECENT_FILES)

@@ -32,6 +32,15 @@ import java.io.File
 
 class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerFragment<MyViewPagerFragment.ItemsInnerBinding>(context, attributeSet),
     ItemOperationsListener {
+    interface DirectoryNavigationHandler {
+        fun onDirectoryNavigationRequested(
+            fragment: ItemsFragment,
+            currentPath: String,
+            item: FileDirItem,
+            fromNavigatorRoot: Boolean
+        ): Boolean
+    }
+
     private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
     private var showHidden = false
     private var lastSearchedText = ""
@@ -42,6 +51,8 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     private var storedItems = ArrayList<ListItem>()
     private var itemsIgnoringSearch = ArrayList<ListItem>()
     private lateinit var binding: ItemsFragmentBinding
+    var directoryNavigationHandler: DirectoryNavigationHandler? = null
+    var pathChangedListener: ((String) -> Unit)? = null
 
     private data class RevealRequest(
         val targetPath: String,
@@ -134,6 +145,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
 
         scrollStates[currentPath] = getScrollState()!!
         currentPath = realPath
+        pathChangedListener?.invoke(currentPath)
         showHidden = context!!.config.shouldShowHidden()
         showProgressBar()
         getItems(currentPath) { originalPath, listItems ->
@@ -358,6 +370,9 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             val ctx = context!!
             val selectedSessionKey = NavigatorFolderHelper.resolveSessionKeyForTargetPath(ctx, item.path)
             sessionFileCoordinator.setSelectedSessionKey(ctx, selectedSessionKey)
+            if (directoryNavigationHandler?.onDirectoryNavigationRequested(this, currentPath, item, true) == true) {
+                return
+            }
             openDirectory(item.path)
             return
         }
@@ -399,6 +414,9 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         }
 
         if (item.isDirectory) {
+            if (directoryNavigationHandler?.onDirectoryNavigationRequested(this, currentPath, item, false) == true) {
+                return
+            }
             openDirectory(item.path)
         } else {
             clickedPath(item.path)

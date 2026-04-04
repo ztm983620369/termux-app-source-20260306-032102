@@ -72,7 +72,7 @@ class ViewPagerAdapter(
         val showTabs = activity.config.showTabs
         val fragments = arrayListOf<Int>()
         if (showTabs and TAB_FILES != 0) {
-            fragments.add(R.layout.items_fragment)
+            fragments.add(R.layout.workspace_files_fragment)
         }
 
         if (showTabs and TAB_RECENT_FILES != 0) {

@@ -36,6 +36,7 @@ android {
 }
 
 dependencies {
+    implementation(project(":workspace-shell"))
     implementation(project(":fossify-commons"))
     implementation(project(":file-bridge"))
     implementation(project(":editor-sync-core"))
@@ -47,4 +48,7 @@ dependencies {
     implementation("com.alexvasilkov:gesture-views:2.8.3")
     implementation("me.grantland:autofittextview:0.2.1")
     implementation("net.lingala.zip4j:zip4j:2.11.5")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
