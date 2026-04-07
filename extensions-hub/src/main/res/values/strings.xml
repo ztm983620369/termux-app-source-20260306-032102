@@ -1,0 +1,12 @@
+<resources>
+    <string name="extensions_hub_title">扩展</string>
+    <string name="extensions_hub_subtitle">这是独立模块接入的扩展页骨架，后续能力会继续从这里分发。</string>
+    <string name="extensions_hub_status_idle">状态：已加载，等待进入</string>
+    <string name="extensions_hub_status_ready">状态：扩展模块已运行</string>
+    <string name="extensions_hub_card_title_one">模块化入口</string>
+    <string name="extensions_hub_card_body_one">当前页面来自独立的 Android library 模块，不再直接堆在 app 宿主里。</string>
+    <string name="extensions_hub_card_title_two">后续可扩展</string>
+    <string name="extensions_hub_card_body_two">后续可以在这里承载插件中心、工具页、实验功能、协议入口等扩展能力。</string>
+    <string name="extensions_hub_card_title_three">先跑通</string>
+    <string name="extensions_hub_card_body_three">这一步先把 tab、页面宿主和独立模块跑通，后续再往里面逐步填真实功能。</string>
+</resources>

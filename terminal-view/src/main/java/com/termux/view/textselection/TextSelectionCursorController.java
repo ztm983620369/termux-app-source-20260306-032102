@@ -10,12 +10,7 @@ import android.content.Intent;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
-import android.text.Spannable;
-import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
-import android.text.TextUtils;
-import android.text.style.URLSpan;
-import android.text.util.Linkify;
 import android.view.ActionMode;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -26,19 +21,30 @@ import androidx.annotation.Nullable;
 
 import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalRow;
+import com.termux.terminal.TerminalSelectionContext;
+import com.termux.terminal.TerminalSelectionContextExtractor;
+import com.termux.terminal.TerminalUrlDetectionResult;
 import com.termux.terminal.WcWidth;
 import com.termux.view.R;
 import com.termux.view.TerminalView;
+import com.termux.view.links.TerminalSmartUrlDetector;
 
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.LinkedHashSet;
-import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class TextSelectionCursorController implements CursorController {
 
+    private static final ExecutorService URL_DETECTION_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "TermuxUrlDetection");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private static final int URL_CONTEXT_PADDING_ROWS = 2;
+
     private final TerminalView terminalView;
     private final TextSelectionHandleView mStartHandle, mEndHandle;
+    private final TerminalSmartUrlDetector mUrlDetector;
     private String mStoredSelectedText;
     private boolean mIsSelectingText = false;
     private long mShowStartTime = System.currentTimeMillis();
@@ -61,15 +67,12 @@ public class TextSelectionCursorController implements CursorController {
     private int mCachedUrlSelX2 = Integer.MIN_VALUE;
     private int mCachedUrlSelY2 = Integer.MIN_VALUE;
     @Nullable
-    private LinkedHashSet<String> mCachedDetectedUrls;
-
-    private static final int MAX_URLS_TO_SHOW = 32;
-    private static final int MAX_URL_SCAN_CHARS = 24_000;
-    private static final int URL_EXTRACT_CHUNK_ROWS = 32;
-    private static final int URL_FULL_SCAN_MAX_ROWS = 60;
+    private TerminalUrlDetectionResult mCachedUrlDetectionResult;
+    private int mUrlDetectionGeneration = 0;
 
     public TextSelectionCursorController(TerminalView terminalView) {
         this.terminalView = terminalView;
+        mUrlDetector = new TerminalSmartUrlDetector(terminalView.getContext());
         mStartHandle = new TextSelectionHandleView(terminalView, this, TextSelectionHandleView.LEFT);
         mEndHandle = new TextSelectionHandleView(terminalView, this, TextSelectionHandleView.RIGHT);
 
@@ -80,12 +83,13 @@ public class TextSelectionCursorController implements CursorController {
     public void show(MotionEvent event) {
         setInitialTextSelectionPosition(event);
         invalidateDetectedUrlCache();
+        mIsSelectingText = true;
+        scheduleUrlDetection(true);
         mStartHandle.positionAtCursor(mSelX1, mSelY1, true);
         mEndHandle.positionAtCursor(mSelX2 + 1, mSelY2, true);
 
         setActionModeCallBacks();
         mShowStartTime = System.currentTimeMillis();
-        mIsSelectingText = true;
     }
 
     void onHandleDragStarted(TextSelectionHandleView handle) {
@@ -116,6 +120,7 @@ public class TextSelectionCursorController implements CursorController {
             mActionMode.finish();
         }
 
+        cancelPendingUrlDetection();
         mSelX1 = mSelY1 = mSelX2 = mSelY2 = -1;
         mIsSelectingText = false;
         terminalView.hideTextSelectionPreview();
@@ -198,10 +203,13 @@ public class TextSelectionCursorController implements CursorController {
                         terminalView.stopTextSelectionMode();
                         break;
                     case ACTION_OPEN:
-                        // Re-compute from the actual selected text so we always act on exactly what
-                        // the user selected.
-                        LinkedHashSet<String> urls = extractUrlsForCurrentSelection();
-                        if (urls.isEmpty()) urls = getDetectedUrlsForSelection();
+                        LinkedHashSet<String> urls = getDetectedUrlsForSelection();
+                        if (urls.isEmpty()) {
+                            TerminalSelectionContext selectionContext = buildSelectionContext();
+                            if (selectionContext != null) {
+                                urls = mUrlDetector.detectLocally(selectionContext).getUrls();
+                            }
+                        }
                         if (!urls.isEmpty()) {
                             terminalView.stopTextSelectionMode();
                             openUrls(urls);
@@ -288,133 +296,68 @@ public class TextSelectionCursorController implements CursorController {
         mCachedUrlSelY1 = Integer.MIN_VALUE;
         mCachedUrlSelX2 = Integer.MIN_VALUE;
         mCachedUrlSelY2 = Integer.MIN_VALUE;
-        mCachedDetectedUrls = null;
+        mCachedUrlDetectionResult = null;
+    }
+
+    private void cancelPendingUrlDetection() {
+        mUrlDetectionGeneration++;
     }
 
     private boolean isDetectedUrlCacheValid() {
-        return mCachedDetectedUrls != null &&
+        return mCachedUrlDetectionResult != null &&
             mCachedUrlSelX1 == mSelX1 && mCachedUrlSelY1 == mSelY1 &&
             mCachedUrlSelX2 == mSelX2 && mCachedUrlSelY2 == mSelY2;
     }
 
     private LinkedHashSet<String> getDetectedUrlsForSelection() {
-        if (isDetectedUrlCacheValid()) return mCachedDetectedUrls;
+        if (!isDetectedUrlCacheValid()) return new LinkedHashSet<>();
+        return mCachedUrlDetectionResult.getUrls();
+    }
+
+    @Nullable
+    private TerminalSelectionContext buildSelectionContext() {
+        if (terminalView.mEmulator == null) return null;
+        return TerminalSelectionContextExtractor.extractSelectionContext(
+            terminalView.mEmulator.getScreen(),
+            mSelX1, mSelY1, mSelX2, mSelY2,
+            URL_CONTEXT_PADDING_ROWS
+        );
+    }
+
+    private void scheduleUrlDetection(boolean invalidateActionMode) {
+        TerminalSelectionContext selectionContext = buildSelectionContext();
+        final int requestGeneration = ++mUrlDetectionGeneration;
+
+        if (selectionContext == null || selectionContext.isEmpty()) {
+            applyUrlDetectionResult(requestGeneration, TerminalUrlDetectionResult.empty(), invalidateActionMode);
+            return;
+        }
+
+        applyUrlDetectionResult(requestGeneration, mUrlDetector.detectLocally(selectionContext), invalidateActionMode);
+
+        URL_DETECTION_EXECUTOR.execute(() -> {
+            TerminalUrlDetectionResult result = mUrlDetector.detectSmart(selectionContext);
+            terminalView.post(() -> applyUrlDetectionResult(requestGeneration, result, false));
+        });
+    }
+
+    private void applyUrlDetectionResult(int requestGeneration,
+                                         TerminalUrlDetectionResult detectionResult,
+                                         boolean invalidateActionMode) {
+        if (requestGeneration != mUrlDetectionGeneration || !isActive()) return;
+
+        boolean changed = !isDetectedUrlCacheValid()
+            || !getDetectedUrlsForSelection().equals(detectionResult.getUrls());
 
         mCachedUrlSelX1 = mSelX1;
         mCachedUrlSelY1 = mSelY1;
         mCachedUrlSelX2 = mSelX2;
         mCachedUrlSelY2 = mSelY2;
+        mCachedUrlDetectionResult = detectionResult;
 
-        LinkedHashSet<String> urls = new LinkedHashSet<>();
-        if (terminalView.mEmulator == null) {
-            mCachedDetectedUrls = urls;
-            return urls;
+        if (mActionMode != null && (invalidateActionMode || changed)) {
+            mActionMode.invalidate();
         }
-
-        TerminalBuffer screen = terminalView.mEmulator.getScreen();
-        final int columns = terminalView.mEmulator.mColumns;
-
-        List<CharSequence> probes = new ArrayList<>(6);
-
-        // Fallback: also probe local context near the handles to keep "Open" visible when the
-        // selection is large (avoids scanning huge selection ranges).
-        probes.add(screen.getWordAtLocation(mSelX1, mSelY1));
-        probes.add(screen.getWordAtLocation(mSelX2, mSelY2));
-        int rowSpan = Math.abs(mSelY2 - mSelY1) + 1;
-        if (rowSpan <= URL_FULL_SCAN_MAX_ROWS) {
-            // Safe for UI thread: bounded selection size. Use full selection text to avoid missing URLs
-            // when the selection spans multiple tokens.
-            CharSequence selectionText = truncateForUrlScan(
-                screen.getSelectedText(mSelX1, mSelY1, mSelX2, mSelY2, /*joinBackLines*/ true, /*joinFullLines*/ true)
-            );
-            probes.add(selectionText);
-        } else if (rowSpan == 1) {
-            int midX = (mSelX1 + mSelX2) / 2;
-            probes.add(screen.getWordAtLocation(midX, mSelY1));
-        } else if (rowSpan >= 3) {
-            // Probe an intermediate row where selection is likely full-width to reduce sampling outside
-            // the selected range on the start/end rows.
-            int midY = (mSelY1 + mSelY2) / 2;
-            if (midY == mSelY1) midY++;
-            else if (midY == mSelY2) midY--;
-            int midX = columns / 2;
-            probes.add(screen.getWordAtLocation(midX, midY));
-        }
-
-        for (CharSequence probe : probes) {
-            if (TextUtils.isEmpty(probe)) continue;
-            urls.addAll(extractUrlsWithLinkify(probe));
-            if (urls.size() >= MAX_URLS_TO_SHOW) break;
-        }
-
-        mCachedDetectedUrls = urls;
-        return urls;
-    }
-
-    private LinkedHashSet<String> extractUrlsForCurrentSelection() {
-        LinkedHashSet<String> out = new LinkedHashSet<>();
-        if (terminalView.mEmulator == null) return out;
-
-        TerminalBuffer screen = terminalView.mEmulator.getScreen();
-        final int columns = terminalView.mEmulator.mColumns;
-        final int rowSpan = Math.abs(mSelY2 - mSelY1) + 1;
-
-        if (rowSpan <= URL_FULL_SCAN_MAX_ROWS) {
-            CharSequence selectionText = truncateForUrlScan(
-                screen.getSelectedText(mSelX1, mSelY1, mSelX2, mSelY2, /*joinBackLines*/ true, /*joinFullLines*/ true)
-            );
-            return extractUrlsWithLinkify(selectionText);
-        }
-
-        // For huge selections, avoid constructing a giant String on the UI thread.
-        int startRow = mSelY1;
-        while (startRow <= mSelY2 && out.size() < MAX_URLS_TO_SHOW) {
-            int endRow = Math.min(mSelY2, startRow + URL_EXTRACT_CHUNK_ROWS - 1);
-            int x1 = (startRow == mSelY1) ? mSelX1 : 0;
-            int x2 = (endRow == mSelY2) ? mSelX2 : columns;
-
-            CharSequence chunk = truncateForUrlScan(
-                screen.getSelectedText(x1, startRow, x2, endRow, /*joinBackLines*/ true, /*joinFullLines*/ true)
-            );
-            out.addAll(extractUrlsWithLinkify(chunk));
-
-            if (endRow >= mSelY2) break;
-            // Overlap 1 row to avoid missing a URL that wraps across chunk boundaries.
-            startRow = endRow;
-        }
-
-        return out;
-    }
-
-    private static CharSequence truncateForUrlScan(CharSequence text) {
-        if (text == null) return "";
-        if (text.length() <= MAX_URL_SCAN_CHARS) return text;
-        return text.subSequence(0, MAX_URL_SCAN_CHARS);
-    }
-
-    private static LinkedHashSet<String> extractUrlsWithLinkify(@Nullable CharSequence text) {
-        LinkedHashSet<String> out = new LinkedHashSet<>();
-        if (TextUtils.isEmpty(text)) return out;
-
-        Spannable spannable = new SpannableString(text);
-        // Use the platform URL detector instead of maintaining our own matching logic here.
-        Linkify.addLinks(spannable, Linkify.WEB_URLS);
-
-        URLSpan[] spans = spannable.getSpans(0, spannable.length(), URLSpan.class);
-        if (spans == null || spans.length == 0) return out;
-
-        // Make extraction deterministic: order by appearance in the text.
-        Arrays.sort(spans, (a, b) -> Integer.compare(spannable.getSpanStart(a), spannable.getSpanStart(b)));
-
-        for (URLSpan span : spans) {
-            if (span == null) continue;
-            String url = span.getURL();
-            if (TextUtils.isEmpty(url)) continue;
-            out.add(url);
-            if (out.size() >= MAX_URLS_TO_SHOW) break;
-        }
-
-        return out;
     }
 
     @Nullable
@@ -560,6 +503,7 @@ public class TextSelectionCursorController implements CursorController {
         }
 
         invalidateDetectedUrlCache();
+        scheduleUrlDetection(false);
         terminalView.invalidate();
         updateSelectionPreviewForHandle(handle);
     }
@@ -603,6 +547,7 @@ public class TextSelectionCursorController implements CursorController {
         mSelY1 -= decrement;
         mSelY2 -= decrement;
         invalidateDetectedUrlCache();
+        scheduleUrlDetection(false);
     }
 
     public boolean onTouchEvent(MotionEvent event) {
@@ -617,6 +562,7 @@ public class TextSelectionCursorController implements CursorController {
 
     @Override
     public void onDetached() {
+        cancelPendingUrlDetection();
         terminalView.hideTextSelectionPreview();
     }
 

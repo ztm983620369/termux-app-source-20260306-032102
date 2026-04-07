@@ -53,6 +53,7 @@ android {
         implementation project(":terminal-view")
         implementation project(":termux-shared")
         implementation project(":terminal-tabs")
+        implementation project(":extensions-hub")
         implementation project(":terminal-session-surface")
         implementation project(":terminal-session-core")
         implementation project(":terminal-session-runtime")

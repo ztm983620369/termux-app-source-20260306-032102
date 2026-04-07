@@ -73,6 +73,12 @@
                     android:visibility="gone" />
 
                 <FrameLayout
+                    android:id="@+id/page_extensions"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:visibility="gone" />
+
+                <FrameLayout
                     android:id="@+id/page_files"
                     android:layout_width="match_parent"
                     android:layout_height="match_parent"

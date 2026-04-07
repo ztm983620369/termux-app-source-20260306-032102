@@ -306,8 +306,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
      * Should be called when mActivity.onCreate() is called
      */
     public void onCreate() {
-        // Set terminal fonts and colors
-        checkForFontAndColors();
+        // Keep custom startup styling exact, but skip default no-op disk work from the cold path.
+        if (hasCustomFontOrColors()) {
+            checkForFontAndColors();
+        }
     }
 
     /**
@@ -318,7 +320,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         // Get the session stored in shared preferences stored by {@link #onStop} if its valid,
         // otherwise get the last session currently running.
         if (mActivity.getTermuxService() != null) {
-            setCurrentSession(getCurrentStoredSessionOrLast());
+            mActivity.bootstrapTerminalSessionSelection(getCurrentStoredSessionOrLast());
             termuxSessionListNotifyUpdated();
             maybeAutoSwitchToProotSession();
             maybeAutoRestorePinnedSshSessions();
@@ -336,10 +338,20 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
      * Should be called when mActivity.onResume() is called
      */
     public void onResume() {
-        // Just initialize the mBellSoundPool and load the sound, otherwise bell might not run
-        // the first time bell key is pressed and play() is called, since sound may not be loaded
-        // quickly enough before the call to play(). https://stackoverflow.com/questions/35435625
-        loadBellSoundPool();
+        // Bell preload is not first-frame critical; defer it only for cold start.
+        if (mActivity.isOnResumeAfterOnCreate()) {
+            View anchor = mActivity.getWindow() == null ? null : mActivity.getWindow().getDecorView();
+            if (anchor != null) {
+                anchor.post(this::loadBellSoundPool);
+            } else {
+                loadBellSoundPool();
+            }
+        } else {
+            // Just initialize the mBellSoundPool and load the sound, otherwise bell might not run
+            // the first time bell key is pressed and play() is called, since sound may not be loaded
+            // quickly enough before the call to play(). https://stackoverflow.com/questions/35435625
+            loadBellSoundPool();
+        }
     }
 
     /**
@@ -564,10 +576,6 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             notifyOfSessionChange();
         }
 
-        // We call the following even when the session is already being displayed since config may
-        // be stale, like current session not selected or scrolled to.
-        checkAndScrollToSession(session);
-        updateBackgroundColor();
         mActivity.onTerminalSessionSelectionCommitted(session);
     }
 
@@ -4255,6 +4263,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         } catch (Exception e) {
             Logger.logStackTraceWithMessage(LOG_TAG, "Error in checkForFontAndColors()", e);
         }
+    }
+
+    private boolean hasCustomFontOrColors() {
+        File colorsFile = TermuxConstants.TERMUX_COLOR_PROPERTIES_FILE;
+        File fontFile = TermuxConstants.TERMUX_FONT_FILE;
+        return colorsFile.isFile() || (fontFile.exists() && fontFile.length() > 0);
     }
 
     public void updateBackgroundColor() {

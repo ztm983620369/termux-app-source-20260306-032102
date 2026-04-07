@@ -37,7 +37,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.text.Editable
-import android.text.InputType
 import android.text.TextWatcher
 import android.util.Log
 import android.view.KeyEvent
@@ -48,13 +47,12 @@ import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.PathInterpolator
-import android.widget.EditText
-import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
@@ -101,7 +99,6 @@ import io.github.rosemoe.sora.widget.component.Magnifier
 import io.github.rosemoe.sora.widget.ext.EditorSpanInteractionHandler
 import io.github.rosemoe.sora.widget.getComponent
 import io.github.rosemoe.sora.widget.subscribeAlways
-import io.github.rosemoe.sora.app.ide.IdeRunManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -121,7 +118,8 @@ class EditorController(
     private val activity: AppCompatActivity,
     private val intentProvider: () -> Intent,
     private val loadTMLLauncher: ActivityResultLauncher<String>,
-    private val loadTMTLauncher: ActivityResultLauncher<String>
+    private val loadTMTLauncher: ActivityResultLauncher<String>,
+    private val embeddedTerminalHost: EditorEmbeddedTerminalHost? = null
 ) {
 
     companion object {
@@ -134,7 +132,6 @@ class EditorController(
         private const val TAG = "EditorController"
         const val LOG_FILE = "crash-journal.log"
         private const val PREFS_NAME = "sora_editor_prefs"
-        private const val PREF_KEY_RUN_COMMAND = "pref_run_command"
 
         /**
          * Symbols to be displayed in symbol input view
@@ -161,6 +158,9 @@ class EditorController(
 
     val rootView: View
         get() = binding.root
+
+    val embeddedWorkspaceHost: ViewGroup
+        get() = binding.editorWorkspaceHost
 
     private val resources get() = activity.resources
     private val window get() = activity.window
@@ -258,6 +258,7 @@ class EditorController(
         CrashHandler.INSTANCE.init(activity)
 
         activity.setSupportActionBar(binding.activityToolbar)
+        syncEmbeddedTerminalWorkspaceUi()
         if (applyToolbarTopInsetFromSystemBars) {
             applyEdgeToEdgeForViews(binding.toolbarContainer, binding.root)
         }
@@ -980,6 +981,7 @@ class EditorController(
         menuInflater.inflate(R.menu.menu_main, menu)
         undo = menu.findItem(R.id.text_undo)
         redo = menu.findItem(R.id.text_redo)
+        menu.findItem(R.id.open_terminal_workspace)?.isVisible = embeddedTerminalHost != null
         menu.findItem(R.id.auto_save_enabled)?.isChecked = documentSync.isAutoSaveEnabled()
         menu.findItem(R.id.save_file)?.isEnabled = documentSync.state.value.canSave
         saveStatusUi.bind(menu)
@@ -992,6 +994,8 @@ class EditorController(
         fractionAnimator = null
         runCatching { ViewCompat.setWindowInsetsAnimationCallback(window.decorView, null) }
         FileOpenBridge.removeListener(fileOpenListener)
+        binding.activityToolbar.navigationIcon = null
+        binding.activityToolbar.setNavigationOnClickListener(null)
         binding.editor.release()
     }
 
@@ -1153,85 +1157,41 @@ class EditorController(
 
             R.id.switch_typeface -> editorEnv.chooseTypeface()
 
-            R.id.run_project -> {
-                val path = lastOpenRequest?.path
-                if (path.isNullOrBlank()) {
-                    toast("未打开任何文件，请先打开文件后再运行。")
-                    return true
-                }
-                val command = prefs.getString(PREF_KEY_RUN_COMMAND, "").orEmpty().trim()
-                if (command.isBlank()) {
-                    toast(getString(R.string.run_command_empty))
-                    showRunCommandSettingsDialog()
-                    return true
-                }
-                lifecycleScope.launch {
-                    val save = documentSync.saveNow(EditorSaveTrigger.RUN)
-                    if (!save.ok) {
-                        toast("Save failed: ${save.error ?: "unknown"}")
-                        return@launch
-                    }
-                    val workdir = File(path).parentFile?.absolutePath ?: File(path).absoluteFile.parentFile?.absolutePath.orEmpty()
-                    if (workdir.isBlank()) {
-                        toast("Cannot determine working directory")
-                        return@launch
-                    }
-                    IdeRunManager.launchCustomCommandInTerminal(
-                        context = activity,
-                        command = command,
-                        workdir = workdir,
-                        label = "run-custom"
-                    )
-                    sendBroadcast(
-                        Intent("com.termux.app.action.SWITCH_TAB")
-                            .setPackage(com.termux.shared.termux.TermuxConstants.TERMUX_PACKAGE_NAME)
-                            .putExtra("tab", "terminal")
-                    )
-                    toast("已发送运行命令: $command")
-                }
-                return true
-            }
+            R.id.open_terminal_workspace -> {
+                if (embeddedTerminalHost == null) return true
 
-            R.id.run_command_settings -> {
-                showRunCommandSettingsDialog()
+                if (embeddedTerminalHost.isEmbeddedTerminalWorkspaceVisible()) {
+                    embeddedTerminalHost.hideEmbeddedTerminalWorkspace()
+                } else {
+                    embeddedTerminalHost.showEmbeddedTerminalWorkspace(lastOpenRequest?.path)
+                }
+                syncEmbeddedTerminalWorkspaceUi()
+                activity.invalidateOptionsMenu()
                 return true
             }
         }
         return false
     }
 
-    private fun showRunCommandSettingsDialog() {
-        val input = EditText(activity).apply {
-            setText(prefs.getString(PREF_KEY_RUN_COMMAND, "").orEmpty())
-            hint = getString(R.string.run_command_hint)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            minLines = 2
-            setSingleLine(false)
+    fun syncEmbeddedTerminalWorkspaceUi() {
+        val visible = embeddedTerminalHost?.isEmbeddedTerminalWorkspaceVisible() == true
+        binding.activityToolbar.navigationIcon = if (visible) {
+            AppCompatResources.getDrawable(activity, androidx.appcompat.R.drawable.abc_ic_ab_back_material)
+        } else {
+            null
         }
-
-        val container = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            val pad = (16 * resources.displayMetrics.density).toInt()
-            setPadding(pad, pad, pad, pad)
-            addView(
-                input,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-        }
-
-        AlertDialog.Builder(activity)
-            .setTitle(getString(R.string.run_command_title))
-            .setView(container)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                val v = input.text?.toString().orEmpty()
-                prefs.edit().putString(PREF_KEY_RUN_COMMAND, v).apply()
-                toast(getString(R.string.run_command_saved))
+        binding.activityToolbar.setNavigationOnClickListener(
+            if (visible) {
+                View.OnClickListener {
+                    if (embeddedTerminalHost?.hideEmbeddedTerminalWorkspace() == true) {
+                        syncEmbeddedTerminalWorkspaceUi()
+                        activity.invalidateOptionsMenu()
+                    }
+                }
+            } else {
+                null
             }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
+        )
     }
 
     private fun showBridgeSelfTestDialog() {

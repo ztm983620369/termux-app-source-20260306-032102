@@ -95,7 +95,7 @@
     <string name="save_file">保存</string>
     <string name="autosave_self_test">自动保存自测</string>
     <string name="copy_text">复制</string>
-    <string name="run_project">运行</string>
+    <string name="open_terminal_workspace">终端</string>
     <string name="run_command_settings">运行命令设置</string>
     <string name="run_command_title">运行命令</string>
     <string name="run_command_hint">例如：./gradlew test</string>

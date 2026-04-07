@@ -97,8 +97,6 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
      * Should be called when mActivity.onCreate() is called
      */
     public void onCreate() {
-        onReloadProperties();
-
         mActivity.applyTerminalSessionSurfaceSettings();
     }
 

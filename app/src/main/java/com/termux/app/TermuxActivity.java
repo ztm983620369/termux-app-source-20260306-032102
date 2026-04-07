@@ -40,13 +40,16 @@ import android.widget.RelativeLayout;
 import com.termux.BuildConfig;
 import com.termux.R;
 import com.termux.app.api.file.FileReceiverActivity;
+import com.termux.app.editor.EditorTerminalWorkspaceController;
 import com.termux.app.topbar.TerminalTopBarController;
 import com.termux.app.topbar.TerminalTopBarView;
+import com.termux.app.terminal.TerminalSessionSelectionStateMachine;
 import com.termux.app.terminal.TermuxActivityRootView;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
 import com.termux.app.terminal.TermuxTerminalSessionSurfaceBridge;
 import com.termux.app.terminal.TermuxTerminalTopBarBridge;
 import com.termux.app.terminal.TerminalConfigCanvasView;
+import com.termux.app.terminal.workspace.TerminalWorkspaceController;
 import com.termux.app.terminal.io.TermuxTerminalExtraKeys;
 import com.google.android.material.bottomnavigation.BottomNavigationView;
 import com.termux.shared.activities.ReportActivity;
@@ -69,6 +72,7 @@ import com.termux.shared.logger.Logger;
 import com.termux.shared.termux.TermuxUtils;
 import com.termux.shared.termux.settings.properties.TermuxAppSharedProperties;
 import io.github.rosemoe.sora.app.EditorController;
+import io.github.rosemoe.sora.app.EditorEmbeddedTerminalHost;
 import com.termux.shared.termux.theme.TermuxThemeUtils;
 import com.termux.shared.theme.NightMode;
 import com.termux.shared.view.KeyboardUtils;
@@ -86,6 +90,7 @@ import com.termux.bridge.FileEditorContract;
 import com.termux.bridge.FileOpenEvent;
 import com.termux.bridge.FileOpenRequest;
 import com.termux.ui.nav.UiShellNavBridge;
+import com.termux.extensionshub.ExtensionsHubController;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -127,7 +132,7 @@ import java.util.Arrays;
  * </ul>
  * about memory leaks.
  */
-public final class TermuxActivity extends SimpleActivity implements ServiceConnection, FileOpenListener, FileManagerHost {
+public final class TermuxActivity extends SimpleActivity implements ServiceConnection, FileOpenListener, FileManagerHost, EditorEmbeddedTerminalHost {
 
     /**
      * The connection to the {@link TermuxService}. Requested in {@link #onCreate(Bundle)} with a call to
@@ -249,6 +254,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private static final String ARG_BOTTOM_NAV_PRIMARY_TAB = "bottom_nav_primary_tab";
     private static final String ARG_BOTTOM_NAV_FIXED_ON_IME = "bottom_nav_fixed_on_ime";
     private static final String ARG_TERMINAL_CONFIG_TAB_SELECTED = "terminal_config_tab_selected";
+    private static final String ARG_TERMINAL_SELECTED_SESSION_HANDLE = "terminal_selected_session_handle";
     private static final String ARG_TERMINAL_CONFIG_TMUX_PROFILE_ID = "terminal_config_tmux_profile_id";
     private static final String ARG_TERMINAL_CONFIG_TMUX_PROFILE_TITLE = "terminal_config_tmux_profile_title";
     private static final String ARG_TERMINAL_CONFIG_TMUX_TARGET_LABEL = "terminal_config_tmux_target_label";
@@ -260,6 +266,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private static final String ARG_TERMINAL_SOFT_KEYBOARD_VISIBLE = "terminal_soft_keyboard_visible";
     private static final String ARG_TERMINAL_RESTORE_FOCUS = "terminal_restore_focus";
 
+    private static final int TAB_EXTENSIONS = 1;
     private static final int TAB_EDITOR = 2;
     private static final int TAB_FILES = 3;
     private static final int TAB_TERMINAL = 4;
@@ -269,6 +276,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private static final String LOG_TAG = "TermuxActivity";
     private BottomNavigationView mBottomNavigationView;
     private View mEditorPage;
+    private View mExtensionsPage;
     private View mFilesPage;
     private View mTerminalConfigPage;
     private TerminalConfigCanvasView mTerminalConfigCanvasView;
@@ -281,14 +289,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private TerminalTopBarController mTerminalTopBarController;
     private TermuxTerminalSessionSurfaceBridge mTermuxTerminalSessionSurfaceBridge;
     private TermuxTerminalTopBarBridge mTermuxTerminalTopBarBridge;
-    private boolean mSurfaceSelectionDispatchInProgress = false;
+    @NonNull
+    private final TerminalSessionSelectionStateMachine mTerminalSelectionStateMachine =
+        new TerminalSessionSelectionStateMachine();
     private boolean mTerminalSessionSurfaceHasSnapshot = false;
     private boolean mBottomNavFixedOnImeEnabled = true;
     private boolean mSessionListUiUpdateScheduled = false;
-    private boolean mTerminalConfigTabSelected = false;
-    @Nullable private TerminalSession mLastSelectedTerminalSession;
-    @Nullable private TerminalSession mTopBarPreviewSession;
-    private boolean mTopBarPreviewConfigSelected = false;
     private boolean mTerminalSoftKeyboardVisibilityKnown = false;
     private boolean mTerminalSoftKeyboardVisible = false;
     private boolean mTerminalRestoreFocus = false;
@@ -302,6 +308,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private final ArrayList<TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem> mTerminalConfigTmuxSessions = new ArrayList<>();
     private int mSessionUiBatchDepth = 0;
     private boolean mSessionUiUpdatePendingInBatch = false;
+    private boolean mDeferredStartupInitializationScheduled = false;
     private final Runnable mCoalescedSessionListUiUpdate = () -> {
         mSessionListUiUpdateScheduled = false;
         if (mIsInvalidState) return;
@@ -314,6 +321,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private static final String ARG_FILE_MANAGER_STATE = "file_manager_state";
     private EditorController mEditorController;
+    private ExtensionsHubController mExtensionsHubController;
+    @Nullable
+    private EditorTerminalWorkspaceController mEditorTerminalWorkspaceController;
+    private boolean mEditorTerminalOverlayVisible = false;
+    @NonNull
+    private final TerminalWorkspaceController mTerminalWorkspaceController = new EmbeddedTerminalWorkspaceController();
     private ActivityResultLauncher<String> mEditorLoadTmlLauncher;
     private ActivityResultLauncher<String> mEditorLoadTmtLauncher;
     private FileManagerController mFileManagerController;
@@ -334,7 +347,10 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (savedInstanceState != null)
             mBottomNavFixedOnImeEnabled = savedInstanceState.getBoolean(ARG_BOTTOM_NAV_FIXED_ON_IME, true);
         if (savedInstanceState != null) {
-            mTerminalConfigTabSelected = savedInstanceState.getBoolean(ARG_TERMINAL_CONFIG_TAB_SELECTED, false);
+            mTerminalSelectionStateMachine.restore(
+                savedInstanceState.getString(ARG_TERMINAL_SELECTED_SESSION_HANDLE),
+                savedInstanceState.getBoolean(ARG_TERMINAL_CONFIG_TAB_SELECTED, false)
+            );
             mTerminalSoftKeyboardVisibilityKnown = savedInstanceState.getBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBILITY_KNOWN, false);
             mTerminalSoftKeyboardVisible = savedInstanceState.getBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBLE, false);
             mTerminalRestoreFocus = savedInstanceState.getBoolean(ARG_TERMINAL_RESTORE_FOCUS, false);
@@ -346,9 +362,6 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mTerminalConfigTmuxMissing = savedInstanceState.getBoolean(ARG_TERMINAL_CONFIG_TMUX_MISSING, false);
             restoreTerminalConfigTmuxSessions(savedInstanceState.getString(ARG_TERMINAL_CONFIG_TMUX_SESSIONS_JSON));
         }
-
-        // Delete ReportInfo serialized object files from cache older than 14 days
-        ReportActivity.deleteReportInfoFilesOlderThanXDays(this, 14, false);
 
         // Load Termux app SharedProperties from disk
         mProperties = TermuxAppSharedProperties.getProperties();
@@ -363,7 +376,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         setContentView(R.layout.activity_termux);
         mStatusBarScrim = findViewById(R.id.status_bar_scrim);
         mNonTerminalWindowBackgroundColor = resolveNonTerminalWindowBackgroundColor();
-        applyWindowBackgroundForTab(mBottomNavTab);
+        applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
 
         mIsVisible = true;
 
@@ -397,7 +410,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mNavBarHeight = navInsets.bottom;
             int statusBarTop = Math.max(statusInsets.top, cutoutInsets.top);
             mStatusBarHeight = statusBarTop > 0 ? statusBarTop : insets.getSystemWindowInsetTop();
-            applyStatusBarScrimColor(resolveStatusBarColorForTab(mBottomNavTab));
+            applyStatusBarScrimColor(resolveStatusBarColorForTab(getEffectiveTabForSystemUi()));
             return insets;
         });
 
@@ -419,7 +432,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         ensureEditorLaunchers();
 
         setupBottomNavigation(savedInstanceState);
-        if (mTerminalConfigTabSelected) {
+        if (mTerminalSelectionStateMachine.snapshot().configSelected) {
             getWindow().getDecorView().post(() -> {
                 if (mBottomNavTab == TAB_TERMINAL) {
                     selectTerminalConfigTab();
@@ -433,13 +446,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
         handleUiNavigationIntentIfNeeded(getIntent());
         handleEditorIntentIfNeeded(getIntent());
-        FileOpenBridge.addListener(this);
-        registerUiReceiver();
-        registerUiRequestFileObserver();
+        scheduleDeferredStartupInitialization();
 
         updateTerminalContextMenuRegistration(mTerminalView);
-
-        FileReceiverActivity.updateFileReceiverActivityComponentsState(this);
 
         try {
             // Start the {@link TermuxService} and make it run regardless of who is bound to it
@@ -463,6 +472,33 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         // Send the {@link TermuxConstants#BROADCAST_TERMUX_OPENED} broadcast to notify apps that Termux
         // app has been opened.
         TermuxUtils.sendTermuxOpenedBroadcast(this);
+    }
+
+    private void scheduleDeferredStartupInitialization() {
+        if (mDeferredStartupInitializationScheduled) return;
+        mDeferredStartupInitializationScheduled = true;
+
+        Runnable deferred = () -> {
+            mDeferredStartupInitializationScheduled = false;
+            if (mIsInvalidState || isFinishing()) return;
+
+            // None of these are required to render the first frame.
+            if (mTermuxTerminalViewClient != null) {
+                mTermuxTerminalViewClient.onReloadProperties();
+            }
+            ReportActivity.deleteReportInfoFilesOlderThanXDays(TermuxActivity.this, 14, false);
+            FileOpenBridge.addListener(TermuxActivity.this);
+            registerUiReceiver();
+            registerUiRequestFileObserver();
+            FileReceiverActivity.updateFileReceiverActivityComponentsState(TermuxActivity.this);
+        };
+
+        View anchor = getWindow() == null ? null : getWindow().getDecorView();
+        if (anchor != null) {
+            anchor.post(deferred);
+        } else {
+            deferred.run();
+        }
     }
 
     @Override
@@ -519,14 +555,14 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
 
         boolean shouldRestoreTerminalFocus =
-            mBottomNavTab == TAB_TERMINAL && !mTerminalConfigTabSelected &&
+            isTerminalSurfaceActive() && !getTerminalSelectionSnapshot(null).configSelected &&
                 mTerminalSoftKeyboardVisibilityKnown && mTerminalSoftKeyboardVisible && mTerminalRestoreFocus;
         applyTerminalProgrammaticFocusPolicy(shouldRestoreTerminalFocus);
 
         if (mTermuxTerminalViewClient != null) {
-            if (mBottomNavTab == TAB_TERMINAL && mTerminalConfigTabSelected) {
+            if (isTerminalSurfaceActive() && getTerminalSelectionSnapshot(null).configSelected) {
                 mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(false, false);
-            } else if (mBottomNavTab == TAB_TERMINAL && mTerminalSoftKeyboardVisibilityKnown) {
+            } else if (isTerminalSurfaceActive() && mTerminalSoftKeyboardVisibilityKnown) {
                 mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(
                     mTerminalSoftKeyboardVisible,
                     shouldRestoreTerminalFocus
@@ -543,9 +579,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mTermuxTerminalViewClient.onResume();
 
         // Re-apply system/status bar colors on resume to override OEM/system resets.
-        applyWindowBackgroundForTab(mBottomNavTab);
+        applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
 
-        if (mBottomNavTab == TAB_TERMINAL) {
+        if (isTerminalSurfaceActive()) {
             mAllowTerminalContextMenuMapping = false;
             mSuppressTerminalContextMenuOnce = true;
             mSuppressTerminalContextMenuUntilUptimeMs = SystemClock.uptimeMillis() + 2000;
@@ -560,7 +596,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 closeContextMenu();
                 closeOptionsMenu();
             });
-        } else if (mBottomNavTab == TAB_FILES) {
+        } else if (mBottomNavTab == TAB_EXTENSIONS || mBottomNavTab == TAB_FILES) {
             EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
             if (mTerminalView != null) mTerminalView.clearFocus();
@@ -581,12 +617,17 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mBottomNavTab == TAB_EDITOR) {
             ensureEditorInitialized();
             resumeEditor();
+            syncActiveTerminalBindings();
+        }
+        if (mBottomNavTab == TAB_EXTENSIONS) {
+            ensureExtensionsHubInitialized();
+            resumeExtensionsHub();
         }
         if (mBottomNavTab == TAB_FILES) {
             ensureFileManagerInitialized();
             resumeFileManager(false);
         }
-        if (mBottomNavTab == TAB_TERMINAL && mTerminalConfigTabSelected && mTerminalSessionSurfaceView != null) {
+        if (isTerminalSurfaceActive() && getTerminalSelectionSnapshot(null).configSelected && mTerminalSessionSurfaceView != null) {
             ensureTerminalConfigInitialized();
             refreshTerminalConfigPageData();
             mTerminalSessionSurfaceView.setConfigPageEnabled(true);
@@ -598,7 +639,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             if (mTerminalConfigTmuxProfileId != null && mTerminalConfigTmuxLoading) {
                 openTerminalConfigTmuxProfile(mTerminalConfigTmuxProfileId);
             }
-        } else if (mBottomNavTab == TAB_TERMINAL && !shouldRestoreTerminalFocus) {
+        } else if (isTerminalSurfaceActive() && !shouldRestoreTerminalFocus) {
             EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
             if (mTerminalView != null) mTerminalView.clearFocus();
@@ -618,7 +659,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent ev) {
-        if (!mAllowTerminalContextMenuMapping && mBottomNavTab == TAB_TERMINAL && ev.getAction() == MotionEvent.ACTION_DOWN) {
+        if (!mAllowTerminalContextMenuMapping && isTerminalSurfaceActive() && ev.getAction() == MotionEvent.ACTION_DOWN) {
             mAllowTerminalContextMenuMapping = true;
         }
         return super.dispatchTouchEvent(ev);
@@ -693,11 +734,17 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             // ignore.
         }
 
+        if (mEditorTerminalWorkspaceController != null) {
+            mEditorTerminalWorkspaceController.destroy();
+            mEditorTerminalWorkspaceController = null;
+        }
         if (mEditorController != null) {
             mEditorController.onDestroy();
             mEditorController = null;
         }
         if (mEditorPage instanceof ViewGroup) ((ViewGroup) mEditorPage).removeAllViews();
+        if (mExtensionsPage instanceof ViewGroup) ((ViewGroup) mExtensionsPage).removeAllViews();
+        mExtensionsHubController = null;
 
         if (mFilesPage instanceof ViewGroup) ((ViewGroup) mFilesPage).removeAllViews();
         mFileManagerController = null;
@@ -780,6 +827,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     public void switchBottomTabByName(String name) {
         String n = name == null ? "" : name.trim().toLowerCase();
         int tab;
+        if (n.equals("extensions") || n.equals("extension") || n.equals("ext") || n.equals("扩展")) {
+            tab = TAB_EXTENSIONS;
+        } else
         if (n.equals("terminal") || n.equals("term")) {
             tab = TAB_TERMINAL;
         } else if (n.equals("files") || n.equals("file")) {
@@ -899,7 +949,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         savedInstanceState.putInt(ARG_BOTTOM_NAV_TAB, mBottomNavTab);
         savedInstanceState.putInt(ARG_BOTTOM_NAV_PRIMARY_TAB, mBottomNavPrimaryTab);
         savedInstanceState.putBoolean(ARG_BOTTOM_NAV_FIXED_ON_IME, mBottomNavFixedOnImeEnabled);
-        savedInstanceState.putBoolean(ARG_TERMINAL_CONFIG_TAB_SELECTED, mTerminalConfigTabSelected);
+        TerminalSessionSelectionStateMachine.Snapshot selectionSnapshot = mTerminalSelectionStateMachine.snapshot();
+        savedInstanceState.putBoolean(ARG_TERMINAL_CONFIG_TAB_SELECTED, selectionSnapshot.configSelected);
+        savedInstanceState.putString(ARG_TERMINAL_SELECTED_SESSION_HANDLE, selectionSnapshot.currentSessionHandle);
         savedInstanceState.putBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBILITY_KNOWN, mTerminalSoftKeyboardVisibilityKnown);
         savedInstanceState.putBoolean(ARG_TERMINAL_SOFT_KEYBOARD_VISIBLE, mTerminalSoftKeyboardVisible);
         savedInstanceState.putBoolean(ARG_TERMINAL_RESTORE_FOCUS, mTerminalRestoreFocus);
@@ -926,6 +978,10 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mEditorPage != null) {
             mEditorPage.setBackgroundColor(mNonTerminalWindowBackgroundColor);
         }
+        mExtensionsPage = findViewById(R.id.page_extensions);
+        if (mExtensionsPage != null) {
+            mExtensionsPage.setBackgroundColor(mNonTerminalWindowBackgroundColor);
+        }
         mFilesPage = findViewById(R.id.page_files);
         if (mFilesPage != null) {
             mFilesPage.setBackgroundColor(mNonTerminalWindowBackgroundColor);
@@ -937,22 +993,23 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
         if (savedInstanceState != null) {
             int tab = savedInstanceState.getInt(ARG_BOTTOM_NAV_TAB, TAB_TERMINAL);
-            if (tab == TAB_EDITOR || tab == TAB_FILES || tab == TAB_TERMINAL) {
+            if (tab == TAB_EXTENSIONS || tab == TAB_EDITOR || tab == TAB_FILES || tab == TAB_TERMINAL) {
                 mBottomNavTab = tab;
             }
             int primaryTab = savedInstanceState.getInt(ARG_BOTTOM_NAV_PRIMARY_TAB, TAB_TERMINAL);
-            if (primaryTab == TAB_FILES || primaryTab == TAB_TERMINAL) {
+            if (primaryTab == TAB_EXTENSIONS || primaryTab == TAB_FILES || primaryTab == TAB_TERMINAL) {
                 mBottomNavPrimaryTab = primaryTab;
             }
         }
 
         final Menu menu = mBottomNavigationView.getMenu();
         menu.clear();
-        menu.add(Menu.NONE, TAB_FILES, 0, "Files").setIcon(android.R.drawable.ic_menu_sort_by_size);
-        menu.add(Menu.NONE, TAB_TERMINAL, 1, "Terminal").setIcon(android.R.drawable.ic_menu_view);
+        menu.add(Menu.NONE, TAB_EXTENSIONS, 0, "扩展").setIcon(android.R.drawable.ic_menu_manage);
+        menu.add(Menu.NONE, TAB_FILES, 1, "Files").setIcon(android.R.drawable.ic_menu_sort_by_size);
+        menu.add(Menu.NONE, TAB_TERMINAL, 2, "Terminal").setIcon(android.R.drawable.ic_menu_view);
 
         int selectedPrimaryTab = mBottomNavTab == TAB_EDITOR ? mBottomNavPrimaryTab : mBottomNavTab;
-        if (selectedPrimaryTab != TAB_FILES && selectedPrimaryTab != TAB_TERMINAL) {
+        if (selectedPrimaryTab != TAB_EXTENSIONS && selectedPrimaryTab != TAB_FILES && selectedPrimaryTab != TAB_TERMINAL) {
             selectedPrimaryTab = TAB_TERMINAL;
         }
         mBottomNavigationView.setSelectedItemId(selectedPrimaryTab);
@@ -960,14 +1017,15 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
         mBottomNavigationView.setOnItemSelectedListener(item -> {
             int targetTab = item.getItemId();
-            if (targetTab != TAB_FILES && targetTab != TAB_TERMINAL) return false;
+            if (targetTab != TAB_EXTENSIONS && targetTab != TAB_FILES && targetTab != TAB_TERMINAL) return false;
             if (mBottomNavTab != TAB_EDITOR && targetTab == mBottomNavTab) return true;
             setBottomNavTab(targetTab);
             return true;
         });
         mBottomNavigationView.setOnItemReselectedListener(item -> {
             int targetTab = item.getItemId();
-            if (mBottomNavTab == TAB_EDITOR && (targetTab == TAB_FILES || targetTab == TAB_TERMINAL)) {
+            if (mBottomNavTab == TAB_EDITOR &&
+                (targetTab == TAB_EXTENSIONS || targetTab == TAB_FILES || targetTab == TAB_TERMINAL)) {
                 setBottomNavTab(targetTab);
             }
         });
@@ -985,6 +1043,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 resumeFileManager(true);
             });
         }
+        if (mExtensionsPage != null) {
+            mExtensionsPage.post(() -> {
+                if (mBottomNavTab != TAB_EXTENSIONS) return;
+                ensureExtensionsHubInitialized();
+                resumeExtensionsHub();
+            });
+        }
 
         mTerminalConfigPage = findViewById(R.id.page_terminal_config);
     }
@@ -997,29 +1062,36 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     private void setBottomNavTab(int tab) {
-        if (tab != TAB_EDITOR && tab != TAB_FILES && tab != TAB_TERMINAL) return;
+        if (tab != TAB_EXTENSIONS && tab != TAB_EDITOR && tab != TAB_FILES && tab != TAB_TERMINAL) return;
         if (tab == TAB_EDITOR && !ensureEditorInitialized()) {
             // Avoid blank page when editor cannot initialize.
-            tab = (mBottomNavPrimaryTab == TAB_FILES || mBottomNavPrimaryTab == TAB_TERMINAL) ? mBottomNavPrimaryTab : TAB_FILES;
+            tab = (mBottomNavPrimaryTab == TAB_EXTENSIONS || mBottomNavPrimaryTab == TAB_FILES || mBottomNavPrimaryTab == TAB_TERMINAL)
+                ? mBottomNavPrimaryTab : TAB_FILES;
         }
         final int previousTab = mBottomNavTab;
         final boolean enteringEditor = previousTab != TAB_EDITOR && tab == TAB_EDITOR;
         final boolean leavingEditor = previousTab == TAB_EDITOR && tab != TAB_EDITOR;
         mBottomNavTab = tab;
-        if (tab == TAB_FILES || tab == TAB_TERMINAL) {
+        if (tab == TAB_EXTENSIONS || tab == TAB_FILES || tab == TAB_TERMINAL) {
             mBottomNavPrimaryTab = tab;
         }
-        applyWindowBackgroundForTab(tab);
+        applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
 
         applyBottomNavigationVisibility(tab);
 
         final boolean keepPreviousVisibleWhileEnteringEditor = enteringEditor && previousTab != TAB_EDITOR;
         if (mTerminalContainer != null) {
-            boolean showTerminal = tab == TAB_TERMINAL || (keepPreviousVisibleWhileEnteringEditor && previousTab == TAB_TERMINAL);
+            boolean showTerminal = tab == TAB_TERMINAL ||
+                (tab == TAB_EDITOR && mEditorTerminalOverlayVisible) ||
+                (keepPreviousVisibleWhileEnteringEditor && previousTab == TAB_TERMINAL);
             mTerminalContainer.setVisibility(showTerminal ? View.VISIBLE : View.GONE);
         } else if (mTerminalView != null) {
             boolean showTerminal = tab == TAB_TERMINAL || (keepPreviousVisibleWhileEnteringEditor && previousTab == TAB_TERMINAL);
             mTerminalView.setVisibility(showTerminal ? View.VISIBLE : View.GONE);
+        }
+        if (mExtensionsPage != null) {
+            boolean showExtensions = tab == TAB_EXTENSIONS || (keepPreviousVisibleWhileEnteringEditor && previousTab == TAB_EXTENSIONS);
+            mExtensionsPage.setVisibility(showExtensions ? View.VISIBLE : View.GONE);
         }
         if (mFilesPage != null) {
             boolean showFiles = tab == TAB_FILES || (keepPreviousVisibleWhileEnteringEditor && previousTab == TAB_FILES);
@@ -1039,6 +1111,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                         if (mBottomNavTab != TAB_EDITOR) return;
                         if (mTerminalContainer != null) mTerminalContainer.setVisibility(View.GONE);
                         else if (mTerminalView != null) mTerminalView.setVisibility(View.GONE);
+                        if (mExtensionsPage != null) mExtensionsPage.setVisibility(View.GONE);
                         if (mFilesPage != null) mFilesPage.setVisibility(View.GONE);
                     });
                 }
@@ -1060,7 +1133,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             }
         }
 
-        if (tab == TAB_FILES) {
+        if (tab == TAB_EXTENSIONS || tab == TAB_FILES) {
             EditText textInputView = findViewById(R.id.terminal_surface_text_input);
             if (textInputView != null) textInputView.clearFocus();
             if (mTerminalView != null) mTerminalView.clearFocus();
@@ -1084,24 +1157,34 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
         invalidateOptionsMenu();
 
-        final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
+        final ViewPager terminalToolbarViewPager = mTerminalSessionSurfaceView == null ? null : mTerminalSessionSurfaceView.getToolbarPager();
         if (terminalToolbarViewPager != null) {
-            if (tab == TAB_TERMINAL) {
+            if (tab == TAB_TERMINAL || (tab == TAB_EDITOR && mEditorTerminalOverlayVisible)) {
                 terminalToolbarViewPager.setVisibility(mPreferences != null && mPreferences.shouldShowTerminalToolbar() ? View.VISIBLE : View.GONE);
             } else {
                 terminalToolbarViewPager.setVisibility(View.GONE);
             }
         }
-
         if (tab == TAB_EDITOR) {
             ensureEditorInitialized();
             resumeEditor();
+            if (mEditorTerminalOverlayVisible && mTerminalContainer != null) {
+                mTerminalContainer.bringToFront();
+            }
         } else {
+            mEditorTerminalOverlayVisible = false;
             pauseEditor();
             if (tab == TAB_TERMINAL && mTerminalView != null && mTermuxTerminalViewClient != null) {
                 mTermuxTerminalViewClient.requestTerminalViewFocus(false);
                 refreshTerminalTopBar();
             }
+        }
+
+        if (tab == TAB_EXTENSIONS) {
+            ensureExtensionsHubInitialized();
+            resumeExtensionsHub();
+        } else {
+            pauseExtensionsHub();
         }
 
         if (tab == TAB_FILES) {
@@ -1110,10 +1193,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         } else {
             pauseFileManager(true);
         }
-        final DrawerLayout drawer = getDrawer();
-        if (drawer != null) {
-            drawer.setDrawerLockMode(tab == TAB_TERMINAL ? DrawerLayout.LOCK_MODE_UNLOCKED : DrawerLayout.LOCK_MODE_LOCKED_CLOSED);
-        }
+        applyTerminalSurfaceMode();
+        syncActiveTerminalBindings();
     }
 
     private void applyBottomNavigationVisibility(int tab) {
@@ -1328,10 +1409,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
         try {
             ensureEditorLaunchers();
-            mEditorController = new EditorController(this, () -> getIntent(), mEditorLoadTmlLauncher, mEditorLoadTmtLauncher);
+            mEditorController = new EditorController(this, () -> getIntent(), mEditorLoadTmlLauncher, mEditorLoadTmtLauncher, this);
             mEditorController.setHostHandlesStatusBarInsets(true);
             mEditorController.attachTo((ViewGroup) mEditorPage);
             mEditorController.onCreate(null);
+            mEditorController.syncEmbeddedTerminalWorkspaceUi();
             return true;
         } catch (Exception e) {
             Logger.showToast(this, getString(R.string.msg_editor_initialization_failed, e.getMessage()), true);
@@ -1389,6 +1471,125 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         return true;
     }
 
+    @Override
+    public boolean showEmbeddedTerminalWorkspace(String currentFilePath) {
+        return mTerminalWorkspaceController.show(currentFilePath);
+    }
+
+    @Override
+    public boolean hideEmbeddedTerminalWorkspace() {
+        return mTerminalWorkspaceController.hide();
+    }
+
+    @Override
+    public boolean isEmbeddedTerminalWorkspaceVisible() {
+        return mTerminalWorkspaceController.isVisible();
+    }
+
+    @NonNull
+    public TerminalWorkspaceController getTerminalWorkspaceController() {
+        return mTerminalWorkspaceController;
+    }
+
+    private final class EmbeddedTerminalWorkspaceController implements TerminalWorkspaceController {
+        @Override
+        public boolean show(@Nullable String currentFilePath) {
+            if (!ensureEditorInitialized()) return false;
+            if (mBottomNavTab != TAB_EDITOR) return false;
+            if (mTerminalContainer == null) return false;
+
+            if (mTermuxService != null && mTermuxService.getTermuxSessionsSize() <= 0 &&
+                mTermuxTerminalSessionActivityClient != null) {
+                String workdir = null;
+                if (!TextUtils.isEmpty(currentFilePath)) {
+                    File file = new File(currentFilePath);
+                    File dir = file.isDirectory() ? file : file.getParentFile();
+                    if (dir != null && dir.exists()) {
+                        workdir = dir.getAbsolutePath();
+                    }
+                }
+                if (TextUtils.isEmpty(workdir)) {
+                    workdir = mProperties != null ? mProperties.getDefaultWorkingDirectory() : "/";
+                }
+                mTermuxTerminalSessionActivityClient.addNewSessionAt(workdir);
+            }
+
+            mEditorTerminalOverlayVisible = true;
+            if (getTerminalSelectionSnapshot(null).configSelected) {
+                mTerminalSelectionStateMachine.requestReturnToSessionSelection();
+                updateTerminalConfigPageVisibility();
+            }
+            refreshTerminalSessionSurface();
+            refreshTerminalTopBar();
+            // Treat editor overlay as a full terminal surface (drawer unlock, config page enablement, system UI).
+            applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
+            applyTerminalSurfaceMode();
+
+            int width = mTerminalContainer.getWidth();
+            if (width <= 0) width = getResources().getDisplayMetrics().widthPixels;
+            if (width <= 0) width = 1;
+            mTerminalContainer.animate().cancel();
+            mTerminalContainer.setVisibility(View.VISIBLE);
+            mTerminalContainer.bringToFront();
+            mTerminalContainer.setTranslationX(width);
+            mTerminalContainer.setAlpha(1f);
+            mTerminalContainer.animate()
+                .translationX(0f)
+                .setDuration(EDITOR_TRANSITION_DURATION_MS)
+                .setInterpolator(new DecelerateInterpolator())
+                .start();
+
+            if (mEditorController != null) {
+                mEditorController.syncEmbeddedTerminalWorkspaceUi();
+            }
+            syncActiveTerminalBindings();
+            invalidateOptionsMenu();
+            return true;
+        }
+
+        @Override
+        public boolean hide() {
+            if (!mEditorTerminalOverlayVisible) return false;
+            mEditorTerminalOverlayVisible = false;
+
+            if (mTerminalContainer != null) {
+                int width = mTerminalContainer.getWidth();
+                if (width <= 0) width = getResources().getDisplayMetrics().widthPixels;
+                if (width <= 0) width = 1;
+                mTerminalContainer.animate().cancel();
+                mTerminalContainer.setTranslationX(0f);
+                mTerminalContainer.setAlpha(1f);
+                mTerminalContainer.animate()
+                    .translationX(width)
+                    .setDuration(EDITOR_TRANSITION_DURATION_MS)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .withEndAction(() -> {
+                        if (!mEditorTerminalOverlayVisible && mBottomNavTab == TAB_EDITOR) {
+                            mTerminalContainer.setVisibility(View.GONE);
+                            mTerminalContainer.setTranslationX(0f);
+                            if (mEditorPage != null) mEditorPage.bringToFront();
+                        }
+                        // Restore editor semantics once terminal overlay is fully hidden.
+                        applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
+                        applyTerminalSurfaceMode();
+                    })
+                    .start();
+            }
+
+            if (mEditorController != null) {
+                mEditorController.syncEmbeddedTerminalWorkspaceUi();
+            }
+            syncActiveTerminalBindings();
+            invalidateOptionsMenu();
+            return true;
+        }
+
+        @Override
+        public boolean isVisible() {
+            return mEditorTerminalOverlayVisible;
+        }
+    }
+
     private void handleUiNavigationIntentIfNeeded(Intent intent) {
         if (intent == null) return;
         String action = intent.getAction();
@@ -1404,6 +1605,30 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mFileManagerIntent = new Intent();
         }
         return mFileManagerIntent;
+    }
+
+    private void ensureExtensionsHubInitialized() {
+        if (mExtensionsPage == null) return;
+        if (!(mExtensionsPage instanceof ViewGroup)) return;
+        if (mExtensionsHubController != null) return;
+
+        mExtensionsHubController = new ExtensionsHubController(this);
+        mExtensionsHubController.attachTo((ViewGroup) mExtensionsPage);
+    }
+
+    private void resumeExtensionsHub() {
+        if (mExtensionsHubController != null) {
+            mExtensionsHubController.onShow();
+            if (mExtensionsPage != null) {
+                mExtensionsPage.requestFocus();
+            }
+        }
+    }
+
+    private void pauseExtensionsHub() {
+        if (mExtensionsHubController != null) {
+            mExtensionsHubController.onHide();
+        }
     }
 
     private void ensureFileManagerInitialized() {
@@ -1526,7 +1751,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                     boolean isFailSafe = intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
                     mTermuxTerminalSessionActivityClient.addNewSession(isFailSafe, null);
                 } else {
-                    mTermuxTerminalSessionActivityClient.setCurrentSession(mTermuxTerminalSessionActivityClient.getCurrentStoredSessionOrLast());
+                    bootstrapTerminalSessionSelection(mTermuxTerminalSessionActivityClient.getCurrentStoredSessionOrLast());
                 }
             }
 
@@ -1610,7 +1835,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                     @Nullable
                     @Override
                     public TerminalSession getCurrentSession() {
-                        return TermuxActivity.this.getCurrentSession();
+                        return TermuxActivity.this.resolveSelectionAnchorSession();
                     }
                 }
             );
@@ -1640,47 +1865,31 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 @Override
                 public void onSessionPagePreviewSelected(int index, @Nullable TerminalSession session) {
                     if (session == null) return;
-                    mTopBarPreviewSession = session;
-                    mTopBarPreviewConfigSelected = false;
+                    mTerminalSelectionStateMachine.previewSession(getSessionHandle(session));
                     refreshTerminalTopBar();
                 }
 
                 @Override
                 public void onConfigPagePreviewSelected() {
-                    mTopBarPreviewSession = null;
-                    mTopBarPreviewConfigSelected = true;
+                    mTerminalSelectionStateMachine.previewConfig();
                     refreshTerminalTopBar();
                 }
 
                 @Override
-                public void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser) {
-                    if (session == null || mTermuxTerminalSessionActivityClient == null) return;
-                    mLastSelectedTerminalSession = session;
-                    clearTopBarSelectionPreview();
-
-                    if (mTerminalConfigTabSelected) {
-                        mTerminalConfigTabSelected = false;
-                        applyTerminalProgrammaticFocusPolicy(false);
-                    }
-
-                    mSurfaceSelectionDispatchInProgress = true;
-                    try {
-                        mTermuxTerminalSessionActivityClient.setCurrentSession(session);
-                    } finally {
-                        mSurfaceSelectionDispatchInProgress = false;
-                    }
-                    refreshTerminalTopBar();
+                public void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser, long requestToken) {
+                    if (session == null) return;
+                    handleSurfaceSessionSelectionCommitted(session, fromUser, requestToken);
                 }
 
                 @Override
-                public void onConfigPageSelected(boolean fromUser) {
-                    clearTopBarSelectionPreview();
-                    activateTerminalConfigTabState();
+                public void onConfigPageSelected(boolean fromUser, long requestToken) {
+                    handleSurfaceConfigSelectionCommitted(fromUser, requestToken);
                 }
 
                 @Override
                 public void onActiveTerminalViewChanged(@NonNull TerminalView terminalView,
                                                         @Nullable TerminalSession session) {
+                    if (isEditorTerminalWorkspaceActive()) return;
                     mTerminalView = terminalView;
                     if (mTermuxTerminalViewClient != null) {
                         mTermuxTerminalViewClient.bindTerminalViewKeyboardBehavior(terminalView);
@@ -1690,6 +1899,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
                 @Override
                 public void onExtraKeysViewCreated(@NonNull ExtraKeysView extraKeysView) {
+                    if (isEditorTerminalWorkspaceActive()) return;
                     mExtraKeysView = extraKeysView;
                 }
             });
@@ -1723,7 +1933,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                     @Nullable
                     @Override
                     public TerminalSession getCurrentSession() {
-                        return TermuxActivity.this.getCurrentSession();
+                        return TermuxActivity.this.resolveSelectionAnchorSession();
                     }
 
                     @Nullable
@@ -1749,16 +1959,14 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                     @Override
                     public void onSelectSession(int index) {
                         clearTopBarSelectionPreview();
-                        if (mTerminalConfigTabSelected) {
-                            mTerminalConfigTabSelected = false;
-                            applyTerminalProgrammaticFocusPolicy(false);
-                            refreshTerminalTopBar();
-                        }
-                        if (mTerminalSessionSurfaceView != null) {
-                            mTerminalSessionSurfaceView.setCurrentSessionPage(index, true);
+                        TermuxService service = getTermuxService();
+                        if (mTermuxTerminalSessionActivityClient != null && service != null) {
+                            TermuxSession termuxSession = service.getTermuxSession(index);
+                            if (termuxSession != null) {
+                                mTermuxTerminalSessionActivityClient.setCurrentSession(termuxSession.getTerminalSession());
+                            }
                         } else if (mTermuxTerminalSessionActivityClient != null) {
                             mTermuxTerminalSessionActivityClient.switchToSession(index);
-                            refreshTerminalTopBar();
                         }
                     }
 
@@ -1778,8 +1986,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
                         if (sessionsSize > 1 && isClosingCurrent) {
                             int newIndex = index == 0 ? 1 : index - 1;
-                            if (mTerminalSessionSurfaceView != null) {
-                                mTerminalSessionSurfaceView.setCurrentSessionPage(newIndex, true);
+                            if (service != null) {
+                                TermuxSession replacement = service.getTermuxSession(newIndex);
+                                if (replacement != null) {
+                                    mTermuxTerminalSessionActivityClient.setCurrentSession(replacement.getTerminalSession());
+                                }
                             } else {
                                 mTermuxTerminalSessionActivityClient.switchToSession(newIndex);
                             }
@@ -1792,7 +2003,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                             service.removeTermuxSession(terminalSession);
                         }
 
-                        if (sessionsSize <= 1 && !mTerminalConfigTabSelected) {
+                        if (sessionsSize <= 1 && !getTerminalSelectionSnapshot(null).configSelected) {
                             finishActivityIfNotFinishing();
                         }
                     }
@@ -1823,29 +2034,202 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     private void clearTopBarSelectionPreview() {
-        mTopBarPreviewSession = null;
-        mTopBarPreviewConfigSelected = false;
+        mTerminalSelectionStateMachine.clearPreview();
+    }
+
+    @Nullable
+    private String getSessionHandle(@Nullable TerminalSession session) {
+        return session == null || TextUtils.isEmpty(session.mHandle) ? null : session.mHandle;
+    }
+
+    @NonNull
+    private ArrayList<String> buildTerminalSessionHandleSnapshot(@Nullable TermuxService service) {
+        ArrayList<String> handles = new ArrayList<>();
+        if (service == null) return handles;
+
+        for (int i = 0; i < service.getTermuxSessionsSize(); i++) {
+            TermuxSession termuxSession = service.getTermuxSession(i);
+            if (termuxSession == null) continue;
+            TerminalSession session = termuxSession.getTerminalSession();
+            String handle = getSessionHandle(session);
+            if (!TextUtils.isEmpty(handle)) {
+                handles.add(handle);
+            }
+        }
+
+        return handles;
+    }
+
+    private void syncTerminalSelectionStateMachine(@Nullable String preferredSessionHandle) {
+        TermuxService service = getTermuxService();
+        if (service == null) return;
+        mTerminalSelectionStateMachine.syncSessions(
+            buildTerminalSessionHandleSnapshot(service),
+            preferredSessionHandle
+        );
+    }
+
+    @NonNull
+    private TerminalSessionSelectionStateMachine.Snapshot getTerminalSelectionSnapshot(@Nullable String preferredSessionHandle) {
+        syncTerminalSelectionStateMachine(preferredSessionHandle);
+        return mTerminalSelectionStateMachine.snapshot();
+    }
+
+    @Nullable
+    private TerminalSession getSessionForHandle(@Nullable String handle) {
+        if (TextUtils.isEmpty(handle)) return null;
+        TermuxService service = getTermuxService();
+        if (service == null) return null;
+        return service.getTerminalSessionForHandle(handle);
+    }
+
+    @Nullable
+    private TerminalSession resolveSelectionAnchorSession() {
+        return getSessionForHandle(getTerminalSelectionSnapshot(null).currentSessionHandle);
+    }
+
+    public void bootstrapTerminalSessionSelection(@Nullable TerminalSession session) {
+        if (session == null) return;
+        mTerminalSelectionStateMachine.bootstrapSessionSelection(getSessionHandle(session));
+        dispatchCommittedSessionSelection(session);
+        refreshTerminalSessionSurface();
+        refreshTerminalTopBar();
+    }
+
+    private void dispatchCommittedSessionSelection(@NonNull TerminalSession session) {
+        if (mTermuxTerminalSessionActivityClient != null) {
+            mTermuxTerminalSessionActivityClient.checkAndScrollToSession(session);
+            mTermuxTerminalSessionActivityClient.updateBackgroundColor();
+        }
+    }
+
+    private void handleSurfaceSessionSelectionCommitted(@NonNull TerminalSession session,
+                                                        boolean fromUser,
+                                                        long requestToken) {
+        clearTopBarSelectionPreview();
+        boolean accepted = mTerminalSelectionStateMachine.commitSessionSelection(
+            getSessionHandle(session),
+            requestToken,
+            fromUser
+        );
+        if (accepted) {
+            applyTerminalProgrammaticFocusPolicy(false);
+            dispatchCommittedSessionSelection(session);
+        }
+        refreshTerminalSessionSurface();
+        refreshTerminalTopBar();
+    }
+
+    private void handleSurfaceConfigSelectionCommitted(boolean fromUser, long requestToken) {
+        clearTopBarSelectionPreview();
+        boolean accepted = mTerminalSelectionStateMachine.commitConfigSelection(requestToken, fromUser);
+        if (accepted) {
+            applyTerminalProgrammaticFocusPolicy(false);
+            refreshTerminalConfigPageData();
+
+            EditText textInputView = findViewById(R.id.terminal_surface_text_input);
+            if (textInputView != null) textInputView.clearFocus();
+            if (mTerminalView != null) mTerminalView.clearFocus();
+            if (mTerminalConfigCanvasView != null) {
+                mTerminalConfigCanvasView.requestFocus();
+            }
+            if (getWindow() != null) {
+                KeyboardUtils.hideSoftKeyboard(this, getWindow().getDecorView());
+            }
+        }
+        refreshTerminalSessionSurface();
+        refreshTerminalTopBar();
+    }
+
+    private boolean isEditorTerminalWorkspaceActive() {
+        return mBottomNavTab == TAB_EDITOR && mEditorTerminalOverlayVisible;
+    }
+
+    private boolean isTerminalSurfaceActive() {
+        return mBottomNavTab == TAB_TERMINAL || isEditorTerminalWorkspaceActive();
+    }
+
+    /**
+     * Terminal may be presented as an overlay while editor remains the selected bottom tab.
+     * In that case, system UI (status bar colors, window background) should still follow
+     * terminal semantics.
+     */
+    private int getEffectiveTabForSystemUi() {
+        return isTerminalSurfaceActive() ? TAB_TERMINAL : mBottomNavTab;
+    }
+
+    private void applyTerminalSurfaceMode() {
+        updateTerminalConfigPageVisibility();
+        final DrawerLayout drawer = getDrawer();
+        if (drawer != null) {
+            drawer.setDrawerLockMode(isTerminalSurfaceActive()
+                ? DrawerLayout.LOCK_MODE_UNLOCKED
+                : DrawerLayout.LOCK_MODE_LOCKED_CLOSED);
+        }
+    }
+
+    @Nullable
+    private TerminalSession getPrimarySurfaceCurrentSession() {
+        return resolveSelectionAnchorSession();
+    }
+
+    @Nullable
+    private TerminalSessionSurfaceView getActiveTerminalSessionSurfaceView() {
+        return mTerminalSessionSurfaceView;
+    }
+
+    private void syncActiveTerminalBindings() {
+        TerminalView activeTerminalView = null;
+        ExtraKeysView activeExtraKeysView = null;
+
+        if (mTerminalSessionSurfaceView != null) {
+            activeTerminalView = mTerminalSessionSurfaceView.getCurrentTerminalView();
+            activeExtraKeysView = mTerminalSessionSurfaceView.getExtraKeysView();
+        }
+
+        if (activeTerminalView != null) {
+            mTerminalView = activeTerminalView;
+        }
+        mExtraKeysView = activeExtraKeysView;
+        updateTerminalContextMenuRegistration(activeTerminalView);
+    }
+
+    private boolean ensureEditorTerminalWorkspaceControllerInitialized() {
+        return false;
     }
 
     @Nullable
     private TerminalSession getTopBarSelectedSession() {
-        return mTopBarPreviewConfigSelected ? null : mTopBarPreviewSession;
+        return getSessionForHandle(getTerminalSelectionSnapshot(null).topBarSelectedSessionHandle);
     }
 
     private boolean isTerminalConfigTabSelectedForTopBar() {
-        return mTerminalConfigTabSelected || mTopBarPreviewConfigSelected;
+        return getTerminalSelectionSnapshot(null).topBarConfigSelected;
     }
 
     private void refreshTerminalSessionSurface() {
+        refreshTerminalSessionSurface(0L, false);
+    }
+
+    private void refreshTerminalSessionSurface(long requestToken, boolean animate) {
         if (mTerminalSessionSurfaceView == null || mTermuxTerminalSessionSurfaceBridge == null) return;
+        TerminalSessionSelectionStateMachine.Snapshot selectionSnapshot = getTerminalSelectionSnapshot(null);
         TermuxTerminalSessionSurfaceBridge.Snapshot snapshot = mTermuxTerminalSessionSurfaceBridge.capture();
         mTerminalSessionSurfaceHasSnapshot = !snapshot.items.isEmpty();
         updateTerminalConfigPageVisibility();
         int selectedIndex = snapshot.selectedIndex;
-        if (mTerminalConfigTabSelected && mTerminalSessionSurfaceView.isConfigPageEnabled()) {
+        long effectiveRequestToken = requestToken;
+        if (selectionSnapshot.configSelected && mTerminalSessionSurfaceView.isConfigPageEnabled()) {
             selectedIndex = snapshot.items.size();
+            if (effectiveRequestToken == 0L &&
+                selectionSnapshot.pendingKind == TerminalSessionSelectionStateMachine.PendingKind.CONFIG) {
+                effectiveRequestToken = selectionSnapshot.pendingToken;
+            }
+        } else if (effectiveRequestToken == 0L &&
+            selectionSnapshot.pendingKind == TerminalSessionSelectionStateMachine.PendingKind.SESSION) {
+            effectiveRequestToken = selectionSnapshot.pendingToken;
         }
-        mTerminalSessionSurfaceView.submitSessions(snapshot.items, selectedIndex, false);
+        mTerminalSessionSurfaceView.submitSessions(snapshot.items, selectedIndex, animate, effectiveRequestToken);
     }
 
     private boolean ensureTerminalConfigInitialized() {
@@ -1980,7 +2364,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private void updateTerminalConfigPageVisibility() {
         if (mTerminalSessionSurfaceView == null) return;
-        boolean enable = mBottomNavTab == TAB_TERMINAL && (mTerminalConfigTabSelected || mTerminalSessionSurfaceHasSnapshot);
+        boolean enable = isTerminalSurfaceActive() &&
+            (getTerminalSelectionSnapshot(null).configSelected || mTerminalSessionSurfaceHasSnapshot);
         if (enable) {
             ensureTerminalConfigInitialized();
         }
@@ -2057,13 +2442,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     private void snapshotTerminalUiStateBeforePause() {
-        if (mBottomNavTab != TAB_TERMINAL) {
+        if (!isTerminalSurfaceActive()) {
             mTerminalSoftKeyboardVisibilityKnown = true;
             mTerminalSoftKeyboardVisible = false;
             mTerminalRestoreFocus = false;
             return;
         }
-        if (mTerminalConfigTabSelected) {
+        if (getTerminalSelectionSnapshot(null).configSelected) {
             mTerminalSoftKeyboardVisibilityKnown = true;
             mTerminalSoftKeyboardVisible = false;
             mTerminalRestoreFocus = false;
@@ -2113,13 +2498,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     private void selectTerminalConfigTab() {
         if (!ensureTerminalConfigInitialized()) return;
-        if (mBottomNavTab != TAB_TERMINAL) {
+        // If terminal surface is already active (including editor overlay), don't force a tab switch.
+        if (!isTerminalSurfaceActive()) {
             setBottomNavTab(TAB_TERMINAL);
         }
         activateTerminalConfigTabState();
-        if (mTerminalSessionSurfaceView != null) {
-            mTerminalSessionSurfaceView.setCurrentConfigPage(true);
-        }
     }
 
     private void openTerminalConfigTab() {
@@ -2129,12 +2512,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private void activateTerminalConfigTabState() {
         if (!ensureTerminalConfigInitialized()) return;
         clearTopBarSelectionPreview();
-        mTerminalConfigTabSelected = true;
+        mTerminalSelectionStateMachine.requestConfigSelection();
         applyTerminalProgrammaticFocusPolicy(false);
         if (mTerminalSessionSurfaceView != null) {
             mTerminalSessionSurfaceView.setConfigPageEnabled(true);
         }
         refreshTerminalConfigPageData();
+        refreshTerminalSessionSurface();
         refreshTerminalTopBar();
 
         EditText textInputView = findViewById(R.id.terminal_surface_text_input);
@@ -2149,17 +2533,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     private void dismissTerminalConfigTab(boolean returnToPreviousTerminal) {
-        if (!mTerminalConfigTabSelected) return;
+        if (!getTerminalSelectionSnapshot(null).configSelected) return;
         clearTopBarSelectionPreview();
-        mTerminalConfigTabSelected = false;
+        mTerminalSelectionStateMachine.requestReturnToSessionSelection();
         applyTerminalProgrammaticFocusPolicy(false);
+        refreshTerminalSessionSurface();
         refreshTerminalTopBar();
-        if (returnToPreviousTerminal) {
-            TerminalSession currentSession = getCurrentSession();
-            if (currentSession != null && mTerminalSessionSurfaceView != null) {
-                requestTerminalSessionSurfaceSelection(currentSession, true);
-            }
-        }
     }
 
     public void applyTerminalSessionSurfaceSettings() {
@@ -2193,33 +2572,24 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     public void onTerminalSessionSelectionCommitted(@Nullable TerminalSession session) {
-        if (session == null || mSurfaceSelectionDispatchInProgress) return;
-        mLastSelectedTerminalSession = session;
+        if (session == null) return;
+        mTerminalSelectionStateMachine.commitSessionSelection(getSessionHandle(session), 0L, false);
+        dispatchCommittedSessionSelection(session);
         refreshTerminalSessionSurface();
         refreshTerminalTopBar();
     }
 
     public boolean requestTerminalSessionSurfaceSelection(@Nullable TerminalSession session, boolean animate) {
-        if (session == null || mSurfaceSelectionDispatchInProgress ||
-            mTerminalSessionSurfaceView == null) {
+        if (session == null) {
             return false;
         }
 
-        if (!mTerminalSessionSurfaceHasSnapshot) {
-            refreshTerminalSessionSurface();
-        }
+        if (mTerminalSessionSurfaceView == null) return false;
+
+        long requestToken = mTerminalSelectionStateMachine.requestSessionSelection(getSessionHandle(session));
+        refreshTerminalSessionSurface(requestToken, animate);
         if (!mTerminalSessionSurfaceHasSnapshot) return false;
-
-        TermuxService service = getTermuxService();
-        if (service == null) return false;
-
-        int index = service.getIndexOfSession(session);
-        if (index < 0) return false;
-
-        TerminalSession currentSurfaceSession = mTerminalSessionSurfaceView.getCurrentSession();
-        if (currentSurfaceSession == session) return false;
-
-        mTerminalSessionSurfaceView.setCurrentSessionPage(index, animate);
+        refreshTerminalTopBar();
         return true;
     }
 
@@ -2330,8 +2700,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mTerminalSessionSurfaceView != null) {
             mTerminalSessionSurfaceView.setToolbarVisible(showNow);
         }
-        if (showNow && isTerminalToolbarTextInputViewSelected() && mTerminalSessionSurfaceView != null) {
-            mTerminalSessionSurfaceView.focusToolbarTextInput();
+        TerminalSessionSurfaceView activeSurfaceView = getActiveTerminalSessionSurfaceView();
+        if (showNow && isTerminalToolbarTextInputViewSelected() && activeSurfaceView != null) {
+            activeSurfaceView.focusToolbarTextInput();
         }
     }
 
@@ -2381,7 +2752,17 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     @Override
     protected boolean onBackPressedCompat() {
         if (mBottomNavTab == TAB_EDITOR) {
-            int targetTab = (mBottomNavPrimaryTab == TAB_TERMINAL) ? TAB_TERMINAL : TAB_FILES;
+            if (mEditorTerminalOverlayVisible) {
+                hideEmbeddedTerminalWorkspace();
+                if (mEditorController != null) {
+                    mEditorController.syncEmbeddedTerminalWorkspaceUi();
+                }
+                syncActiveTerminalBindings();
+                invalidateOptionsMenu();
+                return true;
+            }
+            int targetTab = (mBottomNavPrimaryTab == TAB_EXTENSIONS || mBottomNavPrimaryTab == TAB_FILES || mBottomNavPrimaryTab == TAB_TERMINAL)
+                ? mBottomNavPrimaryTab : TAB_FILES;
             if (mBottomNavigationView != null) {
                 mBottomNavigationView.setSelectedItemId(targetTab);
             } else {
@@ -2443,6 +2824,18 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     /** Hook system menu to show context menu instead. */
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
+        // When terminal is presented as an editor overlay, behave like the terminal surface instead
+        // of routing menu creation to editor.
+        if (isEditorTerminalWorkspaceActive()) {
+            menu.clear();
+            return true;
+        }
+        if (mBottomNavTab == TAB_EDITOR &&
+            mEditorTerminalWorkspaceController != null &&
+            mEditorTerminalWorkspaceController.isVisible()) {
+            menu.clear();
+            return true;
+        }
         if (mBottomNavTab == TAB_EDITOR && mEditorController != null) {
             menu.clear();
             return mEditorController.onCreateOptionsMenu(menu);
@@ -2459,6 +2852,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
+        if (isEditorTerminalWorkspaceActive()) {
+            return super.onOptionsItemSelected(item);
+        }
         if (mBottomNavTab == TAB_EDITOR && mEditorController != null) {
             if (mEditorController.onOptionsItemSelected(item)) {
                 return true;
@@ -2469,7 +2865,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     @Override
     public boolean onMenuOpened(int featureId, Menu menu) {
-        if (mBottomNavTab == TAB_TERMINAL && featureId == Window.FEATURE_OPTIONS_PANEL) {
+        if (isTerminalSurfaceActive() && featureId == Window.FEATURE_OPTIONS_PANEL) {
             if (!mAllowTerminalContextMenuMapping) {
                 closeOptionsMenu();
                 return false;
@@ -2656,8 +3052,10 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     public ExtraKeysView getExtraKeysView() {
-        if (mExtraKeysView == null && mTerminalSessionSurfaceView != null) {
-            mExtraKeysView = mTerminalSessionSurfaceView.getExtraKeysView();
+        if (mExtraKeysView == null) {
+            if (mTerminalSessionSurfaceView != null) {
+                mExtraKeysView = mTerminalSessionSurfaceView.getExtraKeysView();
+            }
         }
         return mExtraKeysView;
     }
@@ -2718,7 +3116,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     public boolean isTerminalTabActive() {
-        return mBottomNavTab == TAB_TERMINAL;
+        return isTerminalSurfaceActive();
     }
 
 
@@ -2760,21 +3158,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     @Nullable
     public TerminalSession getCurrentSession() {
-        if (mTerminalView != null) {
-            TerminalSession currentSession = mTerminalView.getCurrentSession();
-            if (currentSession != null) {
-                mLastSelectedTerminalSession = currentSession;
-                return currentSession;
-            }
-        }
-        if (mTerminalSessionSurfaceView != null) {
-            TerminalSession currentSession = mTerminalSessionSurfaceView.getCurrentSession();
-            if (currentSession != null) {
-                mLastSelectedTerminalSession = currentSession;
-                return currentSession;
-            }
-        }
-        return mLastSelectedTerminalSession;
+        return resolveSelectionAnchorSession();
     }
 
     public TermuxAppSharedPreferences getPreferences() {

@@ -25,18 +25,22 @@ import com.termux.view.TerminalView;
 import com.termux.view.TerminalViewClient;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class TerminalSessionSurfaceView extends LinearLayout {
+    private static final int MAX_SESSION_PAGER_OFFSCREEN_LIMIT = 2;
+
     public interface Callbacks {
         void onSessionPageSwipeTouchDown();
         void onSessionPageChangeStarted();
         void onSessionPageChangeFinished();
         void onSessionPagePreviewSelected(int index, @Nullable TerminalSession session);
         void onConfigPagePreviewSelected();
-        void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser);
-        void onConfigPageSelected(boolean fromUser);
+        void onSessionPageSelected(int index, @Nullable TerminalSession session, boolean fromUser, long requestToken);
+        void onConfigPageSelected(boolean fromUser, long requestToken);
         void onActiveTerminalViewChanged(@NonNull TerminalView terminalView, @Nullable TerminalSession session);
         void onExtraKeysViewCreated(@NonNull ExtraKeysView extraKeysView);
     }
@@ -78,6 +82,8 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     private boolean mSessionPageChangeInProgress;
     private boolean mProgrammaticFocusAllowed = true;
     private boolean mFullScreenSessionSwipeEnabled;
+    @NonNull
+    private final Map<String, Long> mProgrammaticSelectionTokensByKey = new HashMap<>();
 
     public TerminalSessionSurfaceView(Context context) {
         super(context);
@@ -152,7 +158,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             });
         }
 
-        mSessionPager.setOffscreenPageLimit(8);
+        updateSessionPagerCachePolicy();
         mSessionPager.setPageMargin(mSessionPageGapPx);
         mSessionPager.setPageMarginDrawable(new ColorDrawable(0xFF000000));
         mSessionPager.setAdapter(sessionPagerAdapter);
@@ -216,21 +222,25 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     }
 
     public void setTerminalTextSize(int terminalTextSize) {
+        if (mTerminalTextSize == terminalTextSize) return;
         mTerminalTextSize = terminalTextSize;
         sessionPagerAdapter.applyTerminalViewConfigToAll();
     }
 
     public void setTerminalKeepScreenOn(boolean terminalKeepScreenOn) {
+        if (mTerminalKeepScreenOn == terminalKeepScreenOn) return;
         mTerminalKeepScreenOn = terminalKeepScreenOn;
         sessionPagerAdapter.applyTerminalViewConfigToAll();
     }
 
     public void setTerminalTypeface(@Nullable Typeface terminalTypeface) {
+        if (mTerminalTypeface == terminalTypeface) return;
         mTerminalTypeface = terminalTypeface;
         sessionPagerAdapter.applyTerminalViewConfigToAll();
     }
 
     public void setToolbarVisible(boolean toolbarVisible) {
+        if (mToolbarVisible == toolbarVisible) return;
         mToolbarVisible = toolbarVisible;
         updateToolbarPresentation();
     }
@@ -245,13 +255,20 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     }
 
     public void setToolbarButtonTextAllCaps(boolean toolbarButtonTextAllCaps) {
+        if (mToolbarButtonTextAllCaps == toolbarButtonTextAllCaps) return;
         mToolbarButtonTextAllCaps = toolbarButtonTextAllCaps;
         sessionPagerAdapter.reloadExtraKeysViews();
     }
 
     public void setToolbarMetrics(float defaultHeightPx, float heightScale) {
-        mToolbarDefaultHeightPx = defaultHeightPx > 0f ? defaultHeightPx : resolveToolbarDefaultHeightPx();
-        mToolbarHeightScale = heightScale <= 0f ? 1f : heightScale;
+        float resolvedDefaultHeightPx = defaultHeightPx > 0f ? defaultHeightPx : resolveToolbarDefaultHeightPx();
+        float resolvedHeightScale = heightScale <= 0f ? 1f : heightScale;
+        if (Float.compare(mToolbarDefaultHeightPx, resolvedDefaultHeightPx) == 0 &&
+            Float.compare(mToolbarHeightScale, resolvedHeightScale) == 0) {
+            return;
+        }
+        mToolbarDefaultHeightPx = resolvedDefaultHeightPx;
+        mToolbarHeightScale = resolvedHeightScale;
         updateToolbarMetricsState();
         sessionPagerAdapter.reloadExtraKeysViews();
         updateToolbarPresentation();
@@ -263,6 +280,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
 
     public void setToolbarExtraKeys(@Nullable ExtraKeysInfo extraKeysInfo,
                                     @Nullable ExtraKeysView.IExtraKeysView extraKeysViewClient) {
+        if (mExtraKeysInfo == extraKeysInfo && mExtraKeysViewClient == extraKeysViewClient) return;
         mExtraKeysInfo = extraKeysInfo;
         mExtraKeysViewClient = extraKeysViewClient;
         updateToolbarMetricsState();
@@ -273,7 +291,16 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     public void submitSessions(@NonNull List<TerminalSessionSurfaceItem> items,
                                int selectedIndex,
                                boolean animate) {
+        submitSessions(items, selectedIndex, animate, 0L);
+    }
+
+    public void submitSessions(@NonNull List<TerminalSessionSurfaceItem> items,
+                               int selectedIndex,
+                               boolean animate,
+                               long requestToken) {
         boolean dataChanged = sessionPagerAdapter.submitItems(items);
+        pruneProgrammaticSelectionTokens();
+        updateSessionPagerCachePolicy();
         int safeIndex = sessionPagerAdapter.clampIndex(selectedIndex);
         int currentItem = sessionPagerAdapter.clampIndex(mSessionPager.getCurrentItem());
 
@@ -286,6 +313,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         }
 
         mSelectedSessionIndex = safeIndex;
+        rememberProgrammaticSelectionTokenForPosition(safeIndex, requestToken);
         if (safeIndex != currentItem) {
             notifySessionPageChangeStarted();
             mSuppressSessionPageCallback = true;
@@ -293,13 +321,20 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             mSuppressSessionPageCallback = false;
         } else if (dataChanged) {
             dispatchCurrentExtraKeysViewChanged();
+        } else if (requestToken <= 0L) {
+            return;
         }
         dispatchActivePageChanged(safeIndex, false);
     }
 
     public void setCurrentSessionPage(int index, boolean animate) {
+        setCurrentSessionPage(index, animate, 0L);
+    }
+
+    public void setCurrentSessionPage(int index, boolean animate, long requestToken) {
         int safeIndex = sessionPagerAdapter.clampIndex(index);
         mSelectedSessionIndex = safeIndex;
+        rememberProgrammaticSelectionTokenForPosition(safeIndex, requestToken);
         if (safeIndex == mSessionPager.getCurrentItem()) {
             dispatchActivePageChanged(safeIndex, false);
             return;
@@ -317,12 +352,14 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         if (mConfigPageView == configPageView) return;
         mConfigPageView = configPageView;
         sessionPagerAdapter.notifyDataSetChanged();
+        updateSessionPagerCachePolicy();
     }
 
     public void setConfigPageEnabled(boolean enabled) {
         if (mConfigPageEnabled == enabled) return;
         mConfigPageEnabled = enabled;
         sessionPagerAdapter.notifyDataSetChanged();
+        updateSessionPagerCachePolicy();
     }
 
     public boolean isConfigPageEnabled() {
@@ -334,10 +371,15 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     }
 
     public void setCurrentConfigPage(boolean animate) {
+        setCurrentConfigPage(animate, 0L);
+    }
+
+    public void setCurrentConfigPage(boolean animate, long requestToken) {
         if (!mConfigPageEnabled) return;
         int configIndex = getConfigPageIndex();
         if (configIndex < 0) return;
         mSelectedSessionIndex = configIndex;
+        rememberProgrammaticSelectionTokenForPosition(configIndex, requestToken);
         if (configIndex == mSessionPager.getCurrentItem()) {
             dispatchActivePageChanged(configIndex, false);
             return;
@@ -409,6 +451,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
      * If disabled, swipes are restricted to the bottom extra keys region.
      */
     public void setFullScreenSessionSwipeEnabled(boolean enabled) {
+        if (mFullScreenSessionSwipeEnabled == enabled) return;
         mFullScreenSessionSwipeEnabled = enabled;
     }
 
@@ -477,7 +520,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
 
         if (TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) {
             if (mCallbacks != null && !mSuppressSessionPageCallback) {
-                mCallbacks.onConfigPageSelected(fromUser);
+                mCallbacks.onConfigPageSelected(fromUser, consumeProgrammaticSelectionToken(holder.key, fromUser));
             }
             dispatchCurrentExtraKeysViewChanged();
             dispatchSessionPageChangeFinished();
@@ -488,7 +531,12 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             mCallbacks.onActiveTerminalViewChanged(holder.terminalView, holder.session);
         }
         if (mCallbacks != null && !mSuppressSessionPageCallback) {
-            mCallbacks.onSessionPageSelected(position, holder.session, fromUser);
+            mCallbacks.onSessionPageSelected(
+                position,
+                holder.session,
+                fromUser,
+                consumeProgrammaticSelectionToken(holder.key, fromUser)
+            );
         }
         dispatchCurrentExtraKeysViewChanged();
         dispatchSessionPageChangeFinished();
@@ -507,6 +555,29 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     private void updateToolbarMetricsState() {
         int rows = mExtraKeysInfo == null ? 0 : mExtraKeysInfo.getMatrix().length;
         mToolbarComputedHeightPx = Math.round(mToolbarDefaultHeightPx * rows * mToolbarHeightScale);
+    }
+
+    private void rememberProgrammaticSelectionTokenForPosition(int position, long requestToken) {
+        if (requestToken <= 0L) return;
+        String key = sessionPagerAdapter.getItemKeyAtPosition(position);
+        if (TextUtils.isEmpty(key)) return;
+        mProgrammaticSelectionTokensByKey.put(key, requestToken);
+    }
+
+    private long consumeProgrammaticSelectionToken(@Nullable String key, boolean fromUser) {
+        if (fromUser || TextUtils.isEmpty(key)) return 0L;
+        Long token = mProgrammaticSelectionTokensByKey.remove(key);
+        return token == null ? 0L : token;
+    }
+
+    private void pruneProgrammaticSelectionTokens() {
+        if (mProgrammaticSelectionTokensByKey.isEmpty()) return;
+        ArrayList<String> keys = new ArrayList<>(mProgrammaticSelectionTokensByKey.keySet());
+        for (String key : keys) {
+            if (!sessionPagerAdapter.containsItemKey(key)) {
+                mProgrammaticSelectionTokensByKey.remove(key);
+            }
+        }
     }
 
     private boolean shouldShowIntegratedToolbar() {
@@ -534,6 +605,17 @@ public class TerminalSessionSurfaceView extends LinearLayout {
     private float resolveToolbarDefaultHeightPx() {
         ViewGroup.LayoutParams layoutParams = mToolbarPager.getLayoutParams();
         return layoutParams == null || layoutParams.height <= 0 ? 0f : layoutParams.height;
+    }
+
+    private void updateSessionPagerCachePolicy() {
+        int pageCount = sessionPagerAdapter.getCount();
+        int desiredOffscreenLimit = Math.min(
+            MAX_SESSION_PAGER_OFFSCREEN_LIMIT,
+            Math.max(1, pageCount - 1)
+        );
+        if (mSessionPager.getOffscreenPageLimit() != desiredOffscreenLimit) {
+            mSessionPager.setOffscreenPageLimit(desiredOffscreenLimit);
+        }
     }
 
     private final class SessionPagerAdapter extends PagerAdapter {
@@ -570,6 +652,35 @@ public class TerminalSessionSurfaceView extends LinearLayout {
 
         int getItemsCount() {
             return items.size();
+        }
+
+        @Nullable
+        String getItemKeyAtPosition(int position) {
+            TerminalSessionSurfaceItem item;
+            if (position < items.size()) {
+                item = items.get(position);
+            } else if (mConfigPageEnabled && position == items.size()) {
+                item = new TerminalSessionSurfaceItem(CONFIG_PAGE_KEY, null);
+            } else if (items.isEmpty()) {
+                item = new TerminalSessionSurfaceItem(PLACEHOLDER_KEY, null);
+            } else {
+                item = null;
+            }
+            return item == null ? null : item.key;
+        }
+
+        boolean containsItemKey(@Nullable String key) {
+            if (TextUtils.isEmpty(key)) return false;
+            if (TextUtils.equals(CONFIG_PAGE_KEY, key)) {
+                return mConfigPageEnabled;
+            }
+            if (TextUtils.equals(PLACEHOLDER_KEY, key)) {
+                return items.isEmpty();
+            }
+            for (TerminalSessionSurfaceItem item : items) {
+                if (TextUtils.equals(item.key, key)) return true;
+            }
+            return false;
         }
 
         @Override

@@ -125,9 +125,6 @@
                 android:id="@+id/save_file"
                 android:title="@string/save_file" />
             <item
-                android:id="@+id/run_command_settings"
-                android:title="@string/run_command_settings" />
-            <item
                 android:id="@+id/autosave_self_test"
                 android:title="@string/autosave_self_test" />
             <item
@@ -178,9 +175,9 @@
         android:title="@string/redo"
         app:showAsAction="always" />
     <item
-        android:id="@+id/run_project"
-        android:icon="@drawable/ic_run"
-        android:title="@string/run_project"
+        android:id="@+id/open_terminal_workspace"
+        android:icon="@drawable/ic_terminal_workspace"
+        android:title="@string/open_terminal_workspace"
         app:showAsAction="always" />
     <item
         android:id="@+id/save_sync_status"

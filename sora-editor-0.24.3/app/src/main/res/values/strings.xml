@@ -95,7 +95,7 @@
     <string name="save_file">Save</string>
     <string name="autosave_self_test">Auto save self-test</string>
     <string name="copy_text">Copy</string>
-    <string name="run_project">Run</string>
+    <string name="open_terminal_workspace">Terminal</string>
     <string name="run_command_settings">Run command settings</string>
     <string name="run_command_title">Run command</string>
     <string name="run_command_hint">e.g. ./gradlew test</string>

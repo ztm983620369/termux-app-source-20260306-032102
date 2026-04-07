@@ -89,6 +89,8 @@ public final class TerminalView extends View {
 
     /** If non-zero, this is the last unicode code point received if that was a combining character. */
     int mCombiningAccent;
+    private boolean mFrameInvalidationScheduled;
+    private boolean mAccessibilityContentDescriptionDirty;
 
     /**
      * The current AutoFill type returned for {@link View#getAutofillType()} by {@link #getAutofillType()}.
@@ -496,8 +498,7 @@ public final class TerminalView extends View {
 
         mEmulator.clearScrollCounter();
 
-        invalidate();
-        if (mAccessibilityEnabled) setContentDescription(getText());
+        scheduleRenderFrame(true);
     }
 
     /** This must be called by the hosting activity in {@link Activity#onContextMenuClosed(Menu)}
@@ -601,18 +602,42 @@ public final class TerminalView extends View {
         boolean useArrowKeysInAltBuffer = mClient != null && mClient.shouldScrollWithArrowKeysInAlternateBuffer(mTermSession);
         boolean shouldSendMouseWheel = shouldUseMouseTrackingForTouchScroll();
 
+        if (!shouldSendMouseWheel && !(mEmulator.isAlternateBufferActive() && useArrowKeysInAltBuffer)) {
+            int delta = up ? -amount : amount;
+            int nextTopRow = Math.min(0, Math.max(-activeTranscriptRows, mTopRow + delta));
+            if (nextTopRow != mTopRow) {
+                mTopRow = nextTopRow;
+                if (!awakenScrollBars()) scheduleRenderFrame(false);
+            }
+            return;
+        }
+
         for (int i = 0; i < amount; i++) {
             if (shouldSendMouseWheel) {
                 sendMouseEventCode(event, up ? TerminalEmulator.MOUSE_WHEELUP_BUTTON : TerminalEmulator.MOUSE_WHEELDOWN_BUTTON, true);
             } else if (mEmulator.isAlternateBufferActive() && useArrowKeysInAltBuffer) {
-                // Send up and down key events for scrolling, which is what some terminals do to make scroll work in
-                // e.g. less, which shifts to the alt screen without mouse handling.
-                handleKeyCode(up ? KeyEvent.KEYCODE_DPAD_UP : KeyEvent.KEYCODE_DPAD_DOWN, 0);
-            } else {
-                mTopRow = Math.min(0, Math.max(-activeTranscriptRows, mTopRow + (up ? -1 : 1)));
-                if (!awakenScrollBars()) invalidate();
+                    // Send up and down key events for scrolling, which is what some terminals do to make scroll work in
+                    // e.g. less, which shifts to the alt screen without mouse handling.
+                    handleKeyCode(up ? KeyEvent.KEYCODE_DPAD_UP : KeyEvent.KEYCODE_DPAD_DOWN, 0);
             }
         }
+    }
+
+    private void scheduleRenderFrame(boolean updateAccessibilityDescription) {
+        if (updateAccessibilityDescription && mAccessibilityEnabled) {
+            mAccessibilityContentDescriptionDirty = true;
+        }
+        if (mFrameInvalidationScheduled) return;
+
+        mFrameInvalidationScheduled = true;
+        postOnAnimation(() -> {
+            mFrameInvalidationScheduled = false;
+            invalidate();
+            if (mAccessibilityEnabled && mAccessibilityContentDescriptionDirty) {
+                mAccessibilityContentDescriptionDirty = false;
+                setContentDescription(getText());
+            }
+        });
     }
 
     /** Overriding {@link View#onGenericMotionEvent(MotionEvent)}. */
@@ -1360,7 +1385,7 @@ public final class TerminalView extends View {
                     mCursorVisible = !mCursorVisible;
                     //mClient.logVerbose(LOG_TAG, "Toggling cursor blink state to " + mCursorVisible);
                     mEmulator.setCursorBlinkState(mCursorVisible);
-                    invalidate();
+                    scheduleRenderFrame(false);
                 }
             } finally {
                 // Recall the Runnable after mBlinkRate milliseconds to toggle the blink state

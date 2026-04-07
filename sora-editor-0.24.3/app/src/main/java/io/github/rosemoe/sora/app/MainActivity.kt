@@ -1016,47 +1016,8 @@ class MainActivity : AppCompatActivity() {
 
             R.id.switch_typeface -> editorEnv.chooseTypeface()
 
-            R.id.run_project -> {
-                val path = lastOpenRequest?.path
-                if (path.isNullOrBlank()) {
-                    toast("未打开文件")
-                    return true
-                }
-                val command = prefs.getString(PREF_KEY_RUN_COMMAND, "").orEmpty().trim()
-                if (command.isBlank()) {
-                    toast(getString(R.string.run_command_empty))
-                    showRunCommandSettingsDialog()
-                    return true
-                }
-                lifecycleScope.launch {
-                    val save = documentSync.saveNow(EditorSaveTrigger.RUN)
-                    if (!save.ok) {
-                        toast("保存失败：${save.error ?: "unknown"}")
-                        return@launch
-                    }
-                    val workdir = File(path).parentFile?.absolutePath ?: File(path).absoluteFile.parentFile?.absolutePath.orEmpty()
-                    if (workdir.isBlank()) {
-                        toast("无法确定工作目录")
-                        return@launch
-                    }
-                    IdeRunManager.launchCustomCommandInTerminal(
-                        context = this@MainActivity,
-                        command = command,
-                        workdir = workdir,
-                        label = "run-custom"
-                    )
-                    sendBroadcast(
-                        Intent("com.termux.app.action.SWITCH_TAB")
-                            .setPackage(com.termux.shared.termux.TermuxConstants.TERMUX_PACKAGE_NAME)
-                            .putExtra("tab", "terminal")
-                    )
-                    toast("运行：$command")
-                }
-                return true
-            }
-
-            R.id.run_command_settings -> {
-                showRunCommandSettingsDialog()
+            R.id.open_terminal_workspace -> {
+                toast("嵌入式终端工作台仅在 Termux 主宿主中可用")
                 return true
             }
         }
