@@ -360,6 +360,16 @@ class FileManagerController(
         }
     }
 
+    override fun closeActiveWorkspaceTabIfPossible(): Boolean {
+        val filesFragment = getFilesFragment() ?: return false
+        val closed = filesFragment.closeActiveWorkspaceTabIfPossible()
+        if (closed) {
+            syncWorkspaceChrome()
+            refreshMenuItems()
+        }
+        return closed
+    }
+
     override fun toggleMainFabMenu() {
         openCreateNew()
     }
@@ -373,6 +383,20 @@ class FileManagerController(
         } else {
             finishCreateDocumentIntent(path, filename)
         }
+    }
+
+    override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {
+        val filesIndex = getEffectiveTabs().indexOf(TAB_FILES)
+        if (filesIndex != -1 && binding.mainViewPager.currentItem != filesIndex) {
+            binding.mainViewPager.currentItem = filesIndex
+        }
+        getFilesFragment()?.openPathAndHighlight(targetPath, highlightPaths)
+        syncWorkspaceChrome()
+        refreshMenuItems()
+    }
+
+    override fun installDownloadedApk(path: String, deleteAfterInstall: Boolean) {
+        externalActions.installDownloadedApk(path, deleteAfterInstall)
     }
 
     override fun pickedPath(path: String) {
@@ -513,7 +537,7 @@ class FileManagerController(
     }
 
     private fun isInTermuxStorage(path: String): Boolean {
-        return TermuxPathScope.isInTermuxRoot(activity, path)
+        return TermuxPathScope.isVisibleInFileManager(activity, path)
     }
 
     private fun clampToVisibleTermuxPath(path: String?, fallback: String): String {

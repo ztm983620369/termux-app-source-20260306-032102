@@ -113,6 +113,8 @@ import org.fossify.commons.extensions.Context_stylingKt;
 import org.fossify.filemanager.activities.SimpleActivity;
 import org.fossify.filemanager.controllers.FileManagerController;
 import org.fossify.filemanager.databinding.FmActivityMainBinding;
+import org.fossify.filemanager.helpers.DownloadedApkArchiveInfo;
+import org.fossify.filemanager.helpers.DownloadedApkInstallerSupport;
 import org.fossify.filemanager.interfaces.FileManagerHost;
 
 import kotlin.jvm.functions.Function0;
@@ -121,6 +123,8 @@ import androidx.viewpager.widget.ViewPager;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 
 /**
  * A terminal emulator activity.
@@ -233,6 +237,22 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private View mStatusBarScrim;
 
     private float mTerminalToolbarDefaultHeight;
+    private final LinkedHashMap<String, LinkedHashSet<String>> mPendingDownloadedApkDeletes = new LinkedHashMap<>();
+    private boolean mDownloadedApkCleanupReceiverRegistered = false;
+    private final BroadcastReceiver mDownloadedApkCleanupReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String packageName = intent == null || intent.getData() == null
+                ? ""
+                : intent.getData().getSchemeSpecificPart();
+            if (TextUtils.isEmpty(packageName)) return;
+            LinkedHashSet<String> paths = mPendingDownloadedApkDeletes.remove(packageName);
+            if (paths == null || paths.isEmpty()) return;
+            for (String path : paths) {
+                DownloadedApkInstallerSupport.deleteDownloadedApk(path);
+            }
+        }
+    };
 
 
     private static final int CONTEXT_MENU_SELECT_URL_ID = 0;
@@ -447,6 +467,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         handleUiNavigationIntentIfNeeded(getIntent());
         handleEditorIntentIfNeeded(getIntent());
         scheduleDeferredStartupInitialization();
+        registerDownloadedApkCleanupReceiver();
 
         updateTerminalContextMenuRegistration(mTerminalView);
 
@@ -715,6 +736,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
         Logger.logDebug(LOG_TAG, "onDestroy");
         cancelCoalescedSessionListUiUpdate();
+        unregisterDownloadedApkCleanupReceiver();
 
         if (mIsInvalidState) return;
 
@@ -760,6 +782,35 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         filter.addAction(TermuxActivityUiReceiver.ACTION_SWITCH_TAB);
         filter.addAction(TermuxActivityUiReceiver.ACTION_OPEN_FILES_AT);
         registerReceiver(mUiReceiver, filter);
+    }
+
+    private void registerDownloadedApkCleanupReceiver() {
+        if (mDownloadedApkCleanupReceiverRegistered) return;
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+        filter.addDataScheme("package");
+        registerReceiver(mDownloadedApkCleanupReceiver, filter);
+        mDownloadedApkCleanupReceiverRegistered = true;
+    }
+
+    private void unregisterDownloadedApkCleanupReceiver() {
+        if (!mDownloadedApkCleanupReceiverRegistered) return;
+        try {
+            unregisterReceiver(mDownloadedApkCleanupReceiver);
+        } catch (Exception ignored) {
+        }
+        mDownloadedApkCleanupReceiverRegistered = false;
+    }
+
+    private void removePendingDownloadedApkDelete(@Nullable String packageName, @NonNull String path) {
+        if (TextUtils.isEmpty(packageName)) return;
+        LinkedHashSet<String> paths = mPendingDownloadedApkDeletes.get(packageName);
+        if (paths == null) return;
+        paths.remove(path);
+        if (paths.isEmpty()) {
+            mPendingDownloadedApkDeletes.remove(packageName);
+        }
     }
 
     private void unregisterUiReceiver() {
@@ -886,9 +937,21 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     @Override
+    public boolean closeActiveWorkspaceTabIfPossible() {
+        return mFileManagerController != null && mFileManagerController.closeActiveWorkspaceTabIfPossible();
+    }
+
+    @Override
     public void createDocumentConfirmed(String path) {
         if (mFileManagerController != null) {
             mFileManagerController.createDocumentConfirmed(path);
+        }
+    }
+
+    @Override
+    public void openPathAndHighlight(String targetPath, ArrayList<String> highlightPaths) {
+        if (mFileManagerController != null) {
+            mFileManagerController.openPathAndHighlight(targetPath, highlightPaths);
         }
     }
 
@@ -937,6 +1000,43 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     @Override
     public void openInTerminal(String path) {
         openTerminalAtPath(path);
+    }
+
+    @Override
+    public void installDownloadedApk(String path, boolean deleteAfterInstall) {
+        File apkFile = new File(path);
+        if (!apkFile.exists() || !apkFile.isFile()) {
+            showToast("APK 文件不存在：" + path, true);
+            return;
+        }
+
+        DownloadedApkArchiveInfo archiveInfo = DownloadedApkInstallerSupport.readArchiveInfo(this, path);
+        String packageName = archiveInfo == null ? null : archiveInfo.getPackageName();
+        if (deleteAfterInstall && !TextUtils.isEmpty(packageName)) {
+            LinkedHashSet<String> paths = mPendingDownloadedApkDeletes.get(packageName);
+            if (paths == null) {
+                paths = new LinkedHashSet<>();
+                mPendingDownloadedApkDeletes.put(packageName, paths);
+            }
+            paths.add(path);
+        }
+
+        Intent installIntent = DownloadedApkInstallerSupport.createInstallIntent(this, path);
+        if (installIntent == null) {
+            showToast("无法创建安装请求。", true);
+            removePendingDownloadedApkDelete(packageName, path);
+            return;
+        }
+
+        try {
+            startActivity(installIntent);
+            if (deleteAfterInstall) {
+                showToast("已打开安装器。安装成功后将自动删除 APK；取消安装则保留文件。", true);
+            }
+        } catch (Exception e) {
+            removePendingDownloadedApkDelete(packageName, path);
+            showToast("启动安装器失败：" + (e.getMessage() == null ? "unknown" : e.getMessage()), true);
+        }
     }
 
     @Override

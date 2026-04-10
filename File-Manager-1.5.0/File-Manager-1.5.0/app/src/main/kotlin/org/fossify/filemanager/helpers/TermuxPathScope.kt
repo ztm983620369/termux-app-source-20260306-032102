@@ -1,9 +1,12 @@
 package org.fossify.filemanager.helpers
 
 import android.content.Context
+import org.fossify.commons.extensions.getStorageDirectories
+import org.fossify.commons.extensions.internalStoragePath
 import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.interfaces.FileManagerEnvironment
 import java.io.File
+import java.util.LinkedHashSet
 
 object TermuxPathScope {
     private const val TERMUX_HOME_RELATIVE_PATH = "home"
@@ -18,7 +21,7 @@ object TermuxPathScope {
     fun navigatorRootPath(context: Context): String = normalizePath("${termuxRootPath(context)}/$NAV_ROOT_RELATIVE_PATH")
 
     fun preferredLocalRoot(context: Context): String {
-        return if (context.config.showTermuxSystemDirs) termuxRootPath(context) else termuxHomePath(context)
+        return if (context.config.showTermuxSystemDirs) preferredPhoneRoot(context) else termuxHomePath(context)
     }
 
     fun isScopedHost(context: Context): Boolean {
@@ -55,6 +58,34 @@ object TermuxPathScope {
             normalized.startsWith("$mountRoot/")
     }
 
+    fun phoneStorageRoots(context: Context): List<String> {
+        val roots = LinkedHashSet<String>()
+        val internal = normalizePath(context.internalStoragePath)
+        if (internal.isNotBlank() && File(internal).exists()) {
+            roots.add(internal)
+        }
+
+        context.getStorageDirectories().forEach { raw ->
+            val normalized = normalizePath(raw)
+            if (normalized.isNotBlank() && File(normalized).exists()) {
+                roots.add(normalized)
+            }
+        }
+
+        return roots.toList()
+    }
+
+    fun preferredPhoneRoot(context: Context): String {
+        return phoneStorageRoots(context).firstOrNull() ?: termuxHomePath(context)
+    }
+
+    fun isInPhoneStorage(context: Context, path: String?): Boolean {
+        val normalized = normalizePath(path)
+        return phoneStorageRoots(context).any { root ->
+            normalized == root || normalized.startsWith("$root/")
+        }
+    }
+
     fun isVisibleInFileManager(context: Context, path: String?, isScopedHost: Boolean = isScopedHost(context)): Boolean {
         if (!isScopedHost) return true
 
@@ -63,7 +94,7 @@ object TermuxPathScope {
         if (isVirtualWorkspacePath(context, normalized)) return true
 
         return if (context.config.showTermuxSystemDirs) {
-            isInTermuxRoot(context, normalized)
+            isInTermuxRoot(context, normalized) || isInPhoneStorage(context, normalized)
         } else {
             isInTermuxHome(context, normalized)
         }
@@ -85,7 +116,7 @@ object TermuxPathScope {
     fun isSystemPath(context: Context, path: String?): Boolean {
         if (!isScopedHost(context)) return false
         val normalized = normalizePath(path)
-        return isInTermuxRoot(context, normalized) &&
+        return (isInPhoneStorage(context, normalized) || isInTermuxRoot(context, normalized)) &&
             !isInTermuxHome(context, normalized) &&
             !isVirtualWorkspacePath(context, normalized) &&
             normalized != navigatorRootPath(context)

@@ -4,8 +4,10 @@ import android.content.Context
 import com.termux.sessionsync.FileRootResolver
 import com.termux.sessionsync.SessionFileCoordinator
 import org.fossify.commons.extensions.humanizePath
+import org.fossify.commons.extensions.internalStoragePath
 import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.models.ListItem
+import java.io.File
 import java.util.LinkedHashSet
 
 object NavigatorFolderHelper {
@@ -60,7 +62,9 @@ object NavigatorFolderHelper {
         addFolder("\u672c\u5730\u5de5\u4f5c\u76ee\u5f55", homePath, selected = selectedKey.isNullOrEmpty())
 
         if (context.config.showTermuxSystemDirs) {
-            addFolder(context.getString(org.fossify.filemanager.R.string.termux_system_dirs), TermuxPathScope.termuxRootPath(context))
+            buildAndroidDirectoryItems(context).forEach { (label, path) ->
+                addFolder(label, path)
+            }
         }
 
         favoritePaths.forEach { path ->
@@ -104,5 +108,39 @@ object NavigatorFolderHelper {
 
     private fun normalizePath(rawPath: String): String {
         return TermuxPathScope.normalizePath(rawPath)
+    }
+
+    private fun buildAndroidDirectoryItems(context: Context): List<Pair<String, String>> {
+        val roots = TermuxPathScope.phoneStorageRoots(context)
+        val internalRoot = normalizePath(context.internalStoragePath)
+        val items = ArrayList<Pair<String, String>>()
+
+        roots.forEach { root ->
+            val prefix = if (root == internalRoot) {
+                "\u624b\u673a\u5b58\u50a8"
+            } else {
+                "\u5916\u90e8\u5b58\u50a8"
+            }
+
+            items.add(prefix to root)
+
+            linkedMapOf(
+                "Download" to "\u4e0b\u8f7d",
+                "Documents" to "\u6587\u6863",
+                "DCIM" to "DCIM",
+                "Pictures" to "\u56fe\u7247",
+                "Movies" to "\u89c6\u9891",
+                "Music" to "\u97f3\u4e50",
+                "Android/data" to "Android/data",
+                "Android/obb" to "Android/obb"
+            ).forEach { (relativePath, displayName) ->
+                val target = File(root, relativePath).absolutePath
+                if (File(target).isDirectory) {
+                    items.add("$prefix / $displayName" to normalizePath(target))
+                }
+            }
+        }
+
+        return items
     }
 }

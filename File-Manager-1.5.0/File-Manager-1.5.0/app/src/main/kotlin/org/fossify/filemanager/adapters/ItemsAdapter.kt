@@ -835,7 +835,6 @@ class ItemsAdapter(
             try {
                 val remotePaths = ArrayList<String>(remoteItems.size)
                 remoteItems.forEach { remotePaths.add(it.path) }
-                val revealPaths = buildVirtualRevealPaths(remoteItems, destinationVirtualPath)
                 val progressTracker = TransferSpeedTracker()
                 val result = sessionFileCoordinator.transferVirtualPaths(
                     activity,
@@ -908,8 +907,8 @@ class ItemsAdapter(
                         }
                     }
 
-                    if (result.transferredFiles > 0 && revealPaths.isNotEmpty()) {
-                        listener?.openPathAndHighlight(destinationVirtualPath, revealPaths)
+                    if (result.transferredFiles > 0 && result.transferredVirtualPaths.isNotEmpty()) {
+                        listener?.openPathAndHighlight(destinationVirtualPath, ArrayList(result.transferredVirtualPaths))
                     } else {
                         listener?.refreshFragment()
                     }
@@ -1069,7 +1068,6 @@ class ItemsAdapter(
             try {
                 val virtualPaths = ArrayList<String>(virtualItems.size)
                 virtualItems.forEach { virtualPaths.add(it.path) }
-                val revealPaths = buildLocalRevealPaths(virtualItems, destination)
                 val result = sessionFileCoordinator.downloadVirtualPaths(
                     activity,
                     virtualPaths,
@@ -1192,8 +1190,8 @@ class ItemsAdapter(
                         }
                     }
 
-                    if (result.downloadedFiles > 0 && revealPaths.isNotEmpty()) {
-                        listener?.openPathAndHighlight(destination, revealPaths)
+                    if (result.downloadedFiles > 0 && result.downloadedLocalPaths.isNotEmpty()) {
+                        listener?.openPathAndHighlight(destination, ArrayList(result.downloadedLocalPaths))
                     } else {
                         listener?.refreshFragment()
                     }
@@ -1263,7 +1261,6 @@ class ItemsAdapter(
             try {
                 val localPaths = ArrayList<String>(localItems.size)
                 localItems.forEach { localPaths.add(it.path) }
-                val revealPaths = buildVirtualRevealPaths(localItems, destinationVirtualPath)
                 val result = sessionFileCoordinator.uploadLocalPathsToVirtual(
                     activity,
                     localPaths,
@@ -1386,8 +1383,8 @@ class ItemsAdapter(
                         }
                     }
 
-                    if (result.uploadedFiles > 0 && revealPaths.isNotEmpty()) {
-                        listener?.openPathAndHighlight(destinationVirtualPath, revealPaths)
+                    if (result.uploadedFiles > 0 && result.uploadedVirtualPaths.isNotEmpty()) {
+                        listener?.openPathAndHighlight(destinationVirtualPath, ArrayList(result.uploadedVirtualPaths))
                     } else {
                         listener?.refreshFragment()
                     }
@@ -1923,32 +1920,6 @@ class ItemsAdapter(
     }
 
     private fun getFirstSelectedItemPath() = getSelectedFileDirItems().first().path
-
-    private fun buildLocalRevealPaths(virtualItems: List<FileDirItem>, destination: String): ArrayList<String> {
-        val reveal = ArrayList<String>(virtualItems.size)
-        virtualItems.forEach { item ->
-            val name = item.name.ifBlank { item.path.getFilenameFromPath() }
-            if (name.isBlank()) return@forEach
-            reveal.add(File(destination, name).absolutePath.replace('\\', '/'))
-        }
-        return reveal
-    }
-
-    private fun buildVirtualRevealPaths(localItems: List<FileDirItem>, destinationVirtualPath: String): ArrayList<String> {
-        val reveal = ArrayList<String>(localItems.size)
-        val normalizedDestination = destinationVirtualPath.replace('\\', '/').trimEnd('/').ifEmpty { "/" }
-        localItems.forEach { item ->
-            val name = item.name.ifBlank { item.path.getFilenameFromPath() }
-            if (name.isBlank()) return@forEach
-            val fullPath = if (normalizedDestination == "/") {
-                "/$name"
-            } else {
-                "$normalizedDestination/$name"
-            }
-            reveal.add(fullPath)
-        }
-        return reveal
-    }
 
     private fun getSelectedFileDirItems(): ArrayList<FileDirItem> {
         return listItems.filter {

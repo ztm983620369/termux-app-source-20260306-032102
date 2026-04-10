@@ -6,9 +6,9 @@
     <string name="toggle_termux_storage">Switch storage</string>
     <string name="switch_to_termux">Switch to Termux</string>
     <string name="switch_to_internal_storage">Switch to internal storage</string>
-    <string name="show_termux_system_dirs">Show Termux system dirs</string>
-    <string name="hide_termux_system_dirs">Hide Termux system dirs</string>
-    <string name="termux_system_dirs">Termux system dirs</string>
+    <string name="show_termux_system_dirs">Show phone system dirs</string>
+    <string name="hide_termux_system_dirs">Hide phone system dirs</string>
+    <string name="termux_system_dirs">System dirs</string>
     <string name="open_in_terminal">Open in terminal</string>
     <string name="set_as_home_folder">Set as home folder</string>
     <string name="home_folder_updated">Home folder updated</string>

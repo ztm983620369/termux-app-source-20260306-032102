@@ -194,6 +194,6 @@ class Config(context: Context) : BaseConfig(context) {
         set(preferTermuxStorage) = prefs.edit().putBoolean(PREFER_TERMUX_STORAGE, preferTermuxStorage).apply()
 
     var showTermuxSystemDirs: Boolean
-        get() = prefs.getBoolean(SHOW_TERMUX_SYSTEM_DIRS, false)
+        get() = prefs.getBoolean(SHOW_TERMUX_SYSTEM_DIRS, true)
         set(showTermuxSystemDirs) = prefs.edit().putBoolean(SHOW_TERMUX_SYSTEM_DIRS, showTermuxSystemDirs).apply()
 }

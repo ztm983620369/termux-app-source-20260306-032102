@@ -2,10 +2,17 @@ package org.fossify.filemanager.fragments
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Parcelable
 import android.os.SystemClock
 import android.util.AttributeSet
+import android.widget.ImageView
+import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.recyclerview.widget.GridLayoutManager
+import com.termux.sessionsync.SftpProtocolManager
 import org.fossify.commons.activities.BaseSimpleActivity
 import org.fossify.commons.extensions.*
 import org.fossify.commons.helpers.*
@@ -23,12 +30,14 @@ import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
 import org.fossify.filemanager.helpers.NavigatorFolderHelper
 import org.fossify.filemanager.helpers.RootHelpers
 import org.fossify.filemanager.helpers.TermuxPathScope
+import org.fossify.filemanager.helpers.DownloadedApkArchiveInfo
+import org.fossify.filemanager.helpers.DownloadedApkInstallerSupport
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
 import com.termux.bridge.FileOpenRequest
 import com.termux.sessionsync.SessionFileCoordinator
-import com.termux.sessionsync.SftpProtocolManager
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerFragment<MyViewPagerFragment.ItemsInnerBinding>(context, attributeSet),
     ItemOperationsListener {
@@ -76,6 +85,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                     }
                     val parent = resolveParentPathForNavigation(currentPath)
                     if (parent == currentPath.trimEnd('/')) {
+                        fileManagerControllerCommands.closeActiveWorkspaceTabIfPossible()
                         return@setOnClickListener
                     }
                     openPath(parent, forceRefresh = true)
@@ -380,6 +390,8 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         if (context != null && sessionFileCoordinator.isVirtualPath(context!!, item.path)) {
             if (item.isDirectory) {
                 openDirectory(item.path)
+            } else if (item.name.endsWith(".apk", true)) {
+                downloadRemoteApkToDownloads(item)
             } else {
                 showProgressBar()
                 ensureBackgroundThread {
@@ -421,6 +433,299 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         } else {
             clickedPath(item.path)
         }
+    }
+
+    private fun downloadRemoteApkToDownloads(item: FileDirItem) {
+        val hostActivity = activity ?: return
+        val downloadsPath = DownloadedApkInstallerSupport.getSystemDownloadsPath()
+        if (downloadsPath.isBlank()) {
+            hostActivity.toast("无法确定系统 Download 目录。")
+            return
+        }
+
+        hostActivity.handleAndroidSAFDialog(downloadsPath, openInSystemAppAllowed = true) { granted ->
+            if (!granted) return@handleAndroidSAFDialog
+            hostActivity.handleSAFDialog(downloadsPath) { safGranted ->
+                if (!safGranted) return@handleSAFDialog
+                startRemoteApkDownload(item, downloadsPath)
+            }
+        }
+    }
+
+    private fun startRemoteApkDownload(item: FileDirItem, downloadsPath: String) {
+        val hostActivity = activity ?: return
+        val progressDialog = hostActivity.getAlertDialogBuilder()
+            .setTitle("下载 APK")
+            .setMessage("正在准备下载...")
+            .setNegativeButton("取消", null)
+            .setCancelable(false)
+            .create()
+        val cancelled = AtomicBoolean(false)
+        progressDialog.setOnShowListener {
+            progressDialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+                cancelled.set(true)
+                it.isEnabled = false
+            }
+        }
+        try {
+            progressDialog.show()
+        } catch (_: Exception) {
+        }
+
+        var lastUiUpdateAt = 0L
+        var lastSpeedAt = 0L
+        var lastSpeedBytes = 0L
+        var speedBytesPerSecond = 0L
+
+        ensureBackgroundThread {
+            try {
+                val result = sessionFileCoordinator.downloadVirtualPaths(
+                    hostActivity,
+                    listOf(item.path),
+                    downloadsPath,
+                    object : SftpProtocolManager.DownloadProgressListener {
+                        override fun onProgress(progress: SftpProtocolManager.DownloadProgress) {
+                            val now = SystemClock.elapsedRealtime()
+                            if (lastSpeedAt == 0L) {
+                                lastSpeedAt = now
+                                lastSpeedBytes = progress.transferredBytes
+                            } else {
+                                val deltaMs = now - lastSpeedAt
+                                if (deltaMs >= 260L || progress.transferredBytes < lastSpeedBytes) {
+                                    val deltaBytes = progress.transferredBytes - lastSpeedBytes
+                                    speedBytesPerSecond = if (deltaMs > 0L && deltaBytes > 0L) {
+                                        deltaBytes * 1000L / deltaMs
+                                    } else {
+                                        0L
+                                    }
+                                    lastSpeedAt = now
+                                    lastSpeedBytes = progress.transferredBytes
+                                }
+                            }
+
+                            if (now - lastUiUpdateAt < 100L && progress.transferredBytes < progress.totalBytes) {
+                                return
+                            }
+                            lastUiUpdateAt = now
+
+                            val finishedCount = progress.completedFiles + progress.failedFiles
+                            val percent = if (progress.totalBytes > 0L) {
+                                ((progress.transferredBytes * 100L) / progress.totalBytes).coerceIn(0L, 100L)
+                            } else {
+                                0L
+                            }
+                            val sizeText = if (progress.totalBytes > 0L) {
+                                "${progress.transferredBytes.formatSize()} / ${progress.totalBytes.formatSize()}"
+                            } else {
+                                "${progress.transferredBytes.formatSize()} / ?"
+                            }
+                            val speedText = if (speedBytesPerSecond > 0L) {
+                                "${speedBytesPerSecond.formatSize()}/s"
+                            } else {
+                                "--"
+                            }
+                            val currentFile = progress.currentFile.ifEmpty { item.name.ifBlank { "apk" } }
+                            val message = StringBuilder()
+                                .append("当前：").append(currentFile).append('\n')
+                                .append("进度：").append(finishedCount).append('/').append(progress.totalFiles)
+                                .append(" (").append(percent).append("%)").append('\n')
+                                .append("大小：").append(sizeText).append('\n')
+                                .append("速度：").append(speedText)
+                                .toString()
+
+                            hostActivity.runOnUiThread {
+                                if (!hostActivity.isDestroyed && !hostActivity.isFinishing && progressDialog.isShowing) {
+                                    progressDialog.setMessage(message)
+                                }
+                            }
+                        }
+                    },
+                    object : SftpProtocolManager.DownloadControl {
+                        override fun isCancelled(): Boolean = cancelled.get()
+                    }
+                )
+
+                hostActivity.runOnUiThread {
+                    try {
+                        if (progressDialog.isShowing) progressDialog.dismiss()
+                    } catch (_: Exception) {
+                    }
+
+                    when {
+                        result.success -> {
+                            hostActivity.toast(
+                                "APK 下载完成：${result.downloadedBytes.formatSize()}"
+                            )
+                        }
+
+                        result.downloadedFiles > 0 -> {
+                            hostActivity.toast(
+                                "APK 已部分下载：${result.downloadedFiles}/${result.totalFiles}"
+                            )
+                        }
+
+                        result.messageCn.contains("已取消") -> {
+                            hostActivity.toast(result.messageCn)
+                        }
+
+                        else -> {
+                            hostActivity.toast(result.messageCn.ifBlank { "APK 下载失败，请重试。" })
+                        }
+                    }
+
+                    val downloadedPath = result.downloadedLocalPaths.firstOrNull()
+                        ?.takeIf { it.isNotBlank() && File(it).exists() }
+                    if (downloadedPath != null) {
+                        hostActivity.rescanPath(downloadedPath)
+                        showDownloadedApkDialog(item, downloadedPath)
+                    }
+                }
+            } catch (t: Throwable) {
+                hostActivity.runOnUiThread {
+                    try {
+                        if (progressDialog.isShowing) progressDialog.dismiss()
+                    } catch (_: Exception) {
+                    }
+                    val msg = t.message?.trim().orEmpty()
+                    hostActivity.toast(if (msg.isNotEmpty()) "APK 下载异常：$msg" else "APK 下载异常，请重试。")
+                }
+            }
+        }
+    }
+
+    private fun showDownloadedApkDialog(item: FileDirItem, downloadedPath: String) {
+        val hostActivity = activity ?: return
+        val apkInfo = DownloadedApkInstallerSupport.readArchiveInfo(hostActivity, downloadedPath)
+        val file = File(downloadedPath)
+        val dialogView = hostActivity.layoutInflater.inflate(R.layout.dialog_downloaded_apk_card, null)
+        bindDownloadedApkDialogView(
+            dialogView = dialogView,
+            item = item,
+            downloadedPath = downloadedPath,
+            apkInfo = apkInfo,
+            fileSize = file.length()
+        )
+
+        val dialog = hostActivity.getAlertDialogBuilder()
+            .setView(dialogView)
+            .setPositiveButton("安装后删除") { _, _ ->
+                fileManagerControllerCommands.installDownloadedApk(downloadedPath, true)
+            }
+            .setNegativeButton("保留") { _, _ ->
+                hostActivity.toast("已保留到 Download 目录。")
+            }
+            .create()
+        dialog.setOnShowListener {
+            val accentColor = hostActivity.getProperPrimaryColor()
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextColor(accentColor)
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextColor(accentColor)
+        }
+        dialog.show()
+    }
+
+    private fun bindDownloadedApkDialogView(
+        dialogView: android.view.View,
+        item: FileDirItem,
+        downloadedPath: String,
+        apkInfo: DownloadedApkArchiveInfo?,
+        fileSize: Long
+    ) {
+        val hostActivity = activity ?: return
+        val backgroundColor = hostActivity.getProperBackgroundColor()
+        val textColor = hostActivity.getProperTextColor()
+        val primaryColor = hostActivity.getProperPrimaryColor()
+        val secondaryTextColor = blendDialogColor(textColor, backgroundColor, 0.62f)
+        val cardColor = blendDialogColor(primaryColor, backgroundColor, 0.12f)
+        val borderColor = blendDialogColor(textColor, backgroundColor, 0.18f)
+        val iconHolderColor = blendDialogColor(primaryColor, backgroundColor, 0.18f)
+
+        dialogView.findViewById<android.view.View>(R.id.downloaded_apk_card).background =
+            GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = hostActivity.resources.displayMetrics.density * 22f
+                setColor(cardColor)
+                setStroke((hostActivity.resources.displayMetrics.density * 1.2f).toInt(), borderColor)
+            }
+        dialogView.findViewById<android.view.View>(R.id.downloaded_apk_icon_holder).background =
+            GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = hostActivity.resources.displayMetrics.density * 18f
+                setColor(iconHolderColor)
+            }
+        dialogView.findViewById<TextView>(R.id.downloaded_apk_badge).background =
+            GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = hostActivity.resources.displayMetrics.density * 999f
+                setColor(primaryColor)
+            }
+        dialogView.findViewById<android.view.View>(R.id.downloaded_apk_divider).setBackgroundColor(borderColor)
+
+        val title = apkInfo?.applicationLabel?.ifBlank { item.name } ?: item.name
+        val packageText = apkInfo?.packageName?.ifBlank { "未知" } ?: "未知"
+        val versionText = buildString {
+            val versionName = apkInfo?.versionName?.trim().orEmpty()
+            if (versionName.isNotEmpty()) {
+                append(versionName)
+            } else {
+                append("未知")
+            }
+            if (apkInfo != null && apkInfo.versionCode > 0L) {
+                append(" (").append(apkInfo.versionCode).append(')')
+            }
+        }
+        val sizeText = if (fileSize > 0L) fileSize.formatSize() else "未知"
+
+        dialogView.findViewById<TextView>(R.id.downloaded_apk_title).apply {
+            text = title
+            setTextColor(textColor)
+        }
+        dialogView.findViewById<TextView>(R.id.downloaded_apk_filename).apply {
+            text = item.name
+            setTextColor(secondaryTextColor)
+        }
+        dialogView.findViewById<TextView>(R.id.downloaded_apk_badge).setTextColor(primaryColor.getContrastColor())
+        dialogView.findViewById<TextView>(R.id.downloaded_apk_hint).setTextColor(secondaryTextColor)
+
+        bindDownloadedApkInfoRow(dialogView, R.id.downloaded_apk_package_label, R.id.downloaded_apk_package_value, "包名", packageText, textColor, secondaryTextColor, true)
+        bindDownloadedApkInfoRow(dialogView, R.id.downloaded_apk_version_label, R.id.downloaded_apk_version_value, "版本", versionText, textColor, secondaryTextColor, false)
+        bindDownloadedApkInfoRow(dialogView, R.id.downloaded_apk_size_label, R.id.downloaded_apk_size_value, "大小", sizeText, textColor, secondaryTextColor, false)
+        bindDownloadedApkInfoRow(dialogView, R.id.downloaded_apk_path_label, R.id.downloaded_apk_path_value, "位置", downloadedPath, textColor, secondaryTextColor, true)
+
+        dialogView.findViewById<ImageView>(R.id.downloaded_apk_icon).setImageDrawable(
+            DownloadedApkInstallerSupport.loadArchiveIcon(hostActivity, downloadedPath)
+                ?: hostActivity.packageManager.defaultActivityIcon
+        )
+    }
+
+    private fun bindDownloadedApkInfoRow(
+        dialogView: android.view.View,
+        labelId: Int,
+        valueId: Int,
+        label: String,
+        value: String,
+        textColor: Int,
+        secondaryTextColor: Int,
+        monospace: Boolean
+    ) {
+        dialogView.findViewById<TextView>(labelId).apply {
+            text = label
+            setTextColor(secondaryTextColor)
+        }
+        dialogView.findViewById<TextView>(valueId).apply {
+            text = value
+            setTextColor(textColor)
+            typeface = if (monospace) Typeface.MONOSPACE else Typeface.DEFAULT
+        }
+    }
+
+    private fun blendDialogColor(foreground: Int, background: Int, ratio: Float): Int {
+        val clamped = ratio.coerceIn(0f, 1f)
+        val inverse = 1f - clamped
+        val a = (Color.alpha(foreground) * clamped + Color.alpha(background) * inverse).toInt()
+        val r = (Color.red(foreground) * clamped + Color.red(background) * inverse).toInt()
+        val g = (Color.green(foreground) * clamped + Color.green(background) * inverse).toInt()
+        val b = (Color.blue(foreground) * clamped + Color.blue(background) * inverse).toInt()
+        return Color.argb(a, r, g, b)
     }
 
     private fun openDirectory(path: String) {
@@ -658,6 +963,10 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     }
 
     override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {
+        fileManagerControllerCommands.openPathAndHighlight(targetPath, highlightPaths)
+    }
+
+    fun openPathAndHighlightInCurrentWorkspace(targetPath: String, highlightPaths: ArrayList<String>) {
         val normalizedTarget = clampToVisiblePath(targetPath.trimEnd('/').ifEmpty { "/" })
         val normalizedHighlights = LinkedHashSet<String>()
         highlightPaths.forEach { raw ->
@@ -735,19 +1044,13 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         val pathCandidates = request.highlightPaths
             .map { it.trimEnd('/').ifEmpty { "/" } }
             .toSet()
-        val nameCandidates = request.highlightPaths
-            .map { it.getFilenameFromPath() }
-            .filter { it.isNotBlank() }
-            .toSet()
 
         val matchedPaths = ArrayList<String>()
         var firstIndex = -1
         items.forEachIndexed { index, item ->
             if (item.isSectionTitle || item.isGridTypeDivider) return@forEachIndexed
             val normalizedItemPath = item.path.trimEnd('/').ifEmpty { "/" }
-            val directMatch = pathCandidates.contains(normalizedItemPath)
-            val nameMatch = nameCandidates.any { expected -> isSameOrIndexedConflictName(expected, item.name) }
-            if (directMatch || nameMatch) {
+            if (pathCandidates.contains(normalizedItemPath)) {
                 matchedPaths.add(item.path)
                 if (firstIndex == -1) firstIndex = index
             }
@@ -762,31 +1065,5 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             }
             adapter.highlightPathsOnce(matchedPaths)
         }
-    }
-
-    private fun isSameOrIndexedConflictName(expectedName: String, actualName: String): Boolean {
-        if (expectedName == actualName) return true
-        if (expectedName.isBlank() || actualName.isBlank()) return false
-
-        val expectedDot = expectedName.lastIndexOf('.')
-        val actualDot = actualName.lastIndexOf('.')
-        if (expectedDot > 0 && actualDot > 0) {
-            val expectedExt = expectedName.substring(expectedDot)
-            val actualExt = actualName.substring(actualDot)
-            if (!expectedExt.equals(actualExt, ignoreCase = true)) return false
-            val expectedStem = expectedName.substring(0, expectedDot)
-            val actualStem = actualName.substring(0, actualDot)
-            return actualStem == expectedStem || hasIndexedSuffix(actualStem, expectedStem)
-        }
-
-        return hasIndexedSuffix(actualName, expectedName)
-    }
-
-    private fun hasIndexedSuffix(actual: String, base: String): Boolean {
-        if (!actual.startsWith(base)) return false
-        if (actual.length <= base.length + 2) return false
-        if (actual[base.length] != '(' || actual.last() != ')') return false
-        val number = actual.substring(base.length + 1, actual.length - 1)
-        return number.isNotEmpty() && number.all { it.isDigit() }
     }
 }

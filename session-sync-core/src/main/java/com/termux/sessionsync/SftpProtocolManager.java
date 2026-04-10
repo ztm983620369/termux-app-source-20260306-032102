@@ -572,11 +572,12 @@ public final class SftpProtocolManager {
         Set<String> visitedRemoteDirectories = new HashSet<>();
         Set<String> visitedRemoteFiles = new HashSet<>();
         Set<String> preparedLocalDirectories = new HashSet<>();
+        ArrayList<String> downloadedLocalPaths = new ArrayList<>();
         String firstBuildError = null;
 
         for (String rawVirtualPath : virtualPaths) {
             if (isCancelled(control)) {
-                return DownloadResult.cancelled(tasks.size(), 0, 0, 0L, 0L);
+                return DownloadResult.cancelled(tasks.size(), 0, 0, 0L, 0L, downloadedLocalPaths);
             }
             VirtualTarget target = resolveVirtualTarget(context, rawVirtualPath);
             if (target == null) {
@@ -589,13 +590,14 @@ public final class SftpProtocolManager {
             File topLevelLocal = resumeExistingOutputs
                 ? reserveDestinationRoot(desiredTopLevel, reservedTopLevelPaths)
                 : ensureUniqueDestinationRoot(desiredTopLevel, reservedTopLevelPaths);
+            downloadedLocalPaths.add(topLevelLocal.getAbsolutePath().replace('\\', '/'));
 
             try {
                 collectDownloadTasks(context, target, topLevelLocal, tasks,
                     visitedRemoteDirectories, visitedRemoteFiles, preparedLocalDirectories, control);
             } catch (Exception e) {
                 if (e instanceof OperationCanceledException) {
-                    return DownloadResult.cancelled(tasks.size(), 0, 0, 0L, 0L);
+                    return DownloadResult.cancelled(tasks.size(), 0, 0, 0L, 0L, downloadedLocalPaths);
                 }
                 clearSessionByEntry(target.entry);
                 firstBuildError = classifyExceptionMessage(e);
@@ -617,13 +619,13 @@ public final class SftpProtocolManager {
         }
 
         if (tasks.isEmpty()) {
-            return DownloadResult.ok(0, 0, 0, 0L, 0L);
+            return DownloadResult.ok(0, 0, 0, 0L, 0L, downloadedLocalPaths);
         }
 
         long totalBytes = 0L;
         for (DownloadFileTask task : tasks) {
             if (isCancelled(control)) {
-                return DownloadResult.cancelled(tasks.size(), 0, 0, totalBytes, 0L);
+                return DownloadResult.cancelled(tasks.size(), 0, 0, totalBytes, 0L, downloadedLocalPaths);
             }
             if (task == null) continue;
             if (task.size > 0) totalBytes += task.size;
@@ -705,7 +707,8 @@ public final class SftpProtocolManager {
                         progressState.completedFiles(),
                         progressState.failedFiles(),
                         totalBytes,
-                        progressState.settledBytes()
+                        progressState.settledBytes(),
+                        downloadedLocalPaths
                     );
                     finishDownloadJournal(context, journalHandle, cancelled);
                     return cancelled;
@@ -723,7 +726,8 @@ public final class SftpProtocolManager {
                 progressState.completedFiles(),
                 progressState.failedFiles(),
                 totalBytes,
-                progressState.settledBytes()
+                progressState.settledBytes(),
+                downloadedLocalPaths
             );
             finishDownloadJournal(context, journalHandle, cancelled);
             return cancelled;
@@ -747,7 +751,7 @@ public final class SftpProtocolManager {
         long downloadedBytes = progressState.settledBytes();
 
         if (failedFiles == 0) {
-            DownloadResult result = DownloadResult.ok(tasks.size(), downloadedFiles, 0, totalBytes, downloadedBytes);
+            DownloadResult result = DownloadResult.ok(tasks.size(), downloadedFiles, 0, totalBytes, downloadedBytes, downloadedLocalPaths);
             finishDownloadJournal(context, journalHandle, result);
             return result;
         }
@@ -757,12 +761,12 @@ public final class SftpProtocolManager {
             : firstDownloadError;
         if (downloadedFiles > 0) {
             DownloadResult result = DownloadResult.partial(tasks.size(), downloadedFiles, failedFiles, totalBytes, downloadedBytes,
-                "\u90e8\u5206\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25\uff1a" + reason);
+                "\u90e8\u5206\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25\uff1a" + reason, downloadedLocalPaths);
             finishDownloadJournal(context, journalHandle, result);
             return result;
         }
         DownloadResult result = DownloadResult.failWithStats(tasks.size(), 0, failedFiles, totalBytes, downloadedBytes,
-            "\u4e0b\u8f7d\u5931\u8d25\uff1a" + reason);
+            "\u4e0b\u8f7d\u5931\u8d25\uff1a" + reason, downloadedLocalPaths);
         finishDownloadJournal(context, journalHandle, result);
         return result;
     }
@@ -801,11 +805,12 @@ public final class SftpProtocolManager {
         ArrayList<UploadFileTask> tasks = new ArrayList<>();
         LinkedHashSet<String> remoteDirectories = new LinkedHashSet<>();
         Set<String> reservedRemoteTopLevels = new HashSet<>();
+        ArrayList<String> uploadedVirtualPaths = new ArrayList<>();
 
         String firstBuildError = null;
         for (String rawLocalPath : localPaths) {
             if (isCancelled(control)) {
-                return UploadResult.cancelled(tasks.size(), 0, 0, 0L, 0L);
+                return UploadResult.cancelled(tasks.size(), 0, 0, 0L, 0L, uploadedVirtualPaths);
             }
             if (TextUtils.isEmpty(rawLocalPath)) continue;
 
@@ -829,12 +834,13 @@ public final class SftpProtocolManager {
                 clearSessionByEntry(destination.entry);
                 return UploadResult.fail("\u4e0a\u4f20\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
             }
+            uploadedVirtualPaths.add(destination.virtualRoot + ("/".equals(uniqueRemoteTop) ? "" : uniqueRemoteTop));
 
             try {
                 collectUploadTasksRecursive(localFile, uniqueRemoteTop, tasks, remoteDirectories, control);
             } catch (Exception e) {
                 if (e instanceof OperationCanceledException) {
-                    return UploadResult.cancelled(tasks.size(), 0, 0, 0L, 0L);
+                    return UploadResult.cancelled(tasks.size(), 0, 0, 0L, 0L, uploadedVirtualPaths);
                 }
                 firstBuildError = classifyExceptionMessage(e);
                 break;
@@ -857,7 +863,7 @@ public final class SftpProtocolManager {
             });
         } catch (Exception e) {
             if (e instanceof OperationCanceledException) {
-                return UploadResult.cancelled(tasks.size(), 0, 0, 0L, 0L);
+                return UploadResult.cancelled(tasks.size(), 0, 0, 0L, 0L, uploadedVirtualPaths);
             }
             clearSessionByEntry(destination.entry);
             return UploadResult.fail("\u4e0a\u4f20\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
@@ -867,7 +873,7 @@ public final class SftpProtocolManager {
             synchronized (mLock) {
                 clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(destination.entry));
             }
-            return UploadResult.ok(0, 0, 0, 0L, 0L);
+            return UploadResult.ok(0, 0, 0, 0L, 0L, uploadedVirtualPaths);
         }
 
         long totalBytes = 0L;
@@ -927,7 +933,8 @@ public final class SftpProtocolManager {
                         progressState.completedFiles(),
                         progressState.failedFiles(),
                         totalBytes,
-                        progressState.settledBytes()
+                        progressState.settledBytes(),
+                        uploadedVirtualPaths
                     );
                     finishUploadJournal(context, journalHandle, cancelled);
                     return cancelled;
@@ -945,7 +952,8 @@ public final class SftpProtocolManager {
                 progressState.completedFiles(),
                 progressState.failedFiles(),
                 totalBytes,
-                progressState.settledBytes()
+                progressState.settledBytes(),
+                uploadedVirtualPaths
             );
             finishUploadJournal(context, journalHandle, cancelled);
             return cancelled;
@@ -972,7 +980,7 @@ public final class SftpProtocolManager {
         long uploadedBytes = progressState.settledBytes();
 
         if (failedFiles == 0) {
-            UploadResult result = UploadResult.ok(tasks.size(), uploadedFiles, 0, totalBytes, uploadedBytes);
+            UploadResult result = UploadResult.ok(tasks.size(), uploadedFiles, 0, totalBytes, uploadedBytes, uploadedVirtualPaths);
             finishUploadJournal(context, journalHandle, result);
             return result;
         }
@@ -982,12 +990,12 @@ public final class SftpProtocolManager {
             : firstUploadError;
         if (uploadedFiles > 0) {
             UploadResult result = UploadResult.partial(tasks.size(), uploadedFiles, failedFiles, totalBytes, uploadedBytes,
-                "\u90e8\u5206\u6587\u4ef6\u4e0a\u4f20\u5931\u8d25\uff1a" + reason);
+                "\u90e8\u5206\u6587\u4ef6\u4e0a\u4f20\u5931\u8d25\uff1a" + reason, uploadedVirtualPaths);
             finishUploadJournal(context, journalHandle, result);
             return result;
         }
         UploadResult result = UploadResult.failWithStats(tasks.size(), 0, failedFiles, totalBytes, uploadedBytes,
-            "\u4e0a\u4f20\u5931\u8d25\uff1a" + reason);
+            "\u4e0a\u4f20\u5931\u8d25\uff1a" + reason, uploadedVirtualPaths);
         finishUploadJournal(context, journalHandle, result);
         return result;
     }
@@ -1130,7 +1138,8 @@ public final class SftpProtocolManager {
             localSize,
             localSize,
             remoteModifiedMsHolder[0],
-            remoteSizeHolder[0]
+            remoteSizeHolder[0],
+            new ArrayList<>()
         );
     }
 
@@ -1202,7 +1211,7 @@ public final class SftpProtocolManager {
         boolean resumeExistingStage = !TextUtils.isEmpty(stageDirectoryPath);
         try {
             if (isCancelled(control)) {
-                finalResult = RemoteTransferResult.cancelled(0, 0, 0, 0L, 0L);
+                finalResult = RemoteTransferResult.cancelled(0, 0, 0, 0L, 0L, new ArrayList<>());
                 return finalResult;
             }
 
@@ -1247,7 +1256,8 @@ public final class SftpProtocolManager {
                     downloadResult.downloadedFiles,
                     downloadResult.failedFiles,
                     downloadResult.totalBytes,
-                    downloadResult.downloadedBytes
+                    downloadResult.downloadedBytes,
+                    new ArrayList<>()
                 );
                 return finalResult;
             }
@@ -1259,7 +1269,8 @@ public final class SftpProtocolManager {
                     downloadResult.failedFiles,
                     downloadResult.totalBytes,
                     downloadResult.downloadedBytes,
-                    downloadResult.messageCn
+                    downloadResult.messageCn,
+                    new ArrayList<>()
                 );
                 return finalResult;
             }
@@ -1288,7 +1299,8 @@ public final class SftpProtocolManager {
                     uploadResult.uploadedFiles,
                     uploadResult.failedFiles,
                     uploadResult.totalBytes,
-                    uploadResult.uploadedBytes
+                    uploadResult.uploadedBytes,
+                    uploadResult.uploadedVirtualPaths
                 );
                 return finalResult;
             }
@@ -1299,7 +1311,8 @@ public final class SftpProtocolManager {
                     uploadResult.uploadedFiles,
                     uploadResult.failedFiles,
                     uploadResult.totalBytes,
-                    uploadResult.uploadedBytes
+                    uploadResult.uploadedBytes,
+                    uploadResult.uploadedVirtualPaths
                 );
                 return finalResult;
             }
@@ -1310,7 +1323,8 @@ public final class SftpProtocolManager {
                 uploadResult.failedFiles,
                 uploadResult.totalBytes,
                 uploadResult.uploadedBytes,
-                uploadResult.messageCn
+                uploadResult.messageCn,
+                uploadResult.uploadedVirtualPaths
             );
             return finalResult;
         } catch (Exception e) {
@@ -4323,6 +4337,8 @@ public final class SftpProtocolManager {
         public final long totalBytes;
         public final long downloadedBytes;
         @NonNull
+        public final ArrayList<String> downloadedLocalPaths;
+        @NonNull
         public final String messageCn;
 
         private DownloadResult(boolean success,
@@ -4331,6 +4347,7 @@ public final class SftpProtocolManager {
                                int failedFiles,
                                long totalBytes,
                                long downloadedBytes,
+                               @NonNull ArrayList<String> downloadedLocalPaths,
                                @NonNull String messageCn) {
             this.success = success;
             this.totalFiles = Math.max(0, totalFiles);
@@ -4338,40 +4355,45 @@ public final class SftpProtocolManager {
             this.failedFiles = Math.max(0, failedFiles);
             this.totalBytes = Math.max(0L, totalBytes);
             this.downloadedBytes = Math.max(0L, downloadedBytes);
+            this.downloadedLocalPaths = new ArrayList<>(downloadedLocalPaths);
             this.messageCn = messageCn;
         }
 
         @NonNull
         static DownloadResult ok(int totalFiles, int downloadedFiles, int failedFiles,
-                                 long totalBytes, long downloadedBytes) {
+                                 long totalBytes, long downloadedBytes,
+                                 @NonNull ArrayList<String> downloadedLocalPaths) {
             return new DownloadResult(true, totalFiles, downloadedFiles, failedFiles,
-                totalBytes, downloadedBytes, "");
+                totalBytes, downloadedBytes, downloadedLocalPaths, "");
         }
 
         @NonNull
         static DownloadResult partial(int totalFiles, int downloadedFiles, int failedFiles,
-                                      long totalBytes, long downloadedBytes, @NonNull String messageCn) {
+                                      long totalBytes, long downloadedBytes, @NonNull String messageCn,
+                                      @NonNull ArrayList<String> downloadedLocalPaths) {
             return new DownloadResult(false, totalFiles, downloadedFiles, failedFiles,
-                totalBytes, downloadedBytes, messageCn);
+                totalBytes, downloadedBytes, downloadedLocalPaths, messageCn);
         }
 
         @NonNull
         static DownloadResult fail(@NonNull String messageCn) {
-            return new DownloadResult(false, 0, 0, 0, 0L, 0L, messageCn);
+            return new DownloadResult(false, 0, 0, 0, 0L, 0L, new ArrayList<>(), messageCn);
         }
 
         @NonNull
         static DownloadResult cancelled(int totalFiles, int downloadedFiles, int failedFiles,
-                                        long totalBytes, long downloadedBytes) {
+                                        long totalBytes, long downloadedBytes,
+                                        @NonNull ArrayList<String> downloadedLocalPaths) {
             return new DownloadResult(false, totalFiles, downloadedFiles, failedFiles,
-                totalBytes, downloadedBytes, "\u4e0b\u8f7d\u5df2\u53d6\u6d88");
+                totalBytes, downloadedBytes, downloadedLocalPaths, "\u4e0b\u8f7d\u5df2\u53d6\u6d88");
         }
 
         @NonNull
         static DownloadResult failWithStats(int totalFiles, int downloadedFiles, int failedFiles,
-                                            long totalBytes, long downloadedBytes, @NonNull String messageCn) {
+                                            long totalBytes, long downloadedBytes, @NonNull String messageCn,
+                                            @NonNull ArrayList<String> downloadedLocalPaths) {
             return new DownloadResult(false, totalFiles, downloadedFiles, failedFiles,
-                totalBytes, downloadedBytes, messageCn);
+                totalBytes, downloadedBytes, downloadedLocalPaths, messageCn);
         }
     }
 
@@ -4423,6 +4445,8 @@ public final class SftpProtocolManager {
         public final long remoteModifiedMs;
         public final long remoteSize;
         @NonNull
+        public final ArrayList<String> uploadedVirtualPaths;
+        @NonNull
         public final String messageCn;
 
         private UploadResult(boolean success,
@@ -4431,8 +4455,9 @@ public final class SftpProtocolManager {
                              int failedFiles,
                              long totalBytes,
                              long uploadedBytes,
+                             @NonNull ArrayList<String> uploadedVirtualPaths,
                              @NonNull String messageCn) {
-            this(success, totalFiles, uploadedFiles, failedFiles, totalBytes, uploadedBytes, messageCn, -1L, -1L);
+            this(success, totalFiles, uploadedFiles, failedFiles, totalBytes, uploadedBytes, uploadedVirtualPaths, messageCn, -1L, -1L);
         }
 
         private UploadResult(boolean success,
@@ -4441,6 +4466,7 @@ public final class SftpProtocolManager {
                              int failedFiles,
                              long totalBytes,
                              long uploadedBytes,
+                             @NonNull ArrayList<String> uploadedVirtualPaths,
                              @NonNull String messageCn,
                              long remoteModifiedMs,
                              long remoteSize) {
@@ -4452,48 +4478,54 @@ public final class SftpProtocolManager {
             this.uploadedBytes = Math.max(0L, uploadedBytes);
             this.remoteModifiedMs = remoteModifiedMs;
             this.remoteSize = remoteSize;
+            this.uploadedVirtualPaths = new ArrayList<>(uploadedVirtualPaths);
             this.messageCn = messageCn;
         }
 
         @NonNull
         static UploadResult ok(int totalFiles, int uploadedFiles, int failedFiles,
-                               long totalBytes, long uploadedBytes) {
+                               long totalBytes, long uploadedBytes,
+                               @NonNull ArrayList<String> uploadedVirtualPaths) {
             return new UploadResult(true, totalFiles, uploadedFiles, failedFiles,
-                totalBytes, uploadedBytes, "");
+                totalBytes, uploadedBytes, uploadedVirtualPaths, "");
         }
 
         @NonNull
         static UploadResult okWithRemote(int totalFiles, int uploadedFiles, int failedFiles,
                                          long totalBytes, long uploadedBytes,
-                                         long remoteModifiedMs, long remoteSize) {
+                                         long remoteModifiedMs, long remoteSize,
+                                         @NonNull ArrayList<String> uploadedVirtualPaths) {
             return new UploadResult(true, totalFiles, uploadedFiles, failedFiles,
-                totalBytes, uploadedBytes, "", remoteModifiedMs, remoteSize);
+                totalBytes, uploadedBytes, uploadedVirtualPaths, "", remoteModifiedMs, remoteSize);
         }
 
         @NonNull
         static UploadResult partial(int totalFiles, int uploadedFiles, int failedFiles,
-                                    long totalBytes, long uploadedBytes, @NonNull String messageCn) {
+                                    long totalBytes, long uploadedBytes, @NonNull String messageCn,
+                                    @NonNull ArrayList<String> uploadedVirtualPaths) {
             return new UploadResult(false, totalFiles, uploadedFiles, failedFiles,
-                totalBytes, uploadedBytes, messageCn);
+                totalBytes, uploadedBytes, uploadedVirtualPaths, messageCn);
         }
 
         @NonNull
         static UploadResult fail(@NonNull String messageCn) {
-            return new UploadResult(false, 0, 0, 0, 0L, 0L, messageCn);
+            return new UploadResult(false, 0, 0, 0, 0L, 0L, new ArrayList<>(), messageCn);
         }
 
         @NonNull
         static UploadResult cancelled(int totalFiles, int uploadedFiles, int failedFiles,
-                                      long totalBytes, long uploadedBytes) {
+                                      long totalBytes, long uploadedBytes,
+                                      @NonNull ArrayList<String> uploadedVirtualPaths) {
             return new UploadResult(false, totalFiles, uploadedFiles, failedFiles,
-                totalBytes, uploadedBytes, "\u4e0a\u4f20\u5df2\u53d6\u6d88");
+                totalBytes, uploadedBytes, uploadedVirtualPaths, "\u4e0a\u4f20\u5df2\u53d6\u6d88");
         }
 
         @NonNull
         static UploadResult failWithStats(int totalFiles, int uploadedFiles, int failedFiles,
-                                          long totalBytes, long uploadedBytes, @NonNull String messageCn) {
+                                          long totalBytes, long uploadedBytes, @NonNull String messageCn,
+                                          @NonNull ArrayList<String> uploadedVirtualPaths) {
             return new UploadResult(false, totalFiles, uploadedFiles, failedFiles,
-                totalBytes, uploadedBytes, messageCn);
+                totalBytes, uploadedBytes, uploadedVirtualPaths, messageCn);
         }
     }
 
@@ -4555,6 +4587,8 @@ public final class SftpProtocolManager {
         public final long totalBytes;
         public final long transferredBytes;
         @NonNull
+        public final ArrayList<String> transferredVirtualPaths;
+        @NonNull
         public final String messageCn;
 
         private RemoteTransferResult(boolean success,
@@ -4563,6 +4597,7 @@ public final class SftpProtocolManager {
                                      int failedFiles,
                                      long totalBytes,
                                      long transferredBytes,
+                                     @NonNull ArrayList<String> transferredVirtualPaths,
                                      @NonNull String messageCn) {
             this.success = success;
             this.totalFiles = Math.max(0, totalFiles);
@@ -4570,6 +4605,7 @@ public final class SftpProtocolManager {
             this.failedFiles = Math.max(0, failedFiles);
             this.totalBytes = Math.max(0L, totalBytes);
             this.transferredBytes = Math.max(0L, transferredBytes);
+            this.transferredVirtualPaths = new ArrayList<>(transferredVirtualPaths);
             this.messageCn = messageCn;
         }
 
@@ -4578,14 +4614,15 @@ public final class SftpProtocolManager {
                                        int transferredFiles,
                                        int failedFiles,
                                        long totalBytes,
-                                       long transferredBytes) {
+                                       long transferredBytes,
+                                       @NonNull ArrayList<String> transferredVirtualPaths) {
             return new RemoteTransferResult(true, totalFiles, transferredFiles, failedFiles,
-                totalBytes, transferredBytes, "");
+                totalBytes, transferredBytes, transferredVirtualPaths, "");
         }
 
         @NonNull
         static RemoteTransferResult fail(@NonNull String messageCn) {
-            return new RemoteTransferResult(false, 0, 0, 0, 0L, 0L, messageCn);
+            return new RemoteTransferResult(false, 0, 0, 0, 0L, 0L, new ArrayList<>(), messageCn);
         }
 
         @NonNull
@@ -4593,9 +4630,10 @@ public final class SftpProtocolManager {
                                               int transferredFiles,
                                               int failedFiles,
                                               long totalBytes,
-                                              long transferredBytes) {
+                                              long transferredBytes,
+                                              @NonNull ArrayList<String> transferredVirtualPaths) {
             return new RemoteTransferResult(false, totalFiles, transferredFiles, failedFiles,
-                totalBytes, transferredBytes, "\u670d\u52a1\u5668\u4e92\u4f20\u5df2\u53d6\u6d88");
+                totalBytes, transferredBytes, transferredVirtualPaths, "\u670d\u52a1\u5668\u4e92\u4f20\u5df2\u53d6\u6d88");
         }
 
         @NonNull
@@ -4604,9 +4642,10 @@ public final class SftpProtocolManager {
                                                   int failedFiles,
                                                   long totalBytes,
                                                   long transferredBytes,
-                                                  @NonNull String messageCn) {
+                                                  @NonNull String messageCn,
+                                                  @NonNull ArrayList<String> transferredVirtualPaths) {
             return new RemoteTransferResult(false, totalFiles, transferredFiles, failedFiles,
-                totalBytes, transferredBytes, messageCn);
+                totalBytes, transferredBytes, transferredVirtualPaths, messageCn);
         }
     }
 

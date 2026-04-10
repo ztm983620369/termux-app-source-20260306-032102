@@ -124,7 +124,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
 
     override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {
         openManagedPath(targetPath, forceRefresh = true)
-        activeItemsFragment()?.openPathAndHighlight(targetPath, highlightPaths)
+        activeItemsFragment()?.openPathAndHighlightInCurrentWorkspace(targetPath, highlightPaths)
     }
 
     fun shellState(): WorkspaceShellState = requireState()
@@ -192,6 +192,13 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         notifyWorkspaceStateChanged()
     }
 
+    fun closeActiveWorkspaceTabIfPossible(): Boolean {
+        val activeTabId = shellState?.activeTabId ?: return false
+        if (activeTabId == HOME_TAB_ID) return false
+        closeWorkspaceTab(activeTabId)
+        return true
+    }
+
     fun handleBackPressedWithinWorkspaces(): Boolean {
         val state = shellState ?: return false
         val activeTab = state.activeTab ?: return false
@@ -205,7 +212,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         }
 
         if (activeTab.id != HOME_TAB_ID) {
-            selectWorkspaceTab(HOME_TAB_ID)
+            closeWorkspaceTab(activeTab.id)
             return true
         }
 

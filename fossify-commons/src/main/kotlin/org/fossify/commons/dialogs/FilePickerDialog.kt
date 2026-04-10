@@ -537,15 +537,23 @@ class FilePickerDialog(
         if (targetScope != TargetScope.REMOTE_ONLY) {
             addWorkspace("Termux", termuxRootPath)
 
+            val localRoots = LinkedHashSet<String>()
             val internal = activity.internalStoragePath.trimEnd('/')
             if (internal.isNotEmpty() && activity.getDoesFilePathExist(internal)) {
-                addWorkspace("手机存储", internal)
+                localRoots.add(internal)
             }
-
             activity.getStorageDirectories().forEach { root ->
                 val normalized = root.trimEnd('/')
                 if (normalized.isNotEmpty() && activity.getDoesFilePathExist(normalized)) {
-                    addWorkspace("存储 / $normalized", normalized)
+                    localRoots.add(normalized)
+                }
+            }
+
+            localRoots.forEach { root ->
+                val storageLabel = if (root == internal) "手机存储" else "存储 / $root"
+                addWorkspace(storageLabel, root)
+                buildSystemDirectoryItems(root).forEach { (name, path) ->
+                    addWorkspace("$storageLabel / $name", path)
                 }
             }
         }
@@ -559,6 +567,32 @@ class FilePickerDialog(
         }
 
         return items
+    }
+
+    private fun buildSystemDirectoryItems(rootPath: String): List<Pair<String, String>> {
+        val root = rootPath.trimEnd('/')
+        if (root.isEmpty()) return emptyList()
+
+        val candidates = linkedMapOf(
+            "Documents" to File(root, Environment.DIRECTORY_DOCUMENTS).absolutePath,
+            "Downloads" to File(root, Environment.DIRECTORY_DOWNLOADS).absolutePath,
+            "DCIM" to File(root, Environment.DIRECTORY_DCIM).absolutePath,
+            "Pictures" to File(root, Environment.DIRECTORY_PICTURES).absolutePath,
+            "Movies" to File(root, Environment.DIRECTORY_MOVIES).absolutePath,
+            "Music" to File(root, Environment.DIRECTORY_MUSIC).absolutePath,
+            "Podcasts" to File(root, Environment.DIRECTORY_PODCASTS).absolutePath,
+            "Audiobooks" to File(root, Environment.DIRECTORY_AUDIOBOOKS).absolutePath,
+            "Android/data" to File(root, "Android/data").absolutePath,
+            "Android/obb" to File(root, "Android/obb").absolutePath
+        )
+
+        return candidates.mapNotNull { (label, path) ->
+            if (activity.getDoesFilePathExist(path) && activity.getIsPathDirectory(path)) {
+                label to path
+            } else {
+                null
+            }
+        }
     }
 
     private fun preferredLocalRoot(): String {

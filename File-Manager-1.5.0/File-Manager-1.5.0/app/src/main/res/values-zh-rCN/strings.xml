@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="show_termux_system_dirs">显示 Termux 系统目录</string>
-    <string name="hide_termux_system_dirs">隐藏 Termux 系统目录</string>
-    <string name="termux_system_dirs">Termux 系统目录</string>
+    <string name="show_termux_system_dirs">显示手机系统目录</string>
+    <string name="hide_termux_system_dirs">隐藏手机系统目录</string>
+    <string name="termux_system_dirs">系统目录</string>
     <string name="industrial_self_test_title">工业级别自检测</string>
     <string name="industrial_self_test_failed_title">工业级别自检测完成，但存在失败项</string>
     <string name="industrial_self_test_running">工业级别自检测已经在运行中</string>
