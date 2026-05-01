@@ -8,7 +8,6 @@ import android.content.Context;
 import android.media.AudioManager;
 import android.os.Environment;
 import android.text.TextUtils;
-import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -52,7 +51,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
-import androidx.drawerlayout.widget.DrawerLayout;
 import androidx.annotation.Nullable;
 
 public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
@@ -122,7 +120,13 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
      */
     public void onResume() {
         TerminalView terminalView = mActivity.getTerminalView();
-        if (terminalView != null && mResumeSoftKeyboardVisibleOverride != null) {
+        if (mActivity.isEmbeddedTerminalWorkspaceVisible() && mActivity.isEmbeddedTerminalImeActive()) {
+            if (mResumeSoftKeyboardVisibleOverride != null) {
+                mActivity.restoreEmbeddedTerminalIme(Boolean.TRUE.equals(mResumeSoftKeyboardVisibleOverride));
+            }
+            mResumeSoftKeyboardVisibleOverride = null;
+            mResumeSoftKeyboardRequestTerminalFocus = true;
+        } else if (terminalView != null && mResumeSoftKeyboardVisibleOverride != null) {
             bindTerminalViewKeyboardBehavior(terminalView);
             boolean visible = mResumeSoftKeyboardVisibleOverride;
             if (visible) {
@@ -151,7 +155,6 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             mResumeSoftKeyboardVisibleOverride = null;
             mResumeSoftKeyboardRequestTerminalFocus = true;
         } else {
-            // Show the soft keyboard if required
             setSoftKeyboardState(true, mActivity.isActivityRecreated());
         }
 
@@ -279,12 +282,21 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
         boolean pinnedSshSession = mTermuxTerminalSessionActivityClient.isSshSessionPinned(currentSession);
         if ((!term.isMouseTrackingActive() || pinnedSshSession) && !e.isFromSource(InputDevice.SOURCE_MOUSE)) {
+            if (mActivity.isEmbeddedTerminalWorkspaceVisible()) {
+                mActivity.reactivateSharedImeForEmbeddedTerminal();
+                return;
+            }
             if (!KeyboardUtils.areDisableSoftKeyboardFlagsSet(mActivity)) {
                 setProgrammaticTerminalFocusAllowed(true);
                 KeyboardUtils.showSoftKeyboard(mActivity, terminalView);
             } else
                 Logger.logVerbose(LOG_TAG, "Not showing soft keyboard onSingleTapUp since its disabled");
         }
+    }
+
+    @Override
+    public boolean shouldTerminalViewRequestFocusOnTap() {
+        return !mActivity.isEmbeddedTerminalWorkspaceVisible();
     }
 
     @Override
@@ -324,8 +336,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     @Override
     public void copyModeChanged(boolean copyMode) {
-        // Disable drawer while copying.
-        mActivity.getDrawer().setDrawerLockMode(copyMode ? DrawerLayout.LOCK_MODE_LOCKED_CLOSED : DrawerLayout.LOCK_MODE_UNLOCKED);
+        mActivity.closeAndLockSessionDrawer();
     }
 
 
@@ -348,7 +359,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             } else if (keyCode == KeyEvent.KEYCODE_DPAD_UP || unicodeChar == 'p' /* previous */) {
                 mTermuxTerminalSessionActivityClient.switchToSession(false);
             } else if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                mActivity.getDrawer().openDrawer(Gravity.LEFT);
+                mActivity.closeAndLockSessionDrawer();
             } else if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
                 mActivity.getDrawer().closeDrawers();
             } else if (unicodeChar == 'k'/* keyboard */) {
@@ -670,10 +681,43 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         }
     }
 
+    public void showSoftKeyboardForTerminal() {
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView == null) return;
+
+        bindTerminalViewKeyboardBehavior(terminalView);
+        KeyboardUtils.setSoftInputModeAdjustResize(mActivity);
+        KeyboardUtils.clearDisableSoftKeyboardFlags(mActivity);
+        setProgrammaticTerminalFocusAllowed(true);
+        terminalView.requestFocusFromTouch();
+        terminalView.requestFocus();
+        KeyboardUtils.showSoftKeyboard(mActivity, terminalView);
+        terminalView.postDelayed(getShowSoftKeyboardRunnable(), 100);
+    }
+
+    public void hideSoftKeyboardForTerminal() {
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView == null) return;
+
+        KeyboardUtils.hideSoftKeyboard(mActivity, terminalView);
+    }
+
+    public void toggleSoftKeyboardForTerminal() {
+        if (KeyboardUtils.isSoftKeyboardVisible(mActivity)) {
+            hideSoftKeyboardForTerminal();
+        } else {
+            showSoftKeyboardForTerminal();
+        }
+    }
+
     public void bindTerminalViewKeyboardBehavior(TerminalView terminalView) {
         if (terminalView == null) return;
 
         terminalView.setOnFocusChangeListener((view, hasFocus) -> {
+            if (mActivity.isEmbeddedTerminalWorkspaceVisible() && mActivity.isEmbeddedTerminalImeActive()) {
+                Logger.logVerbose(LOG_TAG, "Ignoring terminal focus change while embedded IME proxy is active");
+                return;
+            }
             if (mPreserveSoftKeyboardOnSessionSwitch || mPreparedSoftKeyboardStateForSessionSwitch) {
                 Logger.logVerbose(LOG_TAG, "Preserving soft keyboard state during terminal switch");
                 return;
@@ -773,6 +817,10 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     }
 
     private void restorePreservedSoftKeyboardStateAfterSessionSwitch() {
+        if (mActivity.isEmbeddedTerminalWorkspaceVisible() && mActivity.isEmbeddedTerminalImeActive()) {
+            mActivity.restoreEmbeddedTerminalIme(mPreservedSoftKeyboardVisibleOnSessionSwitch);
+            return;
+        }
         EditText textInputView = mActivity.findViewById(R.id.terminal_surface_text_input);
         boolean textInputViewHasFocus = textInputView != null && textInputView.hasFocus();
         TerminalView terminalView = mActivity.getTerminalView();

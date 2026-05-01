@@ -7,11 +7,14 @@ import com.duolingo.open.rtlviewpager.RtlViewPager
 
 open class MyViewPager : RtlViewPager {
 
+    var isSwipeEnabled: Boolean = true
+
     constructor(context: Context) : super(context)
 
     constructor(context: Context, attrs: AttributeSet) : super(context, attrs)
 
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        if (!isSwipeEnabled) return false
         return try {
             super.onInterceptTouchEvent(ev)
         } catch (ignored: Exception) {
@@ -20,6 +23,7 @@ open class MyViewPager : RtlViewPager {
     }
 
     override fun onTouchEvent(ev: MotionEvent): Boolean {
+        if (!isSwipeEnabled) return false
         return try {
             super.onTouchEvent(ev)
         } catch (ignored: Exception) {

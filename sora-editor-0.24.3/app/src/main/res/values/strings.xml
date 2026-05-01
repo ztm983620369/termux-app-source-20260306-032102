@@ -53,6 +53,7 @@
     <string name="vscode_typeface">VS Code字体</string>
     <string name="switch_typeface">Switch Typeface</string>
     <string name="format">Format</string>
+    <string name="restart_server">Restart server</string>
     <string name="code_navi">Code Navigation</string>
     <string name="navi_err_msg">Code navigation not prepared or unsupported</string>
     <string name="color_scheme">Color Scheme</string>
@@ -85,6 +86,7 @@
     <string name="open_debug_document">Open View.java</string>
     <string name="debug">Debug</string>
     <string name="layout_tv_search_options">Options</string>
+    <string name="close_search">Close search</string>
     <string name="search_option_regex">Regex</string>
     <string name="search_option_whole_word">Whole Word</string>
     <string name="search_option_match_case">Match Case</string>

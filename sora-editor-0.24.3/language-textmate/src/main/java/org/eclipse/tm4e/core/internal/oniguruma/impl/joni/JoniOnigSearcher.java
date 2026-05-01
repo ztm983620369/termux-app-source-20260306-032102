@@ -37,31 +37,18 @@ final class JoniOnigSearcher {
 	}
 
 	private static JoniOnigRegExp createRegExp(String exp) {
+		// workaround for regular expressions that are unsupported by joni
+		// from https://github.com/JetBrains/intellij-community/blob/881c9bc397b850bad1d393a67bcbc82861d55d79/plugins/textmate/core/src/org/jetbrains/plugins/textmate/regex/joni/JoniRegexFactory.kt#L32
 		try {
 			return new JoniOnigRegExp(exp);
 		} catch (TMException e) {
 			if (e.getCause() instanceof JOniException) {
-				final var normalized = normalizePatternForJoni(exp);
-				if (!normalized.equals(exp)) {
-					try {
-						return new JoniOnigRegExp(normalized);
-					} catch (TMException ignored) {
-					}
-				}
+				e.printStackTrace();
 				return new JoniOnigRegExp("^$");
 			} else {
 				throw e;
 			}
 		}
-	}
-
-	private static String normalizePatternForJoni(final String pattern) {
-		var p = pattern;
-		p = p.replace("++", "+");
-		p = p.replace("*+", "*");
-		p = p.replace("?+", "?");
-		p = p.replace("}+", "}");
-		return p;
 	}
 
 	@Nullable

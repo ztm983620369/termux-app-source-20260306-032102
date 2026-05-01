@@ -52,9 +52,12 @@ class LocalSocketStreamConnectionProvider(
     override val outputStream: OutputStream
         get() = socket.getOutputStream()
 
+    override val isClosed: Boolean
+        get() = !::socket.isInitialized || socket.isClosed
+
     override fun close() {
         try {
-            socket.close()
+            socket.shutdownOutput()
         } catch (e: Exception) {
             e.printStackTrace()
         }

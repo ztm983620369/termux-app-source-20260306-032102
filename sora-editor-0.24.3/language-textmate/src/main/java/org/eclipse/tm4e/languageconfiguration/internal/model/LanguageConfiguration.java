@@ -323,41 +323,13 @@ public class LanguageConfiguration {
     }
 
     private static @Nullable String getAsString(@Nullable final JsonElement element) {
-        if (element == null) {
-            return null;
-        }
-        try {
-            if (element.isJsonPrimitive()) {
+        if (element != null)
+            try {
                 return element.getAsString();
+            } catch (final Exception ex) {
+                log.e("Failed to convert JSON element [" + element + "] to String.", ex);
             }
-            if (element.isJsonObject()) {
-                final var obj = element.getAsJsonObject();
-                final var comment = obj.get("comment");
-                if (comment != null && comment.isJsonPrimitive()) {
-                    return comment.getAsString();
-                }
-                final var pattern = obj.get("pattern");
-                if (pattern != null && pattern.isJsonPrimitive()) {
-                    return pattern.getAsString();
-                }
-                final var value = obj.get("value");
-                if (value != null && value.isJsonPrimitive()) {
-                    return value.getAsString();
-                }
-                return null;
-            }
-            if (element.isJsonArray()) {
-                final var arr = element.getAsJsonArray();
-                if (arr.size() == 1) {
-                    return getAsString(arr.get(0));
-                }
-                return null;
-            }
-            return null;
-        } catch (final Exception ex) {
-            log.e("Failed to convert JSON element [" + element + "] to String.", ex);
-            return null;
-        }
+        return null;
     }
 
     private static boolean getAsBoolean(@Nullable final JsonElement element, final boolean defaultValue) {

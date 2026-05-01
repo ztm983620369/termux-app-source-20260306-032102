@@ -8,10 +8,13 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Parcelable
 import android.os.SystemClock
 import android.util.AttributeSet
+import android.view.MotionEvent
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.recyclerview.widget.GridLayoutManager
+import com.termux.bridge.RecentFileEntry
+import com.termux.bridge.RecentFileHistory
 import com.termux.sessionsync.SftpProtocolManager
 import org.fossify.commons.activities.BaseSimpleActivity
 import org.fossify.commons.extensions.*
@@ -41,6 +44,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerFragment<MyViewPagerFragment.ItemsInnerBinding>(context, attributeSet),
     ItemOperationsListener {
+    companion object {
+        private const val RECENTS_LIMIT = 200
+    }
+
     interface DirectoryNavigationHandler {
         fun onDirectoryNavigationRequested(
             fragment: ItemsFragment,
@@ -50,15 +57,22 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         ): Boolean
     }
 
+    private enum class ContentMode {
+        DIRECTORY,
+        RECENTS
+    }
+
     private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
     private var showHidden = false
     private var lastSearchedText = ""
     private var scrollStates = HashMap<String, Parcelable>()
     private var zoomListener: MyRecyclerView.MyZoomListener? = null
     private var pendingRevealRequest: RevealRequest? = null
+    private var contentMode = ContentMode.DIRECTORY
 
     private var storedItems = ArrayList<ListItem>()
     private var itemsIgnoringSearch = ArrayList<ListItem>()
+    private var recentEntriesByPath = linkedMapOf<String, RecentFileEntry>()
     private lateinit var binding: ItemsFragmentBinding
     var directoryNavigationHandler: DirectoryNavigationHandler? = null
     var pathChangedListener: ((String) -> Unit)? = null
@@ -67,6 +81,11 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         val targetPath: String,
         val highlightPaths: Set<String>,
         val createdAtMs: Long = SystemClock.elapsedRealtime()
+    )
+
+    private data class RecentListResult(
+        val items: ArrayList<ListItem>,
+        val entriesByPath: LinkedHashMap<String, RecentFileEntry>
     )
 
     override fun onFinishInflate() {
@@ -80,6 +99,10 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             this.activity = activity
             binding.apply {
                 pathBarHolder.setOnClickListener {
+                    if (contentMode == ContentMode.RECENTS) {
+                        showDirectoryContents(forceRefresh = true)
+                        return@setOnClickListener
+                    }
                     if (NavigatorFolderHelper.isNavigatorPath(activity, currentPath)) {
                         return@setOnClickListener
                     }
@@ -91,7 +114,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                     openPath(parent, forceRefresh = true)
                 }
                 pathBarHolder.setOnLongClickListener {
-                    fileManagerControllerCommands.showSessionSwitcher()
+                    fileManagerControllerCommands.showPathBarActions(it, currentPath)
                     true
                 }
                 itemsSwipeRefresh.setOnRefreshListener { refreshFragment() }
@@ -142,11 +165,42 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         getRecyclerAdapter()?.finishActMode()
     }
 
+    fun isShowingFolderRecents(): Boolean = contentMode == ContentMode.RECENTS
+
+    fun toggleFolderRecentsMode(): Boolean {
+        return if (isShowingFolderRecents()) {
+            showDirectoryContents(forceRefresh = true)
+        } else {
+            showFolderRecents(forceRefresh = true)
+        }
+    }
+
+    fun showFolderRecents(forceRefresh: Boolean = false): Boolean {
+        val changed = contentMode != ContentMode.RECENTS
+        contentMode = ContentMode.RECENTS
+        if (changed || forceRefresh) {
+            loadCurrentFolderRecents(forceRefresh = true)
+        }
+        return true
+    }
+
+    fun showDirectoryContents(forceRefresh: Boolean = false): Boolean {
+        val changed = contentMode != ContentMode.DIRECTORY
+        contentMode = ContentMode.DIRECTORY
+        recentEntriesByPath.clear()
+        if (changed || forceRefresh) {
+            openPath(currentPath, forceRefresh = true)
+        }
+        return changed || forceRefresh
+    }
+
     fun openPath(path: String, forceRefresh: Boolean = false) {
         if ((activity as? BaseSimpleActivity)?.isAskingPermissions == true) {
             return
         }
 
+        contentMode = ContentMode.DIRECTORY
+        recentEntriesByPath.clear()
         var realPath = path.trimEnd('/')
         if (realPath.isEmpty()) {
             realPath = "/"
@@ -193,21 +247,22 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     private fun addItems(items: ArrayList<ListItem>, forceRefresh: Boolean = false) {
         activity?.runOnUiThread {
             binding.itemsSwipeRefresh.isRefreshing = false
-            val ctx = context
-            binding.pathBarText.text = if (ctx != null) {
-                if (NavigatorFolderHelper.isNavigatorPath(ctx, currentPath)) {
-                    NavigatorFolderHelper.displayTitle()
-                } else {
-                    sessionFileCoordinator.getDisplayPath(ctx, currentPath)
-                }
-            } else currentPath
+            binding.pathBarText.text = buildPathBarLabel()
             if (!forceRefresh && items.hashCode() == storedItems.hashCode()) {
                 return@runOnUiThread
             }
 
             storedItems = items
             if (binding.itemsList.adapter == null) {
-                ItemsAdapter(activity as SimpleActivity, storedItems, this, binding.itemsList, isPickMultipleIntent, binding.itemsSwipeRefresh) {
+                ItemsAdapter(
+                    activity = activity as SimpleActivity,
+                    listItems = storedItems,
+                    listener = this,
+                    recyclerView = binding.itemsList,
+                    isPickMultipleIntent = isPickMultipleIntent,
+                    swipeRefreshLayout = binding.itemsSwipeRefresh,
+                    showRecentPathMetadata = contentMode == ContentMode.RECENTS
+                ) {
                     if ((it as? ListItem)?.isSectionTitle == true) {
                         openDirectory(it.mPath)
                         searchClosed()
@@ -220,6 +275,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                 }
             } else {
                 (binding.itemsList.adapter as? ItemsAdapter)?.apply {
+                    setRecentPathMetadataEnabled(contentMode == ContentMode.RECENTS)
                     updateItems(storedItems, "")
                     setupZoomListener(zoomListener)
                 }
@@ -375,7 +431,138 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         return listItems
     }
 
+    private fun loadCurrentFolderRecents(forceRefresh: Boolean = false) {
+        val ctx = context ?: return
+        val folderPath = currentPath
+        showProgressBar()
+        ensureBackgroundThread {
+            val result = getCurrentFolderRecents(folderPath)
+            activity?.runOnUiThread {
+                if (context == null || currentPath != folderPath || contentMode != ContentMode.RECENTS) {
+                    return@runOnUiThread
+                }
+
+                recentEntriesByPath = result.entriesByPath
+                itemsIgnoringSearch = result.items
+                addItems(result.items, forceRefresh)
+                if (context != null && currentViewType != context!!.config.getFolderViewType(currentPath)) {
+                    setupLayoutManager()
+                }
+                hideProgressBar()
+            }
+        }
+    }
+
+    private fun getCurrentFolderRecents(folderPath: String): RecentListResult {
+        val ctx = context ?: return RecentListResult(arrayListOf(), linkedMapOf())
+        val isNavigatorScope = NavigatorFolderHelper.isNavigatorPath(ctx, folderPath)
+        val normalizedFolderPath = TermuxPathScope.normalizePath(folderPath).trimEnd('/').ifEmpty { "/" }
+        val listItems = arrayListOf<ListItem>()
+        val recentEntries = LinkedHashMap<String, RecentFileEntry>()
+
+        try {
+            val isTermuxScoped = fileManagerEnvironment.isTermuxScopedFileManager()
+            RecentFileHistory.getRecentFiles(ctx, RECENTS_LIMIT).forEach { entry ->
+                val listPath = entry.listPath()
+                if (!TermuxPathScope.isVisibleInFileManager(ctx, listPath, isTermuxScoped)) {
+                    return@forEach
+                }
+
+                val normalizedListPath = TermuxPathScope.normalizePath(listPath).trimEnd('/').ifEmpty { "/" }
+                if (!recentMatchesScope(normalizedFolderPath, normalizedListPath, isNavigatorScope)) {
+                    return@forEach
+                }
+
+                val isRemote = entry.remoteOriginPath() != null
+                val file = File(entry.path)
+                if (!isRemote && (!file.exists() || !file.isFile)) {
+                    RecentFileHistory.removePath(ctx, entry.path)
+                    return@forEach
+                }
+
+                if (wantedMimeTypes.any { isProperMimeType(it, listPath, false) }) {
+                    val name = entry.displayName.ifBlank { normalizedListPath.getFilenameFromPath() }
+                    val size = entry.resolveRecentSize(file, isRemote)
+                    val modified = entry.openedAtMs
+                    listItems.add(ListItem(normalizedListPath, name, false, 0, size, modified, false, false))
+                    recentEntries[normalizedListPath] = entry
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        return RecentListResult(listItems, recentEntries)
+    }
+
+    private fun recentMatchesScope(scopePath: String, filePath: String, isNavigatorScope: Boolean): Boolean {
+        if (isNavigatorScope) {
+            return true
+        }
+
+        val normalizedScope = scopePath.trimEnd('/').ifEmpty { "/" }
+        val normalizedFile = filePath.trimEnd('/').ifEmpty { "/" }
+        if (normalizedFile == normalizedScope) {
+            return false
+        }
+
+        return normalizedScope == "/" || normalizedFile.startsWith("$normalizedScope/")
+    }
+
+    private fun handleRecentClick(path: String) {
+        val ctx = context ?: return
+        val entry = recentEntriesByPath[path]
+        if (entry == null) {
+            clickedPath(path)
+            return
+        }
+
+        val remoteOriginPath = entry.remoteOriginPath()
+        if (remoteOriginPath == null) {
+            clickedPath(path)
+            return
+        }
+
+        showProgressBar()
+        ensureBackgroundThread {
+            val result = sessionFileCoordinator.materializeVirtualFile(ctx.applicationContext, remoteOriginPath)
+            activity?.runOnUiThread {
+                hideProgressBar()
+                if (!result.success) {
+                    activity?.toast(result.messageCn)
+                    return@runOnUiThread
+                }
+
+                val localPath = result.localPath
+                val displayName = entry.displayName.ifBlank { remoteOriginPath.getFilenameFromPath() }
+                val extension = displayName.substringAfterLast('.', "").lowercase().ifBlank { null }
+                val originDisplayPath = entry.originDisplayPath
+                    ?.takeIf { it.isNotBlank() }
+                    ?: sessionFileCoordinator.getDisplayPath(ctx, remoteOriginPath)
+                clickedPath(
+                    localPath,
+                    FileOpenRequest(
+                        path = localPath,
+                        displayName = displayName,
+                        readOnly = false,
+                        extension = extension,
+                        mimeType = localPath.getMimeType(),
+                        originType = entry.originType,
+                        originPath = remoteOriginPath,
+                        originDisplayPath = originDisplayPath,
+                        originModifiedMs = result.remoteModifiedMs.takeIf { it >= 0L },
+                        originSize = result.remoteSize.takeIf { it >= 0L }
+                    )
+                )
+            }
+        }
+    }
+
     private fun itemClicked(item: FileDirItem) {
+        if (contentMode == ContentMode.RECENTS) {
+            handleRecentClick(item.path)
+            return
+        }
+
         if (context != null && NavigatorFolderHelper.isNavigatorPath(context!!, currentPath)) {
             val ctx = context!!
             val selectedSessionKey = NavigatorFolderHelper.resolveSessionKeyForTargetPath(ctx, item.path)
@@ -728,7 +915,42 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         return Color.argb(a, r, g, b)
     }
 
+    private fun buildPathBarLabel(): String {
+        val ctx = context ?: return currentPath
+        val base = if (NavigatorFolderHelper.isNavigatorPath(ctx, currentPath)) {
+            NavigatorFolderHelper.displayTitle()
+        } else {
+            sessionFileCoordinator.getDisplayPath(ctx, currentPath)
+        }
+        return if (contentMode == ContentMode.RECENTS && !NavigatorFolderHelper.isNavigatorPath(ctx, currentPath)) {
+            "$base  ·  ${ctx.getString(R.string.recents)}"
+        } else {
+            base
+        }
+    }
+
+    private fun RecentFileEntry.remoteOriginPath(): String? {
+        val normalizedOriginPath = originPath?.trim().takeUnless { it.isNullOrEmpty() } ?: return null
+        return if (originType == FileOpenRequest.ORIGIN_SFTP_VIRTUAL) normalizedOriginPath else null
+    }
+
+    private fun RecentFileEntry.listPath(): String {
+        return remoteOriginPath() ?: path
+    }
+
+    private fun RecentFileEntry.resolveRecentSize(file: File, isRemote: Boolean): Long {
+        if (isRemote) {
+            return sizeBytes ?: file.takeIf { it.exists() && it.isFile }?.length() ?: -1L
+        }
+        return when {
+            file.exists() && file.isFile -> file.length()
+            else -> -1L
+        }
+    }
+
     private fun openDirectory(path: String) {
+        contentMode = ContentMode.DIRECTORY
+        recentEntriesByPath.clear()
         fileManagerControllerCommands.openedDirectory()
         openPath(path)
     }
@@ -736,6 +958,28 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     override fun searchQueryChanged(text: String) {
         lastSearchedText = text
         if (context == null) {
+            return
+        }
+
+        if (contentMode == ContentMode.RECENTS) {
+            val normalizedText = text.normalizeString()
+            val filtered = if (text.isEmpty()) {
+                itemsIgnoringSearch
+            } else {
+                itemsIgnoringSearch.filter {
+                    it.mName.normalizeString().contains(normalizedText, true) ||
+                        it.mPath.normalizeString().contains(normalizedText, true)
+                }.toMutableList() as ArrayList<ListItem>
+            }
+
+            binding.apply {
+                itemsSwipeRefresh.isEnabled = text.isEmpty() && activity?.config?.enablePullToRefresh != false
+                itemsFastscroller.beVisibleIf(filtered.isNotEmpty())
+                itemsPlaceholder.beVisibleIf(filtered.isEmpty())
+                itemsPlaceholder2.beGone()
+                getRecyclerAdapter()?.updateItems(filtered, text)
+                hideProgressBar()
+            }
             return
         }
 
@@ -959,7 +1203,11 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     }
 
     override fun refreshFragment() {
-        openPath(currentPath)
+        if (contentMode == ContentMode.RECENTS) {
+            loadCurrentFolderRecents(forceRefresh = true)
+        } else {
+            openPath(currentPath)
+        }
     }
 
     override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {

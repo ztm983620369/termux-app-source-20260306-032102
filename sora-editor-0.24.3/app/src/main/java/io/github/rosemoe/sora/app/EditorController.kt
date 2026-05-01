@@ -36,9 +36,11 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.FileObserver
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.Log
+import android.view.inputmethod.EditorInfo
 import android.view.KeyEvent
 import android.view.Menu
 import android.view.MenuItem
@@ -68,6 +70,7 @@ import com.termux.editorsync.EditorDocumentSyncManager
 import com.termux.editorsync.EditorSaveTrigger
 import com.termux.editorsync.EditorSyncTarget
 import com.termux.editorsync.EditorSyncTargetKind
+import com.termux.shared.view.KeyboardUtils
 import io.github.rosemoe.sora.app.databinding.ActivityMainBinding
 import io.github.rosemoe.sora.app.lsp.LspTestActivity
 import io.github.rosemoe.sora.app.lsp.LspTestJavaActivity
@@ -87,6 +90,7 @@ import io.github.rosemoe.sora.lang.styling.inlayHint.TextInlayHint
 import io.github.rosemoe.sora.langs.java.JavaLanguage as SoraJavaLanguage
 import io.github.rosemoe.sora.langs.textmate.registry.GrammarRegistry
 import io.github.rosemoe.sora.langs.textmate.registry.ThemeRegistry
+import io.github.rosemoe.sora.text.Content
 import io.github.rosemoe.sora.text.ContentIO
 import io.github.rosemoe.sora.util.regex.RegexBackrefGrammar
 import io.github.rosemoe.sora.utils.CrashHandler
@@ -100,12 +104,16 @@ import io.github.rosemoe.sora.widget.ext.EditorSpanInteractionHandler
 import io.github.rosemoe.sora.widget.getComponent
 import io.github.rosemoe.sora.widget.subscribeAlways
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.eclipse.tm4e.core.internal.oniguruma.Oniguruma
 import java.io.File
 import java.io.FileInputStream
+import java.security.DigestInputStream
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicLong
 import java.util.regex.PatternSyntaxException
 import kotlin.math.abs
@@ -132,6 +140,14 @@ class EditorController(
         private const val TAG = "EditorController"
         const val LOG_FILE = "crash-journal.log"
         private const val PREFS_NAME = "sora_editor_prefs"
+        private const val FILE_RELOAD_DEBOUNCE_MS = 240L
+        private val OBSERVED_FILE_EVENTS =
+            FileObserver.CLOSE_WRITE or
+                FileObserver.MODIFY or
+                FileObserver.MOVED_TO or
+                FileObserver.MOVED_FROM or
+                FileObserver.DELETE or
+                FileObserver.ATTRIB
 
         /**
          * Symbols to be displayed in symbol input view
@@ -225,6 +241,23 @@ class EditorController(
     private lateinit var documentSync: EditorDocumentSyncManager
     private val saveStatusUi = EditorSaveStatusUi()
 
+    private data class FileDiskState(
+        val path: String,
+        val lastModified: Long,
+        val length: Long,
+        val sha256: String
+    )
+
+    private data class DiskFileContent(
+        val content: Content,
+        val diskState: FileDiskState
+    )
+
+    private data class OpenFileSnapshot(
+        val diskState: FileDiskState,
+        val editorSha256: String
+    )
+
     private var lastBridgeSeqHandled: Long = 0L
     private var lastOpenRequest: FileOpenRequest? = null
     private var lastOpenAttemptAtMs: Long = 0L
@@ -234,6 +267,21 @@ class EditorController(
     private var loadedPath: String? = null
     private var loadedLastModified: Long = -1L
     private var loadedSize: Long = -1L
+    @Volatile
+    private var openFileSnapshot: OpenFileSnapshot? = null
+    @Volatile
+    private var mutedExternalConflictHash: String? = null
+    @Volatile
+    private var allowOverwriteExternalHashOnce: String? = null
+    private var observedFilePath: String? = null
+    private var observedFileName: String? = null
+    private var observedFileParent: String? = null
+    private var fileObserver: FileObserver? = null
+    private var fileRefreshJob: Job? = null
+    private var externalConflictDialog: AlertDialog? = null
+    private var titlebarSearchModeActive: Boolean = false
+    private var embeddedTerminalImeActive = false
+    private var restoreEditorImeAfterTerminal = false
 
     private val prefs by lazy { activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
     private var applyToolbarTopInsetFromSystemBars: Boolean = true
@@ -263,15 +311,15 @@ class EditorController(
             applyEdgeToEdgeForViews(binding.toolbarContainer, binding.root)
         }
 
-        binding.mainBottomBar.visibility = View.INVISIBLE
-        // Fully refactored: ultra-smooth IME bar
-        setupImeAccessoryBarController()
+        setupPersistentSymbolBar()
+        setupTerminalWorkspaceButton()
 
         documentSync = EditorDocumentSyncManager(
             context = activity,
             prefs = prefs,
             scope = activity.lifecycleScope,
-            textSnapshotProvider = { binding.editor.text.toString() }
+            textSnapshotProvider = { binding.editor.text.toString() },
+            beforeSaveGuard = ::detectExternalSaveConflictBeforePersist
         )
         lifecycleScope.launch {
             documentSync.state.collect { snapshot ->
@@ -287,14 +335,81 @@ class EditorController(
             btnGotoNext.setOnClickListener(::gotoNext)
             btnReplace.setOnClickListener(::replace)
             btnReplaceAll.setOnClickListener(::replaceAll)
+            titlebarBtnGotoPrev.setOnClickListener(::gotoPrev)
+            titlebarBtnGotoNext.setOnClickListener(::gotoNext)
+            titlebarSearchOptionsButton.setOnClickListener(::showSearchOptions)
+            titlebarSearchCloseButton.setOnClickListener { closeTitlebarSearchMode(returnFocusToEditor = true) }
             searchOptions.setOnClickListener(::showSearchOptions)
         }
 
         // Configure symbol input view
         val inputView = binding.symbolInput
         inputView.bindEditor(binding.editor)
+        inputView.setOnSymbolClickListener { _, insertText, editor ->
+            if (embeddedTerminalImeActive) {
+                embeddedTerminalHost?.sendTextToEmbeddedTerminal(insertText)
+                showEmbeddedTerminalIme()
+                return@setOnSymbolClickListener
+            }
+            if (editor == null || !editor.isEditable) {
+                return@setOnSymbolClickListener
+            }
+            if ("\t" == insertText) {
+                if (editor.snippetController.isInSnippet()) {
+                    editor.snippetController.shiftToNextTabStop()
+                } else {
+                    editor.indentOrCommitTab()
+                }
+            } else {
+                editor.insertText(insertText, 1)
+            }
+        }
         inputView.addSymbols(SYMBOLS, SYMBOL_INSERT_TEXT)
         inputView.forEachButton { it.typeface = typeface }
+
+        binding.sharedImeHost.apply {
+            callbacks = object : SharedImeHostEditText.Callbacks {
+                override fun onBackPressedPreIme(event: KeyEvent): Boolean {
+                    if (!embeddedTerminalImeActive) return false
+                    if (event.action == KeyEvent.ACTION_DOWN) return true
+                    if (event.action != KeyEvent.ACTION_UP) return true
+                    return embeddedTerminalHost?.hideEmbeddedTerminalWorkspace() == true
+                }
+            }
+            setSingleLine(true)
+            maxLines = 1
+            setRawInputType(EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+            imeOptions = EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            setOnEditorActionListener { _, actionId, event ->
+                if (!embeddedTerminalImeActive) return@setOnEditorActionListener false
+                val isEnterEvent = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER
+                if (actionId != EditorInfo.IME_ACTION_SEND && !isEnterEvent) {
+                    return@setOnEditorActionListener false
+                }
+                embeddedTerminalHost?.sendTextToEmbeddedTerminal("\r")
+                true
+            }
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                override fun afterTextChanged(editable: Editable) {
+                    if (!embeddedTerminalImeActive) return
+                    if (editable.isEmpty()) return
+                    val text = editable.toString().replace("\n", "")
+                    editable.clear()
+                    if (text.isEmpty()) return
+                    embeddedTerminalHost?.sendTextToEmbeddedTerminal(text)
+                }
+            })
+            setOnKeyListener { _, keyCode, event ->
+                if (!embeddedTerminalImeActive) return@setOnKeyListener false
+                if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
+                if (keyCode != KeyEvent.KEYCODE_DEL) return@setOnKeyListener false
+                if (text?.isNotEmpty() == true) return@setOnKeyListener false
+                embeddedTerminalHost?.sendBackspaceToEmbeddedTerminal()
+                true
+            }
+        }
 
         // Commit search when text changed
         binding.searchEditor.addTextChangedListener(object : TextWatcher {
@@ -304,7 +419,24 @@ class EditorController(
                 tryCommitSearch()
             }
         })
-
+        binding.titlebarSearchEditor.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(charSequence: CharSequence, i: Int, i1: Int, i2: Int) {}
+            override fun onTextChanged(charSequence: CharSequence, i: Int, i1: Int, i2: Int) {}
+            override fun afterTextChanged(editable: Editable) {
+                if (titlebarSearchModeActive) {
+                    tryCommitTitlebarSearch()
+                }
+            }
+        })
+        binding.titlebarSearchEditor.setOnEditorActionListener { _, actionId, event ->
+            val enter = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_UP
+            if (actionId == EditorInfo.IME_ACTION_SEARCH || enter) {
+                gotoNext(binding.titlebarBtnGotoNext)
+                true
+            } else {
+                false
+            }
+        }
         // Search options
         searchMenu = PopupMenu(activity, binding.searchOptions)
         searchMenu.inflate(R.menu.menu_search_options)
@@ -412,6 +544,51 @@ class EditorController(
      */
     fun setHostHandlesStatusBarInsets(hostHandlesInsets: Boolean) {
         applyToolbarTopInsetFromSystemBars = !hostHandlesInsets
+    }
+
+    private fun setupPersistentSymbolBar() {
+        KeyboardUtils.setSoftInputModeAdjustResize(activity)
+        fractionAnimator?.cancel()
+        fractionAnimator = null
+        currentFraction = 1f
+        barFullHeightPx = 0
+        barHwLayerEnabled = false
+        binding.mainBottomBar.apply {
+            visibility = View.VISIBLE
+            alpha = 1f
+            translationY = 0f
+            isEnabled = true
+            scaleX = 1f
+            scaleY = 1f
+            setLayerType(View.LAYER_TYPE_NONE, null)
+        }
+    }
+
+    private fun setupTerminalWorkspaceButton() {
+        binding.openTerminalWorkspaceButton.visibility = if (embeddedTerminalHost != null) View.VISIBLE else View.GONE
+        binding.openTerminalWorkspaceButton.setOnClickListener {
+            toggleEmbeddedTerminalWorkspace()
+        }
+        syncTerminalWorkspaceButtonState()
+    }
+
+    private fun toggleEmbeddedTerminalWorkspace(): Boolean {
+        val host = embeddedTerminalHost ?: return true
+        if (host.isEmbeddedTerminalWorkspaceVisible()) {
+            host.hideEmbeddedTerminalWorkspace()
+        } else {
+            host.showEmbeddedTerminalWorkspace(lastOpenRequest?.path)
+        }
+        syncEmbeddedTerminalWorkspaceUi()
+        activity.invalidateOptionsMenu()
+        return true
+    }
+
+    private fun syncTerminalWorkspaceButtonState() {
+        val visible = embeddedTerminalHost?.isEmbeddedTerminalWorkspaceVisible() == true
+        binding.openTerminalWorkspaceButton.isSelected = visible
+        binding.openTerminalWorkspaceButton.isActivated = visible
+        binding.openTerminalWorkspaceButton.alpha = if (embeddedTerminalHost != null) 1f else 0f
     }
 
     // ---------------- IME controller implementation ----------------
@@ -678,6 +855,7 @@ class EditorController(
 
     fun onResume() {
         applyPendingBridgeRequests("bridge.onResume")
+        scheduleObservedFileCheck("lifecycle.resume")
     }
 
     fun onPause() {
@@ -705,7 +883,14 @@ class EditorController(
      * Commit a text search to editor
      */
     private fun tryCommitSearch() {
-        val query = binding.searchEditor.editableText
+        commitSearchQuery(binding.searchEditor.editableText)
+    }
+
+    private fun tryCommitTitlebarSearch() {
+        commitSearchQuery(binding.titlebarSearchEditor.editableText)
+    }
+
+    private fun commitSearchQuery(query: CharSequence) {
         if (query.isNotEmpty()) {
             try {
                 binding.editor.searcher.search(
@@ -752,11 +937,352 @@ class EditorController(
         }
     }
 
+    private fun readDiskFileForEditorStable(file: File): DiskFileContent {
+        repeat(2) { attempt ->
+            val beforeModified = file.lastModified()
+            val beforeLength = file.length()
+            val digest = MessageDigest.getInstance("SHA-256")
+            val content = DigestInputStream(FileInputStream(file).buffered(), digest).use { stream ->
+                ContentIO.createFrom(stream)
+            }
+            val diskState = FileDiskState(
+                path = file.absolutePath,
+                lastModified = file.lastModified(),
+                length = file.length(),
+                sha256 = toHex(digest.digest())
+            )
+            if (attempt > 0 ||
+                (beforeModified == diskState.lastModified && beforeLength == diskState.length)
+            ) {
+                return DiskFileContent(content = content, diskState = diskState)
+            }
+        }
+        throw IllegalStateException("file changed while reading: ${file.absolutePath}")
+    }
+
+    private fun readDiskStateStable(file: File): FileDiskState {
+        repeat(2) { attempt ->
+            val beforeModified = file.lastModified()
+            val beforeLength = file.length()
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).buffered().use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            val diskState = FileDiskState(
+                path = file.absolutePath,
+                lastModified = file.lastModified(),
+                length = file.length(),
+                sha256 = toHex(digest.digest())
+            )
+            if (attempt > 0 ||
+                (beforeModified == diskState.lastModified && beforeLength == diskState.length)
+            ) {
+                return diskState
+            }
+        }
+        throw IllegalStateException("file changed while hashing: ${file.absolutePath}")
+    }
+
+    private fun sha256(bytes: ByteArray): String {
+        return toHex(MessageDigest.getInstance("SHA-256").digest(bytes))
+    }
+
+    private fun sha256Text(text: String): String {
+        return sha256(text.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun currentEditorSha256(): String {
+        return sha256Text(binding.editor.text.toString())
+    }
+
+    private fun toHex(bytes: ByteArray): String {
+        val out = CharArray(bytes.size * 2)
+        val alphabet = "0123456789abcdef"
+        for (i in bytes.indices) {
+            val v = bytes[i].toInt() and 0xff
+            out[i * 2] = alphabet[v ushr 4]
+            out[i * 2 + 1] = alphabet[v and 0x0f]
+        }
+        return String(out)
+    }
+
+    private fun updateLoadedDiskState(diskState: FileDiskState) {
+        loadedPath = diskState.path
+        loadedLastModified = diskState.lastModified
+        loadedSize = diskState.length
+    }
+
+    private fun updateOpenFileSnapshot(diskState: FileDiskState, editorSha256: String = currentEditorSha256()) {
+        updateLoadedDiskState(diskState)
+        openFileSnapshot = OpenFileSnapshot(diskState = diskState, editorSha256 = editorSha256)
+        mutedExternalConflictHash = null
+        allowOverwriteExternalHashOnce = null
+    }
+
+    private fun updateOpenFileDiskMetadata(diskState: FileDiskState) {
+        updateLoadedDiskState(diskState)
+        val snapshot = openFileSnapshot
+        if (snapshot != null && snapshot.diskState.path == diskState.path) {
+            openFileSnapshot = snapshot.copy(diskState = diskState)
+        }
+    }
+
+    private fun refreshSnapshotAfterSuccessfulSave(path: String?) {
+        val targetPath = path?.takeIf { it.isNotBlank() } ?: observedFilePath ?: loadedPath ?: return
+        lifecycleScope.launch {
+            val diskState = withContext(Dispatchers.IO) {
+                runCatching { readDiskStateStable(File(targetPath)) }.getOrNull()
+            } ?: return@launch
+            val editorHash = currentEditorSha256()
+            if (diskState.sha256 == editorHash || diskState.path == observedFilePath) {
+                updateOpenFileSnapshot(diskState, editorHash)
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startWatchingOpenFile(path: String) {
+        val file = File(path)
+        val parent = file.parentFile ?: return
+        val absolutePath = file.absolutePath
+        val parentPath = parent.absolutePath
+        val fileName = file.name
+        if (observedFilePath == absolutePath && observedFileParent == parentPath) return
+
+        stopWatchingOpenFile()
+        observedFilePath = absolutePath
+        observedFileName = fileName
+        observedFileParent = parentPath
+        fileObserver = object : FileObserver(parentPath, OBSERVED_FILE_EVENTS) {
+            override fun onEvent(event: Int, pathName: String?) {
+                val changedName = pathName ?: return
+                if (changedName != observedFileName) return
+                val cleanEvent = event and FileObserver.ALL_EVENTS
+                if ((cleanEvent and OBSERVED_FILE_EVENTS) == 0) return
+                scheduleObservedFileCheck("observer:$cleanEvent")
+            }
+        }.also { observer ->
+            runCatching { observer.startWatching() }
+        }
+    }
+
+    private fun stopWatchingOpenFile() {
+        fileRefreshJob?.cancel()
+        fileRefreshJob = null
+        runCatching { fileObserver?.stopWatching() }
+        fileObserver = null
+        observedFilePath = null
+        observedFileName = null
+        observedFileParent = null
+        externalConflictDialog?.dismiss()
+        externalConflictDialog = null
+    }
+
+    private fun scheduleObservedFileCheck(reason: String) {
+        val path = observedFilePath ?: return
+        fileRefreshJob?.cancel()
+        fileRefreshJob = lifecycleScope.launch {
+            delay(FILE_RELOAD_DEBOUNCE_MS)
+            inspectObservedFile(path, reason)
+        }
+    }
+
+    private suspend fun inspectObservedFile(path: String, reason: String) {
+        if (path != observedFilePath) return
+        val file = File(path)
+        if (!file.exists() || !file.isFile) {
+            handleObservedFileMissing(path)
+            return
+        }
+
+        val diskState = withContext(Dispatchers.IO) {
+            runCatching { readDiskStateStable(file) }
+        }.getOrElse {
+            Log.w(TAG, "Unable to inspect observed file: $path", it)
+            return
+        }
+        if (path != observedFilePath) return
+
+        val snapshot = openFileSnapshot
+        if (snapshot?.diskState?.sha256 == diskState.sha256) {
+            updateOpenFileDiskMetadata(diskState)
+            return
+        }
+
+        val editorHash = currentEditorSha256()
+        if (diskState.sha256 == editorHash) {
+            updateOpenFileSnapshot(diskState, editorHash)
+            return
+        }
+
+        val editorHasLocalChanges = documentSync.hasUnsavedChanges() ||
+            (snapshot != null && editorHash != snapshot.editorSha256)
+        if (!editorHasLocalChanges) {
+            reloadOpenFileFromDisk(path, reason = reason, notify = reason.startsWith("observer"))
+            return
+        }
+
+        if (mutedExternalConflictHash != diskState.sha256) {
+            showExternalFileConflictDialog(path, diskState)
+        }
+    }
+
+    private fun handleObservedFileMissing(path: String) {
+        val snapshot = openFileSnapshot ?: return
+        val editorHash = currentEditorSha256()
+        val editorHasLocalChanges = documentSync.hasUnsavedChanges() || editorHash != snapshot.editorSha256
+        if (editorHasLocalChanges && mutedExternalConflictHash != "deleted:$path") {
+            mutedExternalConflictHash = "deleted:$path"
+            toast("文件已在外部删除，当前未保存内容已保留")
+        } else if (!editorHasLocalChanges && mutedExternalConflictHash != "deleted:$path") {
+            mutedExternalConflictHash = "deleted:$path"
+            toast("文件已在外部删除，编辑器内容已保留")
+        }
+    }
+
+    private fun reloadOpenFileFromDisk(path: String, reason: String, notify: Boolean) {
+        val request = lastOpenRequest ?: return
+        val expectedPath = File(path).absolutePath
+        lifecycleScope.launch {
+            val fileContent = withContext(Dispatchers.IO) {
+                runCatching { readDiskFileForEditorStable(File(expectedPath)) }
+            }.getOrElse {
+                toast("刷新失败：${it.message ?: it::class.java.name}")
+                return@launch
+            }
+            if (expectedPath != observedFilePath && expectedPath != File(request.path).absolutePath) return@launch
+
+            val editor = binding.editor
+            val line = editor.cursor.leftLine
+            val column = editor.cursor.leftColumn
+            val scrollX = editor.offsetX
+            val scrollY = editor.offsetY
+
+            suppressContentChangeCallbacks = true
+            editor.setText(fileContent.content, null)
+            documentSync.bindDocument(
+                buildSyncTarget(request.copy(path = expectedPath), File(expectedPath)),
+                editor.text.toString()
+            )
+            updateOpenFileSnapshot(fileContent.diskState, currentEditorSha256())
+            updateBtnState()
+            lastOpenOkAtMs = System.currentTimeMillis()
+            lastOpenError = null
+            activity.invalidateOptionsMenu()
+            startWatchingOpenFile(expectedPath)
+            restoreEditorViewport(line, column, scrollX, scrollY)
+            editor.post {
+                suppressContentChangeCallbacks = false
+                if (expectedPath == observedFilePath) {
+                    vscode.maybeAutoApplyVSCodeSyntaxByFileName(expectedPath)
+                }
+            }
+            if (notify) {
+                toast("已刷新外部修改")
+            }
+            Log.d(TAG, "Reloaded observed file from disk reason=$reason path=$expectedPath")
+        }
+    }
+
+    private fun restoreEditorViewport(line: Int, column: Int, scrollX: Int, scrollY: Int) {
+        val editor = binding.editor
+        editor.post {
+            val lineCount = editor.text.lineCount
+            if (lineCount > 0) {
+                val safeLine = line.coerceIn(0, lineCount - 1)
+                val safeColumn = column.coerceIn(0, editor.text.getColumnCount(safeLine))
+                runCatching { editor.setSelection(safeLine, safeColumn, false) }
+            }
+            val scroller = editor.scroller
+            scroller.forceFinished(true)
+            scroller.startScroll(
+                scrollX.coerceIn(0, editor.scrollMaxX),
+                scrollY.coerceIn(0, editor.scrollMaxY),
+                0,
+                0,
+                0
+            )
+            scroller.abortAnimation()
+        }
+    }
+
+    private fun detectExternalSaveConflictBeforePersist(
+        target: EditorSyncTarget,
+        trigger: EditorSaveTrigger,
+        payload: ByteArray
+    ): String? {
+        val snapshot = openFileSnapshot ?: return null
+        val targetPath = File(target.localPath).absolutePath
+        if (snapshot.diskState.path != targetPath) return null
+        val file = File(targetPath)
+        if (!file.exists() || !file.isFile) return null
+
+        val diskState = runCatching { readDiskStateStable(file) }.getOrNull() ?: return null
+        val payloadHash = sha256(payload)
+        if (diskState.sha256 == snapshot.diskState.sha256 || diskState.sha256 == payloadHash) {
+            return null
+        }
+
+        if (trigger == EditorSaveTrigger.MANUAL && allowOverwriteExternalHashOnce == diskState.sha256) {
+            allowOverwriteExternalHashOnce = null
+            return null
+        }
+
+        if (trigger != EditorSaveTrigger.AUTO || mutedExternalConflictHash != diskState.sha256) {
+            runOnUiThread {
+                showExternalFileConflictDialog(targetPath, diskState)
+            }
+        }
+        return "文件已被外部修改，已阻止覆盖保存"
+    }
+
+    private fun showExternalFileConflictDialog(path: String, diskState: FileDiskState) {
+        if (path != observedFilePath && path != loadedPath) return
+        if (externalConflictDialog?.isShowing == true) return
+
+        val fileName = File(path).name
+        val dialog = AlertDialog.Builder(activity)
+            .setTitle("文件已在外部修改")
+            .setMessage("磁盘上的 $fileName 已变化，当前编辑器也有未保存内容。为避免互相覆盖，已暂停自动刷新。")
+            .setPositiveButton("重新载入") { _, _ ->
+                mutedExternalConflictHash = null
+                reloadOpenFileFromDisk(path, reason = "external.conflict.reload", notify = true)
+            }
+            .setNeutralButton("覆盖保存") { _, _ ->
+                mutedExternalConflictHash = null
+                allowOverwriteExternalHashOnce = diskState.sha256
+                lifecycleScope.launch {
+                    val result = documentSync.saveNow(EditorSaveTrigger.MANUAL)
+                    if (result.ok) {
+                        refreshSnapshotAfterSuccessfulSave(result.targetPath)
+                        toast("已覆盖保存")
+                    } else {
+                        toast("保存失败：${result.error ?: "unknown"}")
+                    }
+                }
+            }
+            .setNegativeButton("稍后处理") { _, _ ->
+                mutedExternalConflictHash = diskState.sha256
+            }
+            .create()
+        dialog.setOnCancelListener {
+            mutedExternalConflictHash = diskState.sha256
+        }
+        externalConflictDialog = dialog
+        dialog.show()
+    }
+
     private fun openDiskFile(request: FileOpenRequest) {
         val path = request.path
         val openToken = openGeneration.incrementAndGet()
         lifecycleScope.launch(Dispatchers.IO) {
             val file = File(path)
+            val absolutePath = file.absolutePath
             lastOpenAttemptAtMs = System.currentTimeMillis()
 
             if (!file.exists()) {
@@ -794,12 +1320,16 @@ class EditorController(
             val fileSize = file.length()
 
             // Skip parsing if the same file is already loaded and unchanged.
-            if (loadedPath == path && loadedLastModified == fileModified && loadedSize == fileSize && lastOpenError == null) {
+            if (loadedPath == absolutePath && loadedLastModified == fileModified && loadedSize == fileSize && lastOpenError == null) {
                 if (openToken == openGeneration.get()) {
                     withContext(Dispatchers.Main) {
                         if (openToken != openGeneration.get()) return@withContext
                         lastOpenOkAtMs = System.currentTimeMillis()
                         documentSync.bindDocument(buildSyncTarget(normalizedReq = request, file = file), binding.editor.text.toString())
+                        startWatchingOpenFile(absolutePath)
+                        if (openFileSnapshot?.diskState?.path != absolutePath) {
+                            scheduleObservedFileCheck("open.same-file")
+                        }
                         activity.invalidateOptionsMenu()
                         recordRecentFileOpen(request, file)
                     }
@@ -807,7 +1337,7 @@ class EditorController(
                 return@launch
             }
 
-            val text = runCatching { FileInputStream(file).buffered().use { ContentIO.createFrom(it) } }
+            val diskFile = runCatching { readDiskFileForEditorStable(file) }
                 .getOrElse {
                     if (openToken == openGeneration.get()) {
                         lastOpenError = it.toString()
@@ -821,14 +1351,13 @@ class EditorController(
             withContext(Dispatchers.Main) {
                 if (openToken != openGeneration.get()) return@withContext
                 suppressContentChangeCallbacks = true
-                binding.editor.setText(text, null)
+                binding.editor.setText(diskFile.content, null)
                 documentSync.bindDocument(buildSyncTarget(normalizedReq = request, file = file), binding.editor.text.toString())
                 updateBtnState()
                 lastOpenOkAtMs = System.currentTimeMillis()
                 lastOpenError = null
-                loadedPath = path
-                loadedLastModified = fileModified
-                loadedSize = fileSize
+                updateOpenFileSnapshot(diskFile.diskState, currentEditorSha256())
+                startWatchingOpenFile(absolutePath)
                 activity.invalidateOptionsMenu()
                 recordRecentFileOpen(request, file)
 
@@ -866,7 +1395,9 @@ class EditorController(
             displayName = request.displayName ?: file.name,
             originType = request.originType,
             originPath = request.originPath,
-            originDisplayPath = request.originDisplayPath
+            originDisplayPath = request.originDisplayPath,
+            sizeBytes = request.originSize
+                ?: file.takeIf { it.exists() && it.isFile }?.length()?.takeIf { it >= 0L }
         )
     }
 
@@ -877,6 +1408,8 @@ class EditorController(
             val result = documentSync.flushPendingSave(EditorSaveTrigger.AUTO)
             if (!result.ok) {
                 Log.w(TAG, "Auto-save flush on pause failed: ${result.error ?: "unknown"}")
+            } else {
+                refreshSnapshotAfterSuccessfulSave(result.targetPath)
             }
         }
     }
@@ -906,6 +1439,7 @@ class EditorController(
                 lifecycleScope.launch {
                     val save = documentSync.saveNow(EditorSaveTrigger.MANUAL)
                     if (save.ok) {
+                        refreshSnapshotAfterSuccessfulSave(save.targetPath)
                         proceedOpenRequest(normalizedReq, source, bridgeSequence)
                     } else {
                         toast("切换前保存失败：${save.error ?: "unknown"}")
@@ -941,6 +1475,7 @@ class EditorController(
                 lifecycleScope.launch {
                     val save = documentSync.flushPendingSave(EditorSaveTrigger.AUTO)
                     if (save.ok) {
+                        refreshSnapshotAfterSuccessfulSave(save.targetPath)
                         proceedOpenRequest(normalizedReq, source, bridgeSequence)
                     } else {
                         toast("切换前自动保存失败：${save.error ?: "unknown"}")
@@ -968,12 +1503,7 @@ class EditorController(
     }
 
     fun onConfigurationChanged(newConfig: Configuration) {
-        // Re-measure bar height on rotation, then resync
-        barFullHeightPx = 0
-        binding.root.doOnLayout {
-            ensureBarMeasured()
-            syncToCurrentImeStateNoAnimation()
-        }
+        setupPersistentSymbolBar()
         editorEnv.applyUserPreferredTheme()
     }
 
@@ -981,7 +1511,8 @@ class EditorController(
         menuInflater.inflate(R.menu.menu_main, menu)
         undo = menu.findItem(R.id.text_undo)
         redo = menu.findItem(R.id.text_redo)
-        menu.findItem(R.id.open_terminal_workspace)?.isVisible = embeddedTerminalHost != null
+        menu.findItem(R.id.open_terminal_workspace)?.isVisible = false
+        menu.findItem(R.id.bridge_self_test)?.isVisible = false
         menu.findItem(R.id.auto_save_enabled)?.isChecked = documentSync.isAutoSaveEnabled()
         menu.findItem(R.id.save_file)?.isEnabled = documentSync.state.value.canSave
         saveStatusUi.bind(menu)
@@ -992,6 +1523,7 @@ class EditorController(
     fun onDestroy() {
         fractionAnimator?.cancel()
         fractionAnimator = null
+        stopWatchingOpenFile()
         runCatching { ViewCompat.setWindowInsetsAnimationCallback(window.decorView, null) }
         FileOpenBridge.removeListener(fileOpenListener)
         binding.activityToolbar.navigationIcon = null
@@ -1068,10 +1600,8 @@ class EditorController(
             R.id.search_panel_st -> toggleSearchPanel(item)
 
             R.id.search_am -> {
-                binding.replaceEditor.setText("")
-                binding.searchEditor.setText("")
-                editor.searcher.stopSearch()
-                editor.beginSearchMode()
+                showTitlebarSearchMode()
+                return true
             }
 
             R.id.switch_colors -> editorEnv.chooseTheme(
@@ -1105,6 +1635,7 @@ class EditorController(
                 lifecycleScope.launch {
                     val r = documentSync.saveNow(EditorSaveTrigger.MANUAL)
                     if (r.ok) {
+                        refreshSnapshotAfterSuccessfulSave(r.targetPath)
                         toast("Saved")
                     } else {
                         toast("Save failed: ${r.error ?: "unknown"}")
@@ -1158,16 +1689,7 @@ class EditorController(
             R.id.switch_typeface -> editorEnv.chooseTypeface()
 
             R.id.open_terminal_workspace -> {
-                if (embeddedTerminalHost == null) return true
-
-                if (embeddedTerminalHost.isEmbeddedTerminalWorkspaceVisible()) {
-                    embeddedTerminalHost.hideEmbeddedTerminalWorkspace()
-                } else {
-                    embeddedTerminalHost.showEmbeddedTerminalWorkspace(lastOpenRequest?.path)
-                }
-                syncEmbeddedTerminalWorkspaceUi()
-                activity.invalidateOptionsMenu()
-                return true
+                return toggleEmbeddedTerminalWorkspace()
             }
         }
         return false
@@ -1192,6 +1714,58 @@ class EditorController(
                 null
             }
         )
+        syncTerminalWorkspaceButtonState()
+    }
+
+    fun onEmbeddedTerminalShown(keepKeyboardVisible: Boolean) {
+        restoreEditorImeAfterTerminal =
+                binding.editor.hasFocus() ||
+                binding.searchEditor.hasFocus() ||
+                binding.replaceEditor.hasFocus() ||
+                binding.titlebarSearchEditor.hasFocus()
+        embeddedTerminalImeActive = true
+        closeTitlebarSearchMode(returnFocusToEditor = false)
+        binding.searchEditor.clearFocus()
+        binding.replaceEditor.clearFocus()
+        binding.editor.clearFocus()
+        if (keepKeyboardVisible) {
+            showEmbeddedTerminalIme()
+        } else {
+            binding.sharedImeHost.clearFocus()
+        }
+    }
+
+    fun onEmbeddedTerminalHidden(keepKeyboardVisible: Boolean) {
+        embeddedTerminalImeActive = false
+        binding.sharedImeHost.clearFocus()
+        if (keepKeyboardVisible && restoreEditorImeAfterTerminal) {
+            binding.editor.requestFocus()
+            KeyboardUtils.showSoftKeyboard(activity, binding.editor)
+        }
+        restoreEditorImeAfterTerminal = false
+    }
+
+    fun isEmbeddedTerminalImeActive(): Boolean = embeddedTerminalImeActive
+
+    fun restoreEmbeddedTerminalIme(visible: Boolean) {
+        embeddedTerminalImeActive = true
+        if (visible) {
+            showEmbeddedTerminalIme()
+        } else {
+            binding.sharedImeHost.clearFocus()
+        }
+    }
+
+    fun showEmbeddedTerminalIme() {
+        embeddedTerminalImeActive = true
+        binding.sharedImeHost.post {
+            binding.sharedImeHost.requestFocus()
+            KeyboardUtils.showSoftKeyboard(activity, binding.sharedImeHost)
+            binding.sharedImeHost.postDelayed(
+                { KeyboardUtils.showSoftKeyboard(activity, binding.sharedImeHost) },
+                120
+            )
+        }
     }
 
     private fun showBridgeSelfTestDialog() {
@@ -1346,6 +1920,7 @@ class EditorController(
 
     private fun toggleSearchPanel(item: MenuItem) {
         if (binding.searchPanel.visibility == View.GONE) {
+            closeTitlebarSearchMode(returnFocusToEditor = false)
             binding.apply {
                 replaceEditor.setText("")
                 searchEditor.setText("")
@@ -1358,6 +1933,52 @@ class EditorController(
             binding.editor.searcher.stopSearch()
             item.isChecked = false
         }
+    }
+
+    private fun showTitlebarSearchMode() {
+        if (embeddedTerminalHost?.isEmbeddedTerminalWorkspaceVisible() == true) {
+            embeddedTerminalHost.hideEmbeddedTerminalWorkspace()
+            syncEmbeddedTerminalWorkspaceUi()
+            activity.invalidateOptionsMenu()
+        }
+
+        binding.searchPanel.visibility = View.GONE
+        titlebarSearchModeActive = true
+        binding.symbolBar.visibility = View.GONE
+        binding.titlebarSearchPanel.visibility = View.VISIBLE
+        binding.titlebarSearchEditor.setText("")
+        binding.editor.searcher.stopSearch()
+
+        binding.titlebarSearchEditor.requestFocus()
+        KeyboardUtils.showSoftKeyboard(activity, binding.titlebarSearchEditor)
+        binding.titlebarSearchEditor.postDelayed(
+            { KeyboardUtils.showSoftKeyboard(activity, binding.titlebarSearchEditor) },
+            120
+        )
+    }
+
+    private fun closeTitlebarSearchMode(returnFocusToEditor: Boolean): Boolean {
+        if (!titlebarSearchModeActive && binding.titlebarSearchPanel.visibility != View.VISIBLE) {
+            return false
+        }
+        titlebarSearchModeActive = false
+        binding.titlebarSearchPanel.visibility = View.GONE
+        binding.symbolBar.visibility = View.VISIBLE
+        binding.editor.searcher.stopSearch()
+        binding.titlebarSearchEditor.clearFocus()
+        if (returnFocusToEditor) {
+            binding.editor.requestFocus()
+            KeyboardUtils.showSoftKeyboard(activity, binding.editor)
+        }
+        return true
+    }
+
+    fun onBackPressedCompat(): Boolean {
+        if (closeTitlebarSearchMode(returnFocusToEditor = false)) {
+            KeyboardUtils.hideSoftKeyboard(activity, binding.titlebarSearchEditor)
+            return true
+        }
+        return false
     }
 
     private fun openLogs() {
@@ -1397,16 +2018,24 @@ class EditorController(
     }
 
     fun replace(view: View) {
+        replaceCurrent(binding.replaceEditor.text.toString())
+    }
+
+    fun replaceAll(view: View) {
+        replaceAllMatches(binding.replaceEditor.text.toString())
+    }
+
+    private fun replaceCurrent(replacement: String) {
         try {
-            binding.editor.searcher.replaceCurrentMatch(binding.replaceEditor.text.toString())
+            binding.editor.searcher.replaceCurrentMatch(replacement)
         } catch (e: IllegalStateException) {
             e.printStackTrace()
         }
     }
 
-    fun replaceAll(view: View) {
+    private fun replaceAllMatches(replacement: String) {
         try {
-            binding.editor.searcher.replaceAll(binding.replaceEditor.text.toString())
+            binding.editor.searcher.replaceAll(replacement)
         } catch (e: IllegalStateException) {
             e.printStackTrace()
         }

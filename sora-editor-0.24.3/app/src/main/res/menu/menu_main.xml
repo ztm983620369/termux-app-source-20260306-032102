@@ -188,5 +188,6 @@
     <item
         android:id="@+id/bridge_self_test"
         android:title="自测"
-        app:showAsAction="always" />
+        android:visible="false"
+        app:showAsAction="never" />
 </menu>

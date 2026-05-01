@@ -85,7 +85,6 @@ import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.extensions.tryOpenPathIntent
 import org.fossify.filemanager.fragments.ItemsFragment
 import org.fossify.filemanager.fragments.MyViewPagerFragment
-import org.fossify.filemanager.fragments.RecentsFragment
 import org.fossify.filemanager.fragments.StorageFragment
 import org.fossify.filemanager.fragments.WorkspaceFilesFragment
 import org.fossify.filemanager.helpers.FavoriteHelper
@@ -117,6 +116,8 @@ class FileManagerController(
         private const val MENU_SWITCH_FILES = 10002
         private const val MENU_SWITCH_RECENTS = 10003
         private const val MENU_SWITCH_STORAGE = 10004
+        private const val MENU_PATH_SEARCH = 11001
+        private const val MENU_PATH_SESSION = 11002
     }
 
     private var wasBackJustPressed = false
@@ -182,7 +183,7 @@ class FileManagerController(
         if (enableEdgeToEdge) {
             activity.setupEdgeToEdge(
                 padBottomSystem = listOf(binding.mainViewPager),
-                moveBottomSystem = listOf(binding.mainFab, binding.mainMoreFab, binding.mainSearchFab)
+                moveBottomSystem = listOf(binding.mainFab, binding.mainMoreFab)
             )
         }
 
@@ -284,7 +285,7 @@ class FileManagerController(
         if (binding.workspaceChrome.isSearchVisible()) {
             closeSearchPanel(clearQuery = true)
             return true
-        } else if (currentFragment is RecentsFragment || currentFragment is StorageFragment) {
+        } else if (currentFragment is StorageFragment) {
             return false
         } else if (currentFragment is WorkspaceFilesFragment) {
             if (currentFragment.handleBackPressedWithinWorkspaces()) {
@@ -360,6 +361,26 @@ class FileManagerController(
         }
     }
 
+    override fun showPathBarActions(anchor: View, currentPath: String) {
+        val popup = PopupMenu(activity, anchor, Gravity.START)
+        popup.menu.add(0, MENU_PATH_SEARCH, 0, "搜索")
+        popup.menu.add(0, MENU_PATH_SESSION, 1, "切换会话")
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                MENU_PATH_SEARCH -> {
+                    openWorkspaceSearch()
+                    true
+                }
+                MENU_PATH_SESSION -> {
+                    showSessionSwitcher()
+                    true
+                }
+                else -> false
+            }
+        }
+        popup.show()
+    }
+
     override fun closeActiveWorkspaceTabIfPossible(): Boolean {
         val filesFragment = getFilesFragment() ?: return false
         val closed = filesFragment.closeActiveWorkspaceTabIfPossible()
@@ -386,7 +407,7 @@ class FileManagerController(
     }
 
     override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {
-        val filesIndex = getEffectiveTabs().indexOf(TAB_FILES)
+        val filesIndex = getPageTabs().indexOf(TAB_FILES)
         if (filesIndex != -1 && binding.mainViewPager.currentItem != filesIndex) {
             binding.mainViewPager.currentItem = filesIndex
         }
@@ -504,7 +525,16 @@ class FileManagerController(
             toolbar().inflateMenu(R.menu.menu)
             tabsView().onTabSelectedListener = object : com.termux.workspaceshell.ui.WorkspaceTabsBarView.OnTabSelectedListener {
                 override fun onTabSelected(index: Int, tab: com.termux.workspaceshell.model.WorkspaceTabModel) {
-                    getFilesFragment()?.selectWorkspaceTab(tab.id)
+                    val filesFragment = getFilesFragment()
+                    val filesPageIndex = getPageTabs().indexOf(TAB_FILES)
+                    val toggled = if (binding.mainViewPager.currentItem == filesPageIndex) {
+                        filesFragment?.toggleSelectedWorkspaceTabContent(tab.id) == true
+                    } else {
+                        false
+                    }
+                    if (!toggled) {
+                        filesFragment?.selectWorkspaceTab(tab.id)
+                    }
                     syncWorkspaceChrome()
                     refreshMenuItems()
                 }
@@ -565,7 +595,6 @@ class FileManagerController(
         getAllFragments().forEach { fragment ->
             fragment?.setBackgroundColor(backgroundColor)
         }
-        binding.mainSearchFab.backgroundTintList = android.content.res.ColorStateList.valueOf(activity.getProperPrimaryColor())
         binding.mainMoreFab.backgroundTintList = android.content.res.ColorStateList.valueOf(activity.getProperPrimaryColor())
     }
 
@@ -627,7 +656,7 @@ class FileManagerController(
         }
 
         if (refreshRecents) {
-            getRecentsFragment()?.refreshFragment()
+            getFilesFragment()?.refreshVisibleFolderRecentsIfNeeded()
         }
 
         if (!hasExplicitPath && !mInitialSessionApplied) {
@@ -646,8 +675,9 @@ class FileManagerController(
 
     private fun initFragments() {
         binding.mainViewPager.apply {
+            isSwipeEnabled = false
             adapter = ViewPagerAdapter(activity, mTabsToShow, intentProvider, fileManagerDependencies)
-            offscreenPageLimit = 2
+            offscreenPageLimit = getPageTabs().size
             addOnPageChangeListener(object : ViewPager.OnPageChangeListener {
                 override fun onPageScrollStateChanged(state: Int) {}
 
@@ -657,7 +687,6 @@ class FileManagerController(
                     getAllFragments().forEach {
                         (it as? ItemOperationsListener)?.finishActMode()
                     }
-                    (getCurrentFragment() as? RecentsFragment)?.refreshFragment()
                     if (getCurrentFragment() !is WorkspaceFilesFragment) {
                         closeSearchPanel(clearQuery = false)
                     }
@@ -665,7 +694,8 @@ class FileManagerController(
                     refreshMenuItems()
                 }
             })
-            currentItem = activity.config.lastUsedViewPagerPage
+            val lastIndex = getPageTabs().lastIndex.coerceAtLeast(0)
+            currentItem = activity.config.lastUsedViewPagerPage.coerceIn(0, lastIndex)
 
             onGlobalLayout {
                 syncWorkspaceChrome()
@@ -694,7 +724,22 @@ class FileManagerController(
     }
 
     private fun getEffectiveTabs(): List<Int> {
-        return mTabsToShow.filter { it and activity.config.showTabs != 0 }
+        val effectiveTabs = linkedSetOf(TAB_FILES)
+        if (mTabsToShow.contains(TAB_RECENT_FILES) && activity.config.showTabs and TAB_RECENT_FILES != 0) {
+            effectiveTabs.add(TAB_RECENT_FILES)
+        }
+        if (mTabsToShow.contains(TAB_STORAGE_ANALYSIS) && activity.config.showTabs and TAB_STORAGE_ANALYSIS != 0) {
+            effectiveTabs.add(TAB_STORAGE_ANALYSIS)
+        }
+        return effectiveTabs.toList()
+    }
+
+    private fun getPageTabs(): List<Int> {
+        val pageTabs = arrayListOf(TAB_FILES)
+        if (mTabsToShow.contains(TAB_STORAGE_ANALYSIS) && activity.config.showTabs and TAB_STORAGE_ANALYSIS != 0) {
+            pageTabs.add(TAB_STORAGE_ANALYSIS)
+        }
+        return pageTabs
     }
 
     private fun setupMainFab() {
@@ -710,21 +755,7 @@ class FileManagerController(
         binding.mainMoreFab.setOnClickListener {
             showBottomOverflowMenu()
         }
-        binding.mainSearchFab.setOnClickListener {
-            val currentFragment = getCurrentFragment() ?: return@setOnClickListener
-            if (currentFragment !is WorkspaceFilesFragment) {
-                return@setOnClickListener
-            }
-            val nextVisible = !currentFragment.isSearchVisible()
-            currentFragment.setSearchVisible(nextVisible)
-            if (!nextVisible) {
-                closeSearchPanel(clearQuery = true)
-            } else {
-                binding.workspaceChrome.setSearchVisible(true)
-                binding.workspaceChrome.focusSearch()
-            }
-            syncWorkspaceChrome()
-        }
+        binding.mainSearchFab.visibility = View.GONE
     }
 
     private fun updateMainFabIcon(isCreateDocumentIntent: Boolean) {
@@ -733,19 +764,32 @@ class FileManagerController(
         binding.mainFab.setImageDrawable(icon)
     }
 
+    private fun openWorkspaceSearch() {
+        val currentFragment = getCurrentFragment() as? WorkspaceFilesFragment ?: return
+        if (!currentFragment.isSearchVisible()) {
+            currentFragment.setSearchVisible(true)
+        }
+        binding.workspaceChrome.setSearchVisible(true)
+        binding.workspaceChrome.focusSearch()
+        syncWorkspaceChrome()
+    }
+
     private fun showBottomOverflowMenu() {
         val popup = PopupMenu(activity, binding.mainMoreFab, Gravity.END)
         val menu = popup.menu
         var order = 0
         val currentFragment = getCurrentFragment() ?: return
         val effectiveTabs = getEffectiveTabs()
-        val selectedTabId = effectiveTabs.getOrNull(binding.mainViewPager.currentItem)
+        val selectedTabId = currentNavigationSelectionId()
 
         if (currentFragment is WorkspaceFilesFragment) {
             menu.add(0, MENU_SWITCH_CORE_NAV, order++, NavigatorFolderHelper.displayTitle())
         }
 
         fun addSwitchItem(itemId: Int, tabId: Int, title: String) {
+            if (tabId == TAB_RECENT_FILES && currentFragment is WorkspaceFilesFragment && !currentFragment.canToggleFolderRecentsForActiveTab()) {
+                return
+            }
             if (!effectiveTabs.contains(tabId)) return
             val item = menu.add(1, itemId, order++, title)
             item.isCheckable = true
@@ -791,11 +835,30 @@ class FileManagerController(
     }
 
     private fun switchBottomView(tabId: Int) {
-        val index = getEffectiveTabs().indexOf(tabId)
-        if (index != -1) {
-            closeSearchPanel(clearQuery = false)
-            binding.mainViewPager.currentItem = index
+        closeSearchPanel(clearQuery = false)
+        val filesPageIndex = getPageTabs().indexOf(TAB_FILES)
+        when (tabId) {
+            TAB_FILES -> {
+                if (filesPageIndex != -1) {
+                    binding.mainViewPager.currentItem = filesPageIndex
+                }
+                getFilesFragment()?.showDirectoryForActiveTab(forceRefresh = true)
+            }
+            TAB_RECENT_FILES -> {
+                if (filesPageIndex != -1) {
+                    binding.mainViewPager.currentItem = filesPageIndex
+                }
+                getFilesFragment()?.showFolderRecentsForActiveTab(forceRefresh = true)
+            }
+            else -> {
+                val index = getPageTabs().indexOf(tabId)
+                if (index != -1) {
+                    binding.mainViewPager.currentItem = index
+                }
+            }
         }
+        syncWorkspaceChrome()
+        refreshMenuItems()
     }
 
     private fun showMainFabMenu() {
@@ -821,8 +884,7 @@ class FileManagerController(
         val storageIcon = content.findViewById<ImageView>(R.id.main_fab_menu_storage_icon)
         val storageLabel = content.findViewById<TextView>(R.id.main_fab_menu_storage_label)
 
-        val selectedIndex = binding.mainViewPager.currentItem
-        val selectedTabId = effectiveTabs.getOrNull(selectedIndex)
+        val selectedTabId = currentNavigationSelectionId()
         val textColor = activity.getProperTextColor()
         val selectedColor = activity.getProperPrimaryColor()
 
@@ -843,8 +905,7 @@ class FileManagerController(
             icon.setImageDrawable(activity.resources.getColoredDrawableWithColor(iconRes, color))
             label.setTextColor(color)
             row.setOnClickListener {
-                closeSearchPanel(clearQuery = false)
-                binding.mainViewPager.currentItem = index
+                switchBottomView(tabId)
                 mainFabMenu?.dismiss()
             }
         }
@@ -887,8 +948,7 @@ class FileManagerController(
     }
 
     private fun openCreateNew() {
-        val effectiveTabs = getEffectiveTabs()
-        val filesIndex = effectiveTabs.indexOf(TAB_FILES)
+        val filesIndex = getPageTabs().indexOf(TAB_FILES)
         if (filesIndex == -1) {
             return
         }
@@ -896,9 +956,11 @@ class FileManagerController(
         if (binding.mainViewPager.currentItem != filesIndex) {
             binding.mainViewPager.currentItem = filesIndex
             binding.mainViewPager.post {
+                getFilesFragment()?.showDirectoryForActiveTab(forceRefresh = true)
                 getFilesFragment()?.activeItemsFragment()?.showCreateNewItemDialog()
             }
         } else {
+            getFilesFragment()?.showDirectoryForActiveTab(forceRefresh = true)
             getFilesFragment()?.activeItemsFragment()?.showCreateNewItemDialog()
         }
     }
@@ -1265,7 +1327,6 @@ class FileManagerController(
         activity.finish()
     }
 
-    private fun getRecentsFragment() = activity.findViewById<RecentsFragment>(R.id.recents_fragment)
     private fun getFilesFragment(): WorkspaceFilesFragment? {
         val fragment = activity.findViewById<WorkspaceFilesFragment>(R.id.workspace_files_fragment)
         fragment?.workspaceStateChangedListener = {
@@ -1276,7 +1337,7 @@ class FileManagerController(
     }
     private fun getStorageFragment() = activity.findViewById<StorageFragment>(R.id.storage_fragment)
     private fun getAllFragments(): ArrayList<MyViewPagerFragment<*>?> =
-        arrayListOf(getFilesFragment(), getRecentsFragment(), getStorageFragment())
+        arrayListOf(getFilesFragment(), getStorageFragment())
 
     private fun activeItemsFragment(): ItemsFragment? =
         (getCurrentFragment() as? WorkspaceFilesFragment)?.activeItemsFragment()
@@ -1314,15 +1375,19 @@ class FileManagerController(
     }
 
     private fun getCurrentFragment(): MyViewPagerFragment<*>? {
-        val fragments = arrayListOf<MyViewPagerFragment<*>>()
-        getEffectiveTabs().forEach { tab ->
-            when (tab) {
-                TAB_FILES -> getFilesFragment()?.let { fragments.add(it) }
-                TAB_RECENT_FILES -> getRecentsFragment()?.let { fragments.add(it) }
-                TAB_STORAGE_ANALYSIS -> getStorageFragment()?.let { fragments.add(it) }
-            }
+        return when (getPageTabs().getOrNull(binding.mainViewPager.currentItem)) {
+            TAB_FILES -> getFilesFragment()
+            TAB_STORAGE_ANALYSIS -> getStorageFragment()
+            else -> null
         }
-        return fragments.getOrNull(binding.mainViewPager.currentItem)
+    }
+
+    private fun currentNavigationSelectionId(): Int? {
+        return when (getCurrentFragment()) {
+            is StorageFragment -> TAB_STORAGE_ANALYSIS
+            is WorkspaceFilesFragment -> if (getFilesFragment()?.isActiveTabShowingFolderRecents() == true) TAB_RECENT_FILES else TAB_FILES
+            else -> null
+        }
     }
 
     private fun closeSearchPanel(clearQuery: Boolean) {
@@ -1338,7 +1403,7 @@ class FileManagerController(
         val currentFragment = getCurrentFragment()
         val isFilesSelected = currentFragment is WorkspaceFilesFragment
         binding.workspaceChrome.tabsView().visibility = if (isFilesSelected) View.VISIBLE else View.GONE
-        binding.mainSearchFab.visibility = if (isFilesSelected) View.VISIBLE else View.GONE
+        binding.mainSearchFab.visibility = View.GONE
         binding.mainMoreFab.visibility = if (currentFragment == null) View.GONE else View.VISIBLE
 
         if (isFilesSelected) {

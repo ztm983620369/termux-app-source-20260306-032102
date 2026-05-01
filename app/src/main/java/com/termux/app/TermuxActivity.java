@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -24,6 +25,7 @@ import android.util.TypedValue;
 import android.view.ContextMenu;
 import android.view.ContextMenu.ContextMenuInfo;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.MotionEvent;
@@ -292,6 +294,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private static final int TAB_TERMINAL = 4;
     private static final long EDITOR_TRANSITION_DURATION_MS = 180L;
     private static final long TERMINAL_CONFIG_TRANSITION_DURATION_MS = 180L;
+    private static final boolean SESSION_DRAWER_DISABLED = true;
 
     private static final String LOG_TAG = "TermuxActivity";
     private BottomNavigationView mBottomNavigationView;
@@ -394,6 +397,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
 
         setContentView(R.layout.activity_termux);
+        closeAndLockSessionDrawer();
         mStatusBarScrim = findViewById(R.id.status_bar_scrim);
         mNonTerminalWindowBackgroundColor = resolveNonTerminalWindowBackgroundColor();
         applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
@@ -581,7 +585,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         applyTerminalProgrammaticFocusPolicy(shouldRestoreTerminalFocus);
 
         if (mTermuxTerminalViewClient != null) {
-            if (isTerminalSurfaceActive() && getTerminalSelectionSnapshot(null).configSelected) {
+            if (isEditorTerminalWorkspaceActive() && isEmbeddedTerminalImeActive()) {
+                mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(null, false);
+            } else if (isTerminalSurfaceActive() && getTerminalSelectionSnapshot(null).configSelected) {
                 mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(false, false);
             } else if (isTerminalSurfaceActive() && mTerminalSoftKeyboardVisibilityKnown) {
                 mTermuxTerminalViewClient.setResumeSoftKeyboardVisibilityOverride(
@@ -647,6 +653,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mBottomNavTab == TAB_FILES) {
             ensureFileManagerInitialized();
             resumeFileManager(false);
+        }
+        if (isEditorTerminalWorkspaceActive() && isEmbeddedTerminalImeActive() && mTerminalSoftKeyboardVisibilityKnown) {
+            restoreEmbeddedTerminalIme(mTerminalSoftKeyboardVisible && mTerminalRestoreFocus);
         }
         if (isTerminalSurfaceActive() && getTerminalSelectionSnapshot(null).configSelected && mTerminalSessionSurfaceView != null) {
             ensureTerminalConfigInitialized();
@@ -937,6 +946,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     @Override
+    public void showPathBarActions(View anchor, String currentPath) {
+        if (mFileManagerController != null) {
+            mFileManagerController.showPathBarActions(anchor, currentPath);
+        }
+    }
+
+    @Override
     public boolean closeActiveWorkspaceTabIfPossible() {
         return mFileManagerController != null && mFileManagerController.closeActiveWorkspaceTabIfPossible();
     }
@@ -1073,6 +1089,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private void setupBottomNavigation(Bundle savedInstanceState) {
         mBottomNavigationView = findViewById(R.id.bottom_navigation);
         if (mBottomNavigationView == null) return;
+        applyDarkBottomNavigationStyle();
 
         mEditorPage = findViewById(R.id.page_editor);
         if (mEditorPage != null) {
@@ -1152,6 +1169,22 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
 
         mTerminalConfigPage = findViewById(R.id.page_terminal_config);
+    }
+
+    private void applyDarkBottomNavigationStyle() {
+        int[][] states = new int[][]{
+            new int[]{android.R.attr.state_checked},
+            new int[]{}
+        };
+        int[] colors = new int[]{Color.WHITE, 0xFF9E9E9E};
+        ColorStateList itemTint = new ColorStateList(states, colors);
+
+        mBottomNavigationView.setBackgroundColor(Color.BLACK);
+        mBottomNavigationView.setItemBackgroundResource(android.R.color.black);
+        mBottomNavigationView.setItemIconTintList(itemTint);
+        mBottomNavigationView.setItemTextColor(itemTint);
+        mBottomNavigationView.setItemRippleColor(ColorStateList.valueOf(0xFF212121));
+        mBottomNavigationView.setElevation(0f);
     }
 
     public void setBottomNavigationFixedOnImeEnabled(boolean enabled) {
@@ -1586,6 +1619,46 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         return mTerminalWorkspaceController.isVisible();
     }
 
+    public boolean isEmbeddedTerminalImeActive() {
+        return mEditorTerminalOverlayVisible &&
+            mEditorController != null &&
+            mEditorController.isEmbeddedTerminalImeActive();
+    }
+
+    @Override
+    public void sendTextToEmbeddedTerminal(CharSequence text) {
+        if (text == null || text.length() == 0) return;
+        TerminalView terminalView = getTerminalView();
+        if (terminalView == null || terminalView.getCurrentSession() == null) return;
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            text.codePoints().forEach(codePoint ->
+                terminalView.inputCodePoint(TerminalView.KEY_EVENT_SOURCE_VIRTUAL_KEYBOARD, codePoint, false, false));
+            return;
+        }
+        String raw = text.toString();
+        for (int i = 0; i < raw.length(); i++) {
+            terminalView.inputCodePoint(TerminalView.KEY_EVENT_SOURCE_VIRTUAL_KEYBOARD, raw.charAt(i), false, false);
+        }
+    }
+
+    @Override
+    public void sendBackspaceToEmbeddedTerminal() {
+        TerminalView terminalView = getTerminalView();
+        if (terminalView == null) return;
+        KeyEvent deleteEvent = new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL);
+        terminalView.onKeyDown(KeyEvent.KEYCODE_DEL, deleteEvent);
+    }
+
+    public void reactivateSharedImeForEmbeddedTerminal() {
+        if (!isEditorTerminalWorkspaceActive() || mEditorController == null) return;
+        mEditorController.showEmbeddedTerminalIme();
+    }
+
+    public void restoreEmbeddedTerminalIme(boolean visible) {
+        if (!mEditorTerminalOverlayVisible || mEditorController == null) return;
+        mEditorController.restoreEmbeddedTerminalIme(visible);
+    }
+
     @NonNull
     public TerminalWorkspaceController getTerminalWorkspaceController() {
         return mTerminalWorkspaceController;
@@ -1597,6 +1670,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             if (!ensureEditorInitialized()) return false;
             if (mBottomNavTab != TAB_EDITOR) return false;
             if (mTerminalContainer == null) return false;
+            boolean keepKeyboardVisible =
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && KeyboardUtils.isSoftKeyboardVisible(TermuxActivity.this);
 
             if (mTermuxService != null && mTermuxService.getTermuxSessionsSize() <= 0 &&
                 mTermuxTerminalSessionActivityClient != null) {
@@ -1621,7 +1696,6 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             }
             refreshTerminalSessionSurface();
             refreshTerminalTopBar();
-            // Treat editor overlay as a full terminal surface (drawer unlock, config page enablement, system UI).
             applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
             applyTerminalSurfaceMode();
 
@@ -1640,6 +1714,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 .start();
 
             if (mEditorController != null) {
+                mEditorController.onEmbeddedTerminalShown(keepKeyboardVisible);
                 mEditorController.syncEmbeddedTerminalWorkspaceUi();
             }
             syncActiveTerminalBindings();
@@ -1650,6 +1725,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         @Override
         public boolean hide() {
             if (!mEditorTerminalOverlayVisible) return false;
+            boolean keepKeyboardVisible =
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && KeyboardUtils.isSoftKeyboardVisible(TermuxActivity.this);
             mEditorTerminalOverlayVisible = false;
 
             if (mTerminalContainer != null) {
@@ -1669,7 +1746,6 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                             mTerminalContainer.setTranslationX(0f);
                             if (mEditorPage != null) mEditorPage.bringToFront();
                         }
-                        // Restore editor semantics once terminal overlay is fully hidden.
                         applyWindowBackgroundForTab(getEffectiveTabForSystemUi());
                         applyTerminalSurfaceMode();
                     })
@@ -1677,6 +1753,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             }
 
             if (mEditorController != null) {
+                mEditorController.onEmbeddedTerminalHidden(keepKeyboardVisible);
                 mEditorController.syncEmbeddedTerminalWorkspaceUi();
             }
             syncActiveTerminalBindings();
@@ -2262,9 +2339,33 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         updateTerminalConfigPageVisibility();
         final DrawerLayout drawer = getDrawer();
         if (drawer != null) {
-            drawer.setDrawerLockMode(isTerminalSurfaceActive()
-                ? DrawerLayout.LOCK_MODE_UNLOCKED
-                : DrawerLayout.LOCK_MODE_LOCKED_CLOSED);
+            if (isSessionDrawerDisabled()) {
+                closeAndLockSessionDrawer();
+            } else {
+                drawer.setDrawerLockMode(isTerminalSurfaceActive()
+                    ? DrawerLayout.LOCK_MODE_UNLOCKED
+                    : DrawerLayout.LOCK_MODE_LOCKED_CLOSED);
+            }
+        }
+    }
+
+    public boolean isSessionDrawerDisabled() {
+        return SESSION_DRAWER_DISABLED;
+    }
+
+    @SuppressLint("RtlHardcoded")
+    public void closeAndLockSessionDrawer() {
+        final DrawerLayout drawer = getDrawer();
+        if (drawer == null) return;
+
+        drawer.closeDrawers();
+        drawer.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED);
+        drawer.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED, Gravity.LEFT);
+
+        View leftDrawer = findViewById(R.id.left_drawer);
+        if (leftDrawer != null) {
+            leftDrawer.setEnabled(false);
+            leftDrawer.setVisibility(View.GONE);
         }
     }
 
@@ -2557,10 +2658,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         EditText textInputView = findViewById(R.id.terminal_surface_text_input);
         boolean textInputViewHasFocus = textInputView != null && textInputView.hasFocus();
         boolean terminalViewHasFocus = mTerminalView != null && mTerminalView.hasFocus();
+        boolean embeddedTerminalImeActive = isEmbeddedTerminalImeActive();
         mTerminalSoftKeyboardVisibilityKnown = true;
         mTerminalSoftKeyboardVisible = !KeyboardUtils.areDisableSoftKeyboardFlagsSet(this) &&
             KeyboardUtils.isSoftKeyboardVisible(this);
-        mTerminalRestoreFocus = mTerminalSoftKeyboardVisible && (textInputViewHasFocus || terminalViewHasFocus);
+        mTerminalRestoreFocus = mTerminalSoftKeyboardVisible &&
+            (textInputViewHasFocus || terminalViewHasFocus || embeddedTerminalImeActive);
     }
 
     private void applyTerminalProgrammaticFocusPolicy(boolean allowProgrammaticFocus) {
@@ -2852,6 +2955,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     @Override
     protected boolean onBackPressedCompat() {
         if (mBottomNavTab == TAB_EDITOR) {
+            if (mEditorController != null && mEditorController.onBackPressedCompat()) {
+                return true;
+            }
             if (mEditorTerminalOverlayVisible) {
                 hideEmbeddedTerminalWorkspace();
                 if (mEditorController != null) {

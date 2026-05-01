@@ -111,7 +111,6 @@ internal object VSCodeSyntaxSelfTest {
             )
         }
 
-        var anyMultiToken = false
         var anyStoppedEarly = false
         var anyNonRootScope = false
 
@@ -136,8 +135,7 @@ internal object VSCodeSyntaxSelfTest {
                         if (r.isStoppedEarly) anyStoppedEarly = true
 
                         val tokens = r.tokens
-                        if (tokens.size > 1) anyMultiToken = true
-                        if (tokens.any { t -> t.scopes.any { s -> s != info.scopeName && s != "unknown" } }) {
+                        if (tokens.any { t -> t.scopes.any { s -> isNonRootScope(s, info.scopeName) } }) {
                             anyNonRootScope = true
                         }
 
@@ -166,7 +164,7 @@ internal object VSCodeSyntaxSelfTest {
             }
         }
 
-        val suspectedNoHighlight = !anyMultiToken || !anyNonRootScope
+        val suspectedNoHighlight = !anyNonRootScope
         return LanguageReport(
             ok = true,
             suspectedNoHighlight = suspectedNoHighlight,
@@ -181,6 +179,16 @@ internal object VSCodeSyntaxSelfTest {
         return false
     }
 
+    private fun isNonRootScope(scope: String, rootScope: String): Boolean {
+        val s = scope.trim()
+        if (s.isEmpty() || s == "unknown") return false
+        if (s == rootScope) return false
+        return s.split(' ').any { child ->
+            val part = child.trim()
+            part.isNotEmpty() && part != rootScope && part != "unknown"
+        }
+    }
+
     private fun safeSlice(s: String, start: Int, end: Int): String {
         val a = start.coerceIn(0, s.length)
         val b = end.coerceIn(a, s.length)
@@ -188,4 +196,3 @@ internal object VSCodeSyntaxSelfTest {
         return raw.replace("\t", "\\t").replace("\n", "\\n")
     }
 }
-

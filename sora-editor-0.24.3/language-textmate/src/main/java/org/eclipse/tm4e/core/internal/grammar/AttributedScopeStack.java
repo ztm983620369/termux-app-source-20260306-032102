@@ -33,31 +33,7 @@ import org.eclipse.tm4e.core.internal.utils.StringUtils;
 public final class AttributedScopeStack {
 
 	@NonNullByDefault({}) // https://github.com/eclipse-jdt/eclipse.jdt.core/issues/233
-	static final class Frame {
-		final int encodedTokenAttributes;
-		final List<String> scopeNames;
-
-		Frame(final int encodedTokenAttributes, final List<String> scopeNames) {
-			this.encodedTokenAttributes = encodedTokenAttributes;
-			this.scopeNames = scopeNames;
-		}
-
-		@Override
-		public boolean equals(final Object o) {
-			if (this == o) return true;
-			if (!(o instanceof final Frame frame)) return false;
-			return encodedTokenAttributes == frame.encodedTokenAttributes && Objects.equals(scopeNames, frame.scopeNames);
-		}
-
-		@Override
-		public int hashCode() {
-			return Objects.hash(encodedTokenAttributes, scopeNames);
-		}
-
-		@Override
-		public String toString() {
-			return "Frame[encodedTokenAttributes=" + encodedTokenAttributes + ", scopeNames=" + scopeNames + "]";
-		}
+	record Frame(int encodedTokenAttributes, List<String> scopeNames) {
 	}
 
 	@Nullable

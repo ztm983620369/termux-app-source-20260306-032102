@@ -16,7 +16,7 @@ import java.util.NoSuchElementException;
 import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.tm4e.core.internal.parser.PropertySettable;
 
-public final class RawRepository extends PropertySettable.HashMap<IRawRule> implements IRawRepository {
+public final class RawRepository extends PropertySettable.HashMap<Object> implements IRawRepository {
 
 	private static final long serialVersionUID = 1L;
 
@@ -25,17 +25,18 @@ public final class RawRepository extends PropertySettable.HashMap<IRawRule> impl
 
 	@SuppressWarnings({ "null", "unused" })
 	private IRawRule getSafe(final String key) {
-		final IRawRule obj = get(key);
-		if (obj == null) {
+		final Object obj = get(key);
+		if (!(obj instanceof final IRawRule rawRule)) {
 			throw new NoSuchElementException("Key '" + key + "' does not exit found");
 		}
-		return obj;
+		return rawRule;
 	}
 
 	@Override
 	@Nullable
 	public IRawRule getRule(final String name) {
-		return get(name);
+		final Object obj = get(name);
+		return obj instanceof final IRawRule rawRule ? rawRule : null;
 	}
 
 	@Override
@@ -61,7 +62,9 @@ public final class RawRepository extends PropertySettable.HashMap<IRawRule> impl
 	@Override
 	public void putEntries(final PropertySettable<IRawRule> target) {
 		for (final var entry : entrySet()) {
-			target.setProperty(entry.getKey(), entry.getValue());
+			if (entry.getValue() instanceof final IRawRule rawRule) {
+				target.setProperty(entry.getKey(), rawRule);
+			}
 		}
 	}
 }

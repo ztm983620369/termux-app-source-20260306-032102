@@ -28,18 +28,22 @@ import android.graphics.Canvas
 import android.graphics.Color
 import io.github.rosemoe.sora.graphics.InlayHintRenderParams
 import io.github.rosemoe.sora.graphics.Paint
+import io.github.rosemoe.sora.lang.styling.color.ConstColor
+import io.github.rosemoe.sora.lang.styling.color.ResolvableColor
 import io.github.rosemoe.sora.lang.styling.inlayHint.ColorInlayHint
 import io.github.rosemoe.sora.lang.styling.inlayHint.InlayHint
 import io.github.rosemoe.sora.widget.schemes.EditorColorScheme
 
-open class ColorInlayHintRenderer() : InlayHintRenderer() {
+open class ColorInlayHintRenderer(
+    val borderColor: ResolvableColor = ConstColor(Color.WHITE)
+) : InlayHintRenderer() {
 
     companion object {
         val DefaultInstance = ColorInlayHintRenderer()
     }
 
     override val typeName: String
-        get() = "color"
+        get() = ColorInlayHint.TYPE_NAME
 
     protected val localPaint = Paint().also {
         it.isAntiAlias = true
@@ -76,7 +80,7 @@ open class ColorInlayHintRenderer() : InlayHintRenderer() {
             centerY + halfSize,
             localPaint
         )
-        localPaint.color = Color.WHITE
+        localPaint.color = borderColor.resolve(colorScheme)
         localPaint.style = android.graphics.Paint.Style.STROKE
         canvas.drawRect(
             centerX - halfSize,

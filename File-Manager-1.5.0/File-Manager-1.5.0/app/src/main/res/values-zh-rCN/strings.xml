@@ -13,4 +13,20 @@
     <string name="favorite_remark_hint">收藏备注</string>
     <string name="favorite_remark_required">备注不能为空</string>
     <string name="favorite_remark_message">备注会显示在核心导航器中，位于 SFTP 或路径信息上方。</string>
+    <string name="recent_file_size_unknown">未知大小</string>
+    <string name="recent_time_today">今天</string>
+    <string name="recent_time_yesterday">昨天</string>
+    <string name="recent_time_day_before_yesterday">前天</string>
+    <string name="recent_time_last_week">一周前</string>
+    <string name="recent_time_last_month">上个月</string>
+    <plurals name="recent_time_days_ago">
+        <item quantity="other">%d天前</item>
+    </plurals>
+    <plurals name="recent_time_weeks_ago">
+        <item quantity="other">%d周前</item>
+    </plurals>
+    <plurals name="recent_time_months_ago">
+        <item quantity="other">%d个月前</item>
+    </plurals>
+    <string name="multi_select">多选</string>
 </resources>

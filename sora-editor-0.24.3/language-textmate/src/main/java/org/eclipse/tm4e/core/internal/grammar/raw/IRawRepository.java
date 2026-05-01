@@ -28,10 +28,16 @@ public interface IRawRepository {
 
 	static IRawRepository merge(@Nullable final IRawRepository... sources) {
 		final var merged = new RawRepository();
+		final PropertySettable<IRawRule> target = new PropertySettable<>() {
+			@Override
+			public void setProperty(final String name, final IRawRule value) {
+				merged.put(name, value);
+			}
+		};
 		for (final var source : sources) {
 			if (source == null)
 				continue;
-			source.putEntries(merged);
+			source.putEntries(target);
 		}
 		return merged;
 	}

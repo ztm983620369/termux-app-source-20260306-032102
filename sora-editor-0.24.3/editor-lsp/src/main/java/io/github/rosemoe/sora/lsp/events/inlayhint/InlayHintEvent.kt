@@ -24,7 +24,6 @@
 
 package io.github.rosemoe.sora.lsp.events.inlayhint
 
-import android.util.Log
 import io.github.rosemoe.sora.annotations.Experimental
 import io.github.rosemoe.sora.lsp.editor.LspEditor
 import io.github.rosemoe.sora.lsp.events.AsyncEventListener
@@ -71,6 +70,7 @@ class InlayHintEvent : AsyncEventListener() {
 
     private fun getOrCreateFlow(
         coroutineScope: CoroutineScope,
+        context: EventContext,
         uri: String
     ): MutableSharedFlow<InlayHintRequest> {
         return requestFlows.getOrPut(uri) {
@@ -80,12 +80,11 @@ class InlayHintEvent : AsyncEventListener() {
                 onBufferOverflow = BufferOverflow.DROP_OLDEST
             )
 
-
             coroutineScope.launch(Dispatchers.Main) {
                 flow
                     .debounce(50)
                     .collect { request ->
-                        processInlayHintRequest(request)
+                        processInlayHintRequest(request, context)
                     }
             }
 
@@ -93,23 +92,23 @@ class InlayHintEvent : AsyncEventListener() {
         }
     }
 
-    override suspend fun handleAsync(context: EventContext) {
+    override suspend fun doHandleAsync(context: EventContext) {
         val editor = context.get<LspEditor>("lsp-editor")
         val position = context.getByClass<CharPosition>() ?: return
 
         val uri = editor.uri.toString()
 
-        val flow = getOrCreateFlow(editor.coroutineScope, uri)
+        val flow = getOrCreateFlow(editor.coroutineScope, context, uri)
         flow.tryEmit(InlayHintRequest(editor, position))
     }
 
-    private suspend fun processInlayHintRequest(request: InlayHintRequest) =
+    private suspend fun processInlayHintRequest(request: InlayHintRequest, context: EventContext) =
         withContext(Dispatchers.IO) {
             val editor = request.editor
             val position = request.position
             val content = editor.editor?.text ?: return@withContext
 
-            val requestManager = editor.requestManager ?: return@withContext
+            val requestManager = editor.requestManager
 
             // Request over 500 lines for current window
 
@@ -133,25 +132,23 @@ class InlayHintEvent : AsyncEventListener() {
 
             this@InlayHintEvent.future = future.thenAccept { }
 
+            val inlayHints: List<InlayHint>?
 
             try {
-                val inlayHints: List<InlayHint>?
-
                 withTimeout(Timeout[Timeouts.INLAY_HINT].toLong()) {
                     inlayHints = future.await()
                 }
-
-                if (inlayHints == null || inlayHints.isEmpty()) {
-                    editor.showInlayHints(null)
-                    return@withContext
-                }
-
-                editor.showInlayHints(inlayHints)
-            } catch (exception: Exception) {
-                // throw?
-                exception.printStackTrace()
-                Log.e("LSP client", "show inlay hint timeout", exception)
+            } catch (e: Exception) {
+                onException(context, e)
+                return@withContext
             }
+
+            if (inlayHints.isNullOrEmpty()) {
+                editor.showInlayHints(null)
+                return@withContext
+            }
+
+            editor.showInlayHints(inlayHints)
         }
 
     override fun dispose() {

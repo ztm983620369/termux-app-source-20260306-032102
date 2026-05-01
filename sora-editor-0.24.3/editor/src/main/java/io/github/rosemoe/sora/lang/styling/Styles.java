@@ -59,10 +59,6 @@ public class Styles {
     public Map<Class<?>, MutableInt> styleTypeCount;
 
     public List<CodeBlock> blocks;
-    /**
-     * Internal, automatically generated
-     */
-    public List<CodeBlock> blocksByStart;
 
     public int suppressSwitch = Integer.MAX_VALUE;
 
@@ -136,7 +132,8 @@ public class Styles {
      * Adjust styles on insert.
      */
     public void adjustOnInsert(@NonNull CharPosition start, @NonNull CharPosition end) {
-        spans.adjustOnInsert(start, end);
+        if (spans != null)
+            spans.adjustOnInsert(start, end);
         var delta = end.line - start.line;
         if (delta == 0) {
             return;
@@ -157,7 +154,8 @@ public class Styles {
      * Adjust styles on delete.
      */
     public void adjustOnDelete(@NonNull CharPosition start, @NonNull CharPosition end) {
-        spans.adjustOnDelete(start, end);
+        if (spans != null)
+            spans.adjustOnDelete(start, end);
         var delta = start.line - end.line;
         if (delta == 0) {
             return;
@@ -266,10 +264,6 @@ public class Styles {
             if (sort) {
                 Collections.sort(blocks, CodeBlock.COMPARATOR_END);
             }
-            blocksByStart = new ArrayList<>(blocks);
-            Collections.sort(blocksByStart, CodeBlock.COMPARATOR_START);
-        } else {
-            blocksByStart = null;
         }
         if (lineStyles != null) {
             Collections.sort(lineStyles);

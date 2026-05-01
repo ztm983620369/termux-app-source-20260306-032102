@@ -93,6 +93,7 @@ public final class TerminalEmulator {
 
     /** Needs to be large enough to contain reasonable OSC 52 pastes. */
     private static final int MAX_OSC_STRING_LENGTH = 8192;
+    private static final int OSC_TERMUX_HOST_CONTROL = 8900;
 
     /** DECSET 1 - application cursor keys. */
     private static final int DECSET_BIT_APPLICATION_CURSOR_KEYS = 1;
@@ -261,6 +262,8 @@ public final class TerminalEmulator {
      * with the scrolling text.
      */
     private int mScrollCounter = 0;
+    /** Set when a state change requires a full viewport redraw rather than dirty-row repaint. */
+    private boolean mFullRedrawRequired = true;
 
     /** If automatic scrolling of terminal is disabled */
     private boolean mAutoScrollDisabled;
@@ -411,6 +414,7 @@ public final class TerminalEmulator {
         }
 
         resizeScreen();
+        mFullRedrawRequired = true;
     }
 
     private void resizeScreen() {
@@ -484,6 +488,15 @@ public final class TerminalEmulator {
     /** If mouse events are being sent as escape codes to the terminal. */
     public boolean isMouseTrackingActive() {
         return isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_PRESS_RELEASE) || isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT);
+    }
+
+    public boolean shouldSendFocusEvents() {
+        return isDecsetInternalBitSet(DECSET_BIT_SEND_FOCUS_EVENTS);
+    }
+
+    public void onHostWindowFocusChanged(boolean hasFocus) {
+        if (!shouldSendFocusEvents()) return;
+        mSession.write(hasFocus ? "\033[I" : "\033[O");
     }
 
     private void setDefaultTabStops() {
@@ -1207,7 +1220,8 @@ public final class TerminalEmulator {
                 break;
             case 4: // DECSCLM-Scrolling Mode. Ignore.
                 break;
-            case 5: // Reverse video. No action.
+            case 5: // Reverse video. Colors of the entire viewport change.
+                mFullRedrawRequired = true;
                 break;
             case 6: // Set: Origin Mode. Reset: Normal Cursor Mode. Ansi name: DECOM.
                 if (setting) setCursorPosition(0, 0);
@@ -1271,6 +1285,7 @@ public final class TerminalEmulator {
                     // Clear new screen if alt buffer:
                     if (newScreen == mAltBuffer)
                         newScreen.blockSet(0, 0, mColumns, mRows, ' ', getStyle());
+                    mFullRedrawRequired = true;
                 }
                 break;
             }
@@ -2123,6 +2138,9 @@ public final class TerminalEmulator {
                     Logger.logError(mClient, LOG_TAG, "OSC Manipulate selection, invalid string '" + textParameter + "");
                 }
                 break;
+            case OSC_TERMUX_HOST_CONTROL:
+                handleTermuxHostControl(textParameter);
+                break;
             case 104:
                 // "104;$c" → Reset Color Number $c. It is reset to the color specified by the corresponding X
                 // resource. Any number of c parameters may be given. These parameters correspond to the ANSI colors 0-7,
@@ -2196,6 +2214,24 @@ public final class TerminalEmulator {
                 unknownParameter(modeBit);
                 break;
         }
+    }
+
+    private void handleTermuxHostControl(String textParameter) {
+        if (textParameter.isEmpty()) return;
+
+        int separatorIndex = textParameter.indexOf(';');
+        String command;
+        String argument;
+        if (separatorIndex < 0) {
+            command = textParameter;
+            argument = "";
+        } else {
+            command = textParameter.substring(0, separatorIndex);
+            argument = textParameter.substring(separatorIndex + 1);
+        }
+
+        if (command.isEmpty()) return;
+        mSession.onTerminalHostControlCommand(command, argument.isEmpty() ? null : argument);
     }
 
     /**
@@ -2533,6 +2569,14 @@ public final class TerminalEmulator {
 
     public void clearScrollCounter() {
         mScrollCounter = 0;
+    }
+
+    public boolean isFullRedrawRequired() {
+        return mFullRedrawRequired;
+    }
+
+    public void clearFullRedrawRequired() {
+        mFullRedrawRequired = false;
     }
 
     public boolean isAutoScrollDisabled() {

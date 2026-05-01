@@ -85,6 +85,7 @@
     <string name="open_debug_document">打开View.java</string>
     <string name="debug">测试</string>
     <string name="layout_tv_search_options">选项</string>
+    <string name="close_search">关闭搜索</string>
     <string name="search_option_regex">正则表达式</string>
     <string name="search_option_whole_word">全词匹配</string>
     <string name="search_option_match_case">区分大小写</string>

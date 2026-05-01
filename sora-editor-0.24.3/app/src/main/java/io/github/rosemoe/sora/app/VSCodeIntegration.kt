@@ -95,8 +95,14 @@ internal class VSCodeIntegration(
     val languageCacheSize: Int get() = vsCodeLanguageCache?.size ?: 0
     val preloadedRootsSize: Int get() = vsCodePreloadedExtensionRoots.size
 
+    init {
+        if (!prefs.contains(KEY_VSCODE_AUTO_HIGHLIGHT_ENABLED)) {
+            prefs.edit().putBoolean(KEY_VSCODE_AUTO_HIGHLIGHT_ENABLED, true).apply()
+        }
+    }
+
     fun isVSCodeAutoHighlightEnabled(): Boolean {
-        return prefs.getBoolean(KEY_VSCODE_AUTO_HIGHLIGHT_ENABLED, false)
+        return prefs.getBoolean(KEY_VSCODE_AUTO_HIGHLIGHT_ENABLED, true)
     }
 
     private fun setVSCodeAutoHighlightEnabled(enabled: Boolean) {
@@ -254,11 +260,13 @@ internal class VSCodeIntegration(
         val extensionName: String?,
         val extensions: List<String> = emptyList(),
         val filenames: List<String> = emptyList(),
+        val filenamePatterns: List<String> = emptyList(),
         val embeddedLanguages: Map<String, String> = emptyMap()
     )
 
     enum class VSCodeAutoMatchKind {
         FILENAME,
+        FILENAME_PATTERN,
         EXTENSION
     }
 
@@ -330,7 +338,7 @@ internal class VSCodeIntegration(
         if (info.grammarPath != null) score += 20
         if (info.scopeName.contains("basic", ignoreCase = true)) score += 5
         if (info.scopeName.contains("derivative", ignoreCase = true)) score -= 5
-        if (info.extensions.isNotEmpty() || info.filenames.isNotEmpty()) score += 1
+        if (info.extensions.isNotEmpty() || info.filenames.isNotEmpty() || info.filenamePatterns.isNotEmpty()) score += 1
         return score
     }
 
@@ -364,7 +372,8 @@ internal class VSCodeIntegration(
                         languageConfigurationPath = languageConfigurationPath,
                         extensionName = EXT_BUILTIN_TEXTMATE,
                         extensions = emptyList(),
-                        filenames = emptyList()
+                        filenames = emptyList(),
+                        filenamePatterns = emptyList()
                     )
                 )
             }
@@ -395,7 +404,8 @@ internal class VSCodeIntegration(
                 val displayName: String,
                 val configurationPath: String?,
                 val extensions: List<String>,
-                val filenames: List<String>
+                val filenames: List<String>,
+                val filenamePatterns: List<String>
             )
 
             val languageMeta = HashMap<String, LanguageMeta>(languagesArray.length())
@@ -432,11 +442,22 @@ internal class VSCodeIntegration(
                     list
                 }.getOrElse { emptyList() }
 
+                val filenamePatterns = runCatching {
+                    val arr = obj.optJSONArray("filenamePatterns") ?: JSONArray()
+                    val list = ArrayList<String>(arr.length())
+                    for (k in 0 until arr.length()) {
+                        val n = arr.optString(k).trim()
+                        if (n.isNotEmpty()) list.add(n.lowercase())
+                    }
+                    list
+                }.getOrElse { emptyList() }
+
                 languageMeta[id] = LanguageMeta(
                     displayName = displayName,
                     configurationPath = configPath,
                     extensions = extensions,
-                    filenames = filenames
+                    filenames = filenames,
+                    filenamePatterns = filenamePatterns
                 )
             }
 
@@ -459,6 +480,7 @@ internal class VSCodeIntegration(
                 val languageConfigurationPath = meta?.configurationPath
                 val extensions = meta?.extensions.orEmpty()
                 val filenames = meta?.filenames.orEmpty()
+                val filenamePatterns = meta?.filenamePatterns.orEmpty()
 
                 val embeddedLanguagesObj = obj.optJSONObject("embeddedLanguages")
                 val embeddedLanguages = if (embeddedLanguagesObj != null) {
@@ -486,6 +508,7 @@ internal class VSCodeIntegration(
                         extensionName = root,
                         extensions = extensions,
                         filenames = filenames,
+                        filenamePatterns = filenamePatterns,
                         embeddedLanguages = embeddedLanguages
                     )
                 )
@@ -578,6 +601,20 @@ internal class VSCodeIntegration(
             )
         }
 
+        val byFileNamePattern = languages.mapNotNull { info ->
+            val pattern = info.filenamePatterns.firstOrNull { matchesVSCodeFilenamePattern(nameLower, it) }
+            if (pattern == null) null else info to pattern
+        }.maxByOrNull { (info, pattern) ->
+            scoreVSCodeLanguageForFileMatch(info) + pattern.count { it != '*' && it != '?' }
+        }
+        if (byFileNamePattern != null) {
+            return VSCodeFileMatch(
+                info = byFileNamePattern.first,
+                matchKind = VSCodeAutoMatchKind.FILENAME_PATTERN,
+                matchKey = byFileNamePattern.second
+            )
+        }
+
         val dot = nameLower.indexOf('.')
         if (dot == -1) return null
 
@@ -632,6 +669,32 @@ internal class VSCodeIntegration(
         }
 
         return null
+    }
+
+    private fun matchesVSCodeFilenamePattern(fileNameLower: String, patternLower: String): Boolean {
+        val pattern = patternLower.trim()
+        if (pattern.isEmpty()) return false
+        if (pattern.indexOf('*') == -1 && pattern.indexOf('?') == -1) {
+            return fileNameLower == pattern
+        }
+
+        val regex = buildString(pattern.length + 8) {
+            append('^')
+            for (ch in pattern) {
+                when (ch) {
+                    '*' -> append(".*")
+                    '?' -> append('.')
+                    '.', '\\', '+', '(', ')', '^', '$', '{', '}', '|', '[', ']' -> {
+                        append('\\')
+                        append(ch)
+                    }
+                    else -> append(ch)
+                }
+            }
+            append('$')
+        }
+
+        return runCatching { Regex(regex).matches(fileNameLower) }.getOrDefault(false)
     }
 
     private fun scoreVSCodeLanguageForFileMatch(info: VSCodeLanguageInfo): Int {
@@ -729,7 +792,6 @@ internal class VSCodeIntegration(
                         val timeLimit =
                             if (Oniguruma().isUseNativeOniguruma) Duration.ofSeconds(2) else Duration.ofSeconds(5)
                         val samples = buildTokenizeSamples(info.scopeName, info.id)
-                        var anyMultiToken = false
                         var anyStoppedEarly = false
                         var anyNonRootScope = false
                         for (sample in samples) {
@@ -740,15 +802,14 @@ internal class VSCodeIntegration(
                                 val r = grammar.tokenizeLine(line, state, timeLimit)
                                 state = r.ruleStack
                                 if (r.isStoppedEarly) anyStoppedEarly = true
-                                if (r.tokens.size > 1) anyMultiToken = true
-                                if (r.tokens.any { t -> t.scopes.any { s -> s != info.scopeName && s != "unknown" } }) {
+                                if (r.tokens.any { t -> t.scopes.any { s -> isNonRootScope(s, info.scopeName) } }) {
                                     anyNonRootScope = true
                                 }
-                                if (anyMultiToken && anyNonRootScope) break
+                                if (anyNonRootScope) break
                             }
-                            if (anyMultiToken && anyNonRootScope) break
+                            if (anyNonRootScope) break
                         }
-                        if (!anyMultiToken || !anyNonRootScope) {
+                        if (!anyNonRootScope) {
                             val autoLine =
                                 if (auto == null) "" else "命中：${auto.matchKind}=${auto.matchKey}\n文件：${auto.path}\n"
                             highlightWarning = """
@@ -798,6 +859,8 @@ internal class VSCodeIntegration(
                 }
                 if (warning.isNullOrEmpty()) {
                     activity.toast("已切换：${info.displayName}（${info.scopeName}）")
+                } else if (auto != null) {
+                    activity.toast("已自动高亮：${info.displayName}（${info.scopeName}）")
                 } else {
                     activity.toast("切换成功但疑似无高亮：已弹出可复制信息")
                     showCopyableDialog("VS Code语法高亮：可能未生效", warning)
@@ -899,6 +962,13 @@ internal class VSCodeIntegration(
                 "[1, 2, 3]"
             )
 
+            scopeName == "source.dotenv" || languageId.equals("dotenv", ignoreCase = true) -> listOf(
+                "XRAYA_PORT=8080",
+                "XRAYA_HOST=127.0.0.1",
+                "XRAYA_CONFIG=\"/root/xraya-portable/config\"",
+                "export XRAYA_TOKEN=${'$'}{XRAYA_TOKEN}"
+            )
+
             scopeName == "source.yaml" || languageId.equals("yaml", ignoreCase = true) -> listOf(
                 "version: \"3\"",
                 "services:",
@@ -920,6 +990,16 @@ internal class VSCodeIntegration(
                 "- item",
                 "key: \"value\""
             )
+        }
+    }
+
+    private fun isNonRootScope(scope: String, rootScope: String): Boolean {
+        val s = scope.trim()
+        if (s.isEmpty() || s == "unknown") return false
+        if (s == rootScope) return false
+        return s.split(' ').any { child ->
+            val part = child.trim()
+            part.isNotEmpty() && part != rootScope && part != "unknown"
         }
     }
 
@@ -1122,7 +1202,7 @@ internal class VSCodeIntegration(
 
         val searchInput = EditText(activity).apply {
             setSingleLine(true)
-            hint = "搜索：名称 / id / scope / 扩展名"
+            hint = "搜索：名称 / id / scope / 扩展名 / 文件名规则"
         }
 
         val listView = ListView(activity)
@@ -1197,6 +1277,9 @@ internal class VSCodeIntegration(
                             it.displayName.lowercase().contains(q) ||
                                 it.id.lowercase().contains(q) ||
                                 it.scopeName.lowercase().contains(q) ||
+                                it.extensions.any { ext -> ext.contains(q) } ||
+                                it.filenames.any { filename -> filename.contains(q) } ||
+                                it.filenamePatterns.any { pattern -> pattern.contains(q) } ||
                                 (it.extensionName?.lowercase()?.contains(q) == true)
                         }
                     )
@@ -1258,8 +1341,8 @@ internal class VSCodeIntegration(
                     val map = HashMap<String, String>()
                     while (keys.hasNext()) {
                         val key = keys.next()
-                        val value = nlsJson.optString(key, null)
-                        if (key.isNotEmpty() && value != null) {
+                        val value = nlsJson.optString(key, "")
+                        if (key.isNotEmpty()) {
                             map[key] = value
                         }
                     }

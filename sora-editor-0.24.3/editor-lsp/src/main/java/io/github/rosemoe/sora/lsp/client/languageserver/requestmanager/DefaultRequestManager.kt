@@ -24,6 +24,7 @@
 
 package io.github.rosemoe.sora.lsp.client.languageserver.requestmanager
 
+import io.github.rosemoe.sora.lsp.client.languageserver.LspFeature
 import io.github.rosemoe.sora.lsp.client.languageserver.ServerStatus
 import io.github.rosemoe.sora.lsp.client.languageserver.wrapper.LanguageServerWrapper
 import org.eclipse.lsp4j.ApplyWorkspaceEditParams
@@ -109,9 +110,17 @@ import java.util.concurrent.CompletableFuture
  * Default implementation for LSP requests/notifications handling.
  */
 class DefaultRequestManager(
-    val wrapper: LanguageServerWrapper, val server: LanguageServer, val client: LanguageClient,
-    val serverCapabilities: ServerCapabilities
+    val wrapper: LanguageServerWrapper,
+    val server: LanguageServer,
+    val client: LanguageClient,
+    private val serverCapabilities: ServerCapabilities,
+    private val disabledFeatures: Set<LspFeature> = emptySet()
 ) : RequestManager() {
+
+    override val serverName = wrapper.serverName
+
+    override val capabilities: ServerCapabilities
+        get() = serverCapabilities
 
     private val textDocumentOptions: TextDocumentSyncOptions? =
         if (serverCapabilities.textDocumentSync.isRight) serverCapabilities.textDocumentSync.right else TextDocumentSyncOptions().apply {
@@ -358,6 +367,7 @@ class DefaultRequestManager(
     }
 
     override fun completion(params: CompletionParams): CompletableFuture<Either<List<CompletionItem>, CompletionList>>? {
+        if (LspFeature.Completion in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.completionProvider != null) textDocumentService.completion(
@@ -371,6 +381,7 @@ class DefaultRequestManager(
     }
 
     override fun resolveCompletionItem(unresolved: CompletionItem): CompletableFuture<CompletionItem>? {
+        if (LspFeature.Completion in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.completionProvider?.resolveProvider == true) textDocumentService.resolveCompletionItem(
@@ -389,6 +400,7 @@ class DefaultRequestManager(
     }
 
     override fun hover(params: HoverParams): CompletableFuture<Hover>? {
+        if (LspFeature.Hover in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.hoverProvider?.left == true || serverCapabilities.hoverProvider?.right != null) textDocumentService.hover(
@@ -407,6 +419,7 @@ class DefaultRequestManager(
     }
 
     override fun signatureHelp(params: SignatureHelpParams): CompletableFuture<SignatureHelp>? {
+        if (LspFeature.SignatureHelp in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.signatureHelpProvider != null) textDocumentService.signatureHelp(
@@ -421,6 +434,7 @@ class DefaultRequestManager(
 
 
     override fun inlayHint(params: InlayHintParams?): CompletableFuture<List<InlayHint?>?>? {
+        if (LspFeature.InlayHint in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.inlayHintProvider?.left == true || serverCapabilities.inlayHintProvider?.right != null) textDocumentService.inlayHint(
@@ -435,6 +449,7 @@ class DefaultRequestManager(
 
 
     override fun references(params: ReferenceParams): CompletableFuture<List<Location?>>? {
+        if (LspFeature.References in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.referencesProvider?.left == true || serverCapabilities.referencesProvider?.right != null) textDocumentService.references(
@@ -453,6 +468,7 @@ class DefaultRequestManager(
     }
 
     override fun documentHighlight(params: DocumentHighlightParams): CompletableFuture<List<DocumentHighlight>>? {
+        if (LspFeature.DocumentHighlight in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.documentHighlightProvider?.left == true || serverCapabilities.documentHighlightProvider?.right != null) textDocumentService.documentHighlight(
@@ -466,6 +482,7 @@ class DefaultRequestManager(
     }
 
     override fun documentSymbol(params: DocumentSymbolParams): CompletableFuture<List<Either<SymbolInformation, DocumentSymbol>>>? {
+        if (LspFeature.DocumentSymbol in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.documentSymbolProvider?.left == true || serverCapabilities.documentSymbolProvider?.right != null) textDocumentService.documentSymbol(
@@ -479,6 +496,7 @@ class DefaultRequestManager(
     }
 
     override fun formatting(params: DocumentFormattingParams): CompletableFuture<List<TextEdit>>? {
+        if (LspFeature.Formatting in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.documentFormattingProvider?.left == true || serverCapabilities.documentFormattingProvider?.right != null) textDocumentService.formatting(
@@ -494,6 +512,7 @@ class DefaultRequestManager(
     }
 
     override fun rangeFormatting(params: DocumentRangeFormattingParams): CompletableFuture<List<TextEdit>>? {
+        if (LspFeature.Formatting in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.documentRangeFormattingProvider?.left == true || serverCapabilities.documentRangeFormattingProvider?.right != null) textDocumentService.rangeFormatting(
@@ -507,6 +526,7 @@ class DefaultRequestManager(
     }
 
     override fun onTypeFormatting(params: DocumentOnTypeFormattingParams): CompletableFuture<List<TextEdit>>? {
+        if (LspFeature.Formatting in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.documentOnTypeFormattingProvider != null) textDocumentService.onTypeFormatting(
@@ -520,6 +540,7 @@ class DefaultRequestManager(
     }
 
     override fun diagnostic(params: DocumentDiagnosticParams?): CompletableFuture<DocumentDiagnosticReport?>? {
+        if (LspFeature.Diagnostics in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.diagnosticProvider?.isInterFileDependencies == true || serverCapabilities.diagnosticProvider?.isWorkspaceDiagnostics == true) {
@@ -540,6 +561,7 @@ class DefaultRequestManager(
     }
 
     override fun definition(params: DefinitionParams): CompletableFuture<Either<List<Location>, List<LocationLink>>>? {
+        if (LspFeature.Definition in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.definitionProvider?.left == true || serverCapabilities.definitionProvider?.right != null) textDocumentService.definition(
@@ -553,6 +575,7 @@ class DefaultRequestManager(
     }
 
     override fun codeAction(params: CodeActionParams): CompletableFuture<List<Either<Command, CodeAction>>>? {
+        if (LspFeature.CodeAction in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.codeActionProvider?.left == true || serverCapabilities.codeActionProvider?.right != null)
@@ -567,6 +590,7 @@ class DefaultRequestManager(
     }
 
     override fun codeLens(params: CodeLensParams): CompletableFuture<List<CodeLens>>? {
+        if (LspFeature.CodeLens in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.codeLensProvider != null) textDocumentService.codeLens(params) else null
@@ -578,6 +602,7 @@ class DefaultRequestManager(
     }
 
     override fun resolveCodeLens(unresolved: CodeLens): CompletableFuture<CodeLens>? {
+        if (LspFeature.CodeLens in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.codeLensProvider?.resolveProvider != null && serverCapabilities.codeLensProvider?.resolveProvider == true)
@@ -592,6 +617,7 @@ class DefaultRequestManager(
     }
 
     override fun documentLink(params: DocumentLinkParams): CompletableFuture<List<DocumentLink>>? {
+        if (LspFeature.DocumentLink in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.documentLinkProvider != null) textDocumentService.documentLink(
@@ -605,6 +631,7 @@ class DefaultRequestManager(
     }
 
     override fun documentLinkResolve(unresolved: DocumentLink): CompletableFuture<DocumentLink>? {
+        if (LspFeature.DocumentLink in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.documentLinkProvider?.resolveProvider == true) textDocumentService.documentLinkResolve(
@@ -618,6 +645,7 @@ class DefaultRequestManager(
     }
 
     override fun prepareRename(params: PrepareRenameParams?): CompletableFuture<Either3<Range?, PrepareRenameResult?, PrepareRenameDefaultBehavior?>?>? {
+        if (LspFeature.Rename in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.renameProvider?.right?.prepareProvider == true)
@@ -632,6 +660,7 @@ class DefaultRequestManager(
     }
 
     override fun rename(params: RenameParams): CompletableFuture<WorkspaceEdit>? {
+        if (LspFeature.Rename in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.renameProvider?.left == true || serverCapabilities.renameProvider?.right != null)
@@ -646,6 +675,7 @@ class DefaultRequestManager(
     }
 
     override fun implementation(params: ImplementationParams): CompletableFuture<Either<List<Location>, List<LocationLink>>>? {
+        if (LspFeature.Implementation in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.implementationProvider?.left == true || serverCapabilities.implementationProvider?.right != null) textDocumentService.implementation(
@@ -659,6 +689,7 @@ class DefaultRequestManager(
     }
 
     override fun typeDefinition(params: TypeDefinitionParams): CompletableFuture<Either<List<Location>, List<LocationLink>>>? {
+        if (LspFeature.TypeDefinition in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.typeDefinitionProvider?.left == true || serverCapabilities.typeDefinitionProvider?.right != null) textDocumentService.typeDefinition(
@@ -672,6 +703,7 @@ class DefaultRequestManager(
     }
 
     override fun documentColor(params: DocumentColorParams): CompletableFuture<List<ColorInformation>>? {
+        if (LspFeature.DocumentColor in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.colorProvider?.left == true || serverCapabilities.colorProvider?.right != null) textDocumentService.documentColor(
@@ -689,6 +721,7 @@ class DefaultRequestManager(
     }
 
     override fun foldingRange(params: FoldingRangeRequestParams): CompletableFuture<List<FoldingRange>>? {
+        if (LspFeature.Folding in disabledFeatures) return null
         return if (checkStatus()) {
             try {
                 if (serverCapabilities.foldingRangeProvider?.left == true || serverCapabilities.foldingRangeProvider?.right != null) textDocumentService.foldingRange(

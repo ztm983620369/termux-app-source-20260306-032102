@@ -23,6 +23,7 @@ ext {
 
 configurations.all {
     exclude group: "com.google.code.findbugs", module: "jsr305"
+    exclude group: "org.codehaus.mojo", module: "animal-sniffer-annotations"
 }
 
 android {

@@ -37,12 +37,12 @@ class DocumentOpenEvent : AsyncEventListener() {
 
     var future: CompletableFuture<Void>? = null
 
-    override suspend fun handleAsync(context: EventContext) {
+    override suspend fun doHandleAsync(context: EventContext) {
         val editor = context.get<LspEditor>("lsp-editor")
 
         val params = editor.createDidOpenTextDocumentParams()
 
-        editor.requestManager?.let { requestManager ->
+        editor.requestManager.let { requestManager ->
             future = CompletableFuture.runAsync {
                 requestManager.didOpen(
                     params
@@ -54,8 +54,8 @@ class DocumentOpenEvent : AsyncEventListener() {
     }
 
     override fun dispose() {
-        future?.cancel(true);
-        future = null;
+        future?.cancel(true)
+        future = null
     }
 
 }

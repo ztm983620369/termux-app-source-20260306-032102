@@ -71,7 +71,6 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
     private Theme theme;
     private final TextMateLanguage language;
     private final LanguageConfiguration configuration;
-    private final Duration tokenizeTimeLimit;
 
     //private final GrammarRegistry grammarRegistry;
 
@@ -93,8 +92,6 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
         //this.grammarRegistry = grammarRegistry;
 
         this.themeRegistry = themeRegistry;
-
-        tokenizeTimeLimit = new Oniguruma().isUseNativeOniguruma() ? Duration.ofSeconds(2) : Duration.ofSeconds(5);
 
         if (!themeRegistry.hasListener(this)) {
             themeRegistry.addListener(this);
@@ -193,7 +190,7 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
 
                     // It's safe here to use raw data because the Content is only held by this thread
                     var length = model.getColumnCount(startLine);
-                    var chars = model.getLine(startLine).getBackingCharArray();
+                    var chars = model.getLine(startLine);
 
                     codeBlock.startColumn = IndentRange.computeStartColumn(chars, length, language.getTabSize());
                     codeBlock.endColumn = codeBlock.startColumn;
@@ -213,9 +210,9 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
         String line = (lineC instanceof ContentLine) ? ((ContentLine) lineC).toStringWithNewline() : lineC.toString();
         var tokens = new ArrayList<Span>();
         var surrogate = StringUtils.checkSurrogate(line);
-        var lineTokens = grammar.tokenizeLine2(line, state == null ? null : state.tokenizeState, tokenizeTimeLimit);
+        var lineTokens = grammar.tokenizeLine2(line, state == null ? null : state.tokenizeState, Duration.ofSeconds(2));
         int tokensLength = lineTokens.getTokens().length / 2;
-        var identifiers = language.createIdentifiers ? new ArrayList<String>() : null;
+        var identifiers = language.collectIdentifiers ? new ArrayList<String>() : null;
         for (int i = 0; i < tokensLength; i++) {
             int startIndex = StringUtils.convertUnicodeOffsetToUtf16(line, lineTokens.getTokens()[2 * i], surrogate);
             if (i == 0 && startIndex != 0) {
@@ -225,7 +222,7 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
             int foreground = EncodedTokenAttributes.getForeground(metadata);
             int fontStyle = EncodedTokenAttributes.getFontStyle(metadata);
             var tokenType = EncodedTokenAttributes.getTokenType(metadata);
-            if (language.createIdentifiers) {
+            if (language.collectIdentifiers) {
 
                 if (tokenType == StandardTokenType.Other) {
                     var end = i + 1 == tokensLength ? lineC.length() : StringUtils.convertUnicodeOffsetToUtf16(line, lineTokens.getTokens()[2 * (i + 1)], surrogate);
@@ -243,26 +240,29 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
                     }
                 }
             }
-            Span span = SpanFactory.obtainNoExt(startIndex, TextStyle.makeStyle(foreground + 255, 0, (fontStyle & FontStyle.Bold) != 0, (fontStyle & FontStyle.Italic) != 0, false));
+            boolean needUnderline = (fontStyle & FontStyle.Underline) != 0;
+            Span span = needUnderline
+                ? SpanFactory.obtain(startIndex, TextStyle.makeStyle(foreground + 255, 0, (fontStyle & FontStyle.Bold) != 0, (fontStyle & FontStyle.Italic) != 0, false))
+                : SpanFactory.obtainNoExt(startIndex, TextStyle.makeStyle(foreground + 255, 0, (fontStyle & FontStyle.Bold) != 0, (fontStyle & FontStyle.Italic) != 0, false));
 
             span.setExtra(tokenType);
 
-            if ((fontStyle & FontStyle.Underline) != 0) {
+            if (needUnderline) {
                 String color = theme.getColor(foreground);
-                if (color != null) {
+                if (color != null && !"@default".equals(color)) {
                     span.setUnderlineColor(Color.parseColor(color));
                 }
             }
 
             tokens.add(span);
         }
-        return new LineTokenizeResult<>(new MyState(lineTokens.getRuleStack(), cachedRegExp == null ? null : cachedRegExp.search(OnigString.of(line), 0), IndentRange.computeIndentLevel(((ContentLine) lineC).getBackingCharArray(), line.length() - 1, language.getTabSize()), identifiers), null, tokens);
+        return new LineTokenizeResult<>(new MyState(lineTokens.getRuleStack(), cachedRegExp == null ? null : cachedRegExp.search(OnigString.of(line), 0), IndentRange.computeIndentLevel(lineC, line.length() - 1, language.getTabSize()), identifiers), null, tokens);
     }
 
     @Override
     public void onAddState(MyState state) {
         super.onAddState(state);
-        if (language.createIdentifiers) {
+        if (language.collectIdentifiers) {
             for (String identifier : state.identifiers) {
                 syncIdentifiers.identifierIncrease(identifier);
             }
@@ -272,7 +272,7 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
     @Override
     public void onAbandonState(MyState state) {
         super.onAbandonState(state);
-        if (language.createIdentifiers) {
+        if (language.collectIdentifiers) {
             for (String identifier : state.identifiers) {
                 syncIdentifiers.identifierDecrease(identifier);
             }

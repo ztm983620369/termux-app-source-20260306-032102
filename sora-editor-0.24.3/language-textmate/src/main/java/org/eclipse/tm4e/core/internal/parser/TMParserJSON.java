@@ -13,13 +13,10 @@
 package org.eclipse.tm4e.core.internal.parser;
 
 import java.io.Reader;
-import java.io.StringReader;
 import java.util.List;
 import java.util.Map;
 
 import org.eclipse.jdt.annotation.NonNull;
-import org.eclipse.tm4e.core.internal.grammar.raw.RawCaptures;
-import org.eclipse.tm4e.core.internal.grammar.raw.RawRepository;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -34,110 +31,8 @@ public class TMParserJSON implements TMParser {
             .create();
 
 	protected Map<String, Object> loadRaw(final Reader source) {
-        final var rawText = readAll(source);
-        final var sanitized = sanitizeJsonc(rawText);
-		return LOADER.fromJson(new StringReader(sanitized), Map.class);
+		return LOADER.fromJson(source, Map.class);
 	}
-
-    private static String readAll(final Reader reader) {
-        try {
-            final var sb = new StringBuilder();
-            final var buf = new char[8192];
-            int n;
-            while ((n = reader.read(buf)) != -1) {
-                sb.append(buf, 0, n);
-            }
-            return sb.toString();
-        } catch (final Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static String sanitizeJsonc(final String input) {
-        if (input == null || input.isEmpty()) {
-            return "";
-        }
-
-        final var src = input.charAt(0) == '\uFEFF' ? input.substring(1) : input;
-        final var out = new StringBuilder(src.length());
-
-        boolean inString = false;
-        boolean escape = false;
-        boolean inLineComment = false;
-        boolean inBlockComment = false;
-
-        for (int i = 0; i < src.length(); i++) {
-            final char c = src.charAt(i);
-            final char next = i + 1 < src.length() ? src.charAt(i + 1) : '\0';
-
-            if (inLineComment) {
-                if (c == '\n') {
-                    inLineComment = false;
-                    out.append(c);
-                }
-                continue;
-            }
-
-            if (inBlockComment) {
-                if (c == '*' && next == '/') {
-                    inBlockComment = false;
-                    i++;
-                }
-                continue;
-            }
-
-            if (inString) {
-                out.append(c);
-                if (escape) {
-                    escape = false;
-                } else if (c == '\\') {
-                    escape = true;
-                } else if (c == '"') {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (c == '/' && next == '/') {
-                inLineComment = true;
-                i++;
-                continue;
-            }
-
-            if (c == '/' && next == '*') {
-                inBlockComment = true;
-                i++;
-                continue;
-            }
-
-            if (c == '"') {
-                inString = true;
-                out.append(c);
-                continue;
-            }
-
-            if (c == ',') {
-                int j = i + 1;
-                while (j < src.length()) {
-                    final char cj = src.charAt(j);
-                    if (!Character.isWhitespace(cj)) {
-                        break;
-                    }
-                    j++;
-                }
-                if (j < src.length()) {
-                    final char cj = src.charAt(j);
-                    if (cj == '}' || cj == ']') {
-                        continue;
-                    }
-                }
-            }
-
-            out.append(c);
-        }
-
-        return out.toString();
-    }
 
 	@Override
 	public final <T extends PropertySettable<?>> T parse(final Reader source, final ObjectFactory<T> factory) {
@@ -174,9 +69,7 @@ public class TMParserJSON implements TMParser {
 			}
 			setProperty(parent, propertyId, transformedChild);
 		} else {
-			if (!(parent instanceof RawRepository) && !(parent instanceof RawCaptures)) {
-				setProperty(parent, propertyId, rawChild);
-			}
+			setProperty(parent, propertyId, rawChild);
 		}
 		path.removeLastElement();
 	}

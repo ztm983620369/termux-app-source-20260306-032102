@@ -24,14 +24,13 @@
 
 package io.github.rosemoe.sora.lsp.events.hover
 
-import android.util.Log
 import io.github.rosemoe.sora.lsp.editor.LspEditor
 import io.github.rosemoe.sora.lsp.events.AsyncEventListener
 import io.github.rosemoe.sora.lsp.events.EventContext
 import io.github.rosemoe.sora.lsp.events.EventType
+import io.github.rosemoe.sora.lsp.events.getByClass
 import io.github.rosemoe.sora.lsp.requests.Timeout
 import io.github.rosemoe.sora.lsp.requests.Timeouts
-import io.github.rosemoe.sora.lsp.events.getByClass
 import io.github.rosemoe.sora.lsp.utils.asLspPosition
 import io.github.rosemoe.sora.lsp.utils.createTextDocumentIdentifier
 import io.github.rosemoe.sora.text.CharPosition
@@ -39,7 +38,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.TimeoutCancellationException
 import org.eclipse.lsp4j.Hover
 import org.eclipse.lsp4j.HoverParams
 import java.util.concurrent.CompletableFuture
@@ -51,11 +49,11 @@ class HoverEvent : AsyncEventListener() {
 
     override val isAsync = true
 
-    override suspend fun handleAsync(context: EventContext) = withContext(Dispatchers.IO) {
+    override suspend fun doHandleAsync(context: EventContext) = withContext(Dispatchers.IO) {
         val editor = context.get<LspEditor>("lsp-editor")
         val position = context.getByClass<CharPosition>() ?: return@withContext
 
-        val requestManager = editor.requestManager ?: return@withContext
+        val requestManager = editor.requestManager
 
         val hoverParams = HoverParams(
             editor.uri.createTextDocumentIdentifier(),
@@ -66,30 +64,19 @@ class HoverEvent : AsyncEventListener() {
 
         this@HoverEvent.future = future.thenAccept { }
 
+        val hover: Hover?
 
-        try {
-            val hover: Hover?
-
-            withTimeout(Timeout[Timeouts.HOVER].toLong()) {
-                hover =
-                    future.await()
-            }
-
-            editor.showHover(hover)
-        } catch (exception: Exception) {
-            if (exception is TimeoutCancellationException) {
-                Log.e("LSP client", "show hover timeout", exception)
-            } else {
-                Log.e("LSP client", "show hover failed", exception)
-            }
+        withTimeout(Timeout[Timeouts.HOVER].toLong()) {
+            hover = future.await()
         }
+
+        editor.showHover(hover)
     }
 
     override fun dispose() {
-        future?.cancel(true);
-        future = null;
+        future?.cancel(true)
+        future = null
     }
-
 }
 
 val EventType.hover: String

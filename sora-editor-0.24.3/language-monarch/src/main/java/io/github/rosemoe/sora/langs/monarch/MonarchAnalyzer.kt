@@ -184,7 +184,7 @@ class MonarchAnalyzer(
 
                 // It's safe here to use raw data because the Content is only held by this thread
                 val length = model.getColumnCount(foldingStartLine)
-                val chars = model.getLine(foldingStartLine).backingCharArray
+                val chars = model.getLine(foldingStartLine)
 
                 codeBlock.startColumn =
                     IndentRange.computeStartColumn(
@@ -265,19 +265,32 @@ class MonarchAnalyzer(
                 }
             }
 
-            val span = SpanFactory.obtainNoExt(
-                startIndex, TextStyle.makeStyle(
-                    foreground + 255,
-                    0,
-                    (fontStyle and FontStyle.Bold) != 0,
-                    (fontStyle and FontStyle.Italic) != 0,
-                    false
+            val hasUnderline = (fontStyle and FontStyle.Underline) != 0
+            val span = if (hasUnderline) {
+                SpanFactory.obtain(
+                    startIndex, TextStyle.makeStyle(
+                        foreground + 255,
+                        0,
+                        (fontStyle and FontStyle.Bold) != 0,
+                        (fontStyle and FontStyle.Italic) != 0,
+                        false
+                    )
                 )
-            )
+            } else {
+                SpanFactory.obtainNoExt(
+                    startIndex, TextStyle.makeStyle(
+                        foreground + 255,
+                        0,
+                        (fontStyle and FontStyle.Bold) != 0,
+                        (fontStyle and FontStyle.Italic) != 0,
+                        false
+                    )
+                )
+            }
 
             span.extra = tokenType
 
-            if ((fontStyle and FontStyle.Underline) != 0) {
+            if (hasUnderline) {
                 val color = theme.value.colorMap.getColor(foreground)
                 if (color != null) {
                     span.setUnderlineColor(Color.parseColor(color))
@@ -294,7 +307,7 @@ class MonarchAnalyzer(
                     line, 0
                 ),
                 IndentRange.computeIndentLevel(
-                    (lineC as ContentLine).backingCharArray, line.length - 1, language.tabSize
+                    lineC, line.length - 1, language.tabSize
                 ),
                 identifiers
             ), null, tokens

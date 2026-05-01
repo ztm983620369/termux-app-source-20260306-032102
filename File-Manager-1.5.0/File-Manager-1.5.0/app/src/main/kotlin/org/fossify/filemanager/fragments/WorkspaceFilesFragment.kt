@@ -4,8 +4,9 @@ import android.content.Context
 import android.os.Bundle
 import android.util.AttributeSet
 import android.view.View
-import android.widget.FrameLayout
-import androidx.core.view.children
+import android.view.ViewGroup
+import androidx.viewpager.widget.PagerAdapter
+import androidx.viewpager.widget.ViewPager
 import com.termux.sessionsync.SessionFileCoordinator
 import com.termux.workspaceshell.model.WorkspaceKind
 import com.termux.workspaceshell.model.WorkspaceReusePolicy
@@ -55,7 +56,44 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
     private lateinit var workspaceSessionStateMachine: WorkspaceSessionStateMachine
     private var shellState: WorkspaceShellState? = null
     private var pendingRestoreState: Bundle? = null
+    private var pagerSelectionInProgress = false
+    private var pagerStructureDirty = false
     var workspaceStateChangedListener: ((WorkspaceShellState) -> Unit)? = null
+
+    private val workspacePagerAdapter = object : PagerAdapter() {
+        override fun getCount(): Int = shellState?.tabs?.size ?: 0
+
+        override fun isViewFromObject(view: View, item: Any): Boolean = view === item
+
+        override fun instantiateItem(container: ViewGroup, position: Int): Any {
+            val tab = shellState?.tabs?.getOrNull(position)
+                ?: error("Workspace tab missing at position $position")
+            ensureSurface(tab, forceRefresh = false)
+            val surface = surfaces[tab.id]?.fragment
+                ?: error("Workspace surface missing for tab ${tab.id}")
+            if (surface.parent !== container) {
+                (surface.parent as? ViewGroup)?.removeView(surface)
+                container.addView(
+                    surface,
+                    ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+            }
+            return surface
+        }
+
+        override fun destroyItem(container: ViewGroup, position: Int, item: Any) {
+            container.removeView(item as View)
+        }
+
+        override fun getItemPosition(`object`: Any): Int {
+            val view = `object` as? View ?: return POSITION_NONE
+            val tabId = surfaces.entries.firstOrNull { it.value.fragment === view }?.key ?: return POSITION_NONE
+            return shellState?.tabs?.indexOfFirst { it.id == tabId }?.takeIf { it >= 0 } ?: POSITION_NONE
+        }
+    }
 
     override fun onFinishInflate() {
         super.onFinishInflate()
@@ -68,6 +106,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         this.activity = activity
         sessionFileCoordinator.initialize(activity)
         initializeWorkspaceSessionStateMachine(activity)
+        setupWorkspacePager()
 
         if (pendingRestoreState != null) {
             restoreWorkspaceState(requireNotNull(pendingRestoreState))
@@ -136,6 +175,8 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         notifyWorkspaceStateChanged()
     }
 
+    fun activeWorkspaceTabId(): String? = shellState?.activeTabId
+
     fun activeItemsFragment(): ItemsFragment? {
         val activeTabId = shellState?.activeTabId ?: return null
         return surfaces[activeTabId]?.fragment
@@ -148,6 +189,48 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
     fun isNavigatorActive(): Boolean {
         val ctx = context ?: return false
         return NavigatorFolderHelper.isNavigatorPath(ctx, activeWorkspacePathForMenu())
+    }
+
+    fun isActiveTabShowingFolderRecents(): Boolean = activeItemsFragment()?.isShowingFolderRecents() == true
+
+    fun canToggleFolderRecentsForActiveTab(): Boolean {
+        return activeItemsFragment() != null
+    }
+
+    fun toggleSelectedWorkspaceTabContent(tabId: String): Boolean {
+        if (tabId != shellState?.activeTabId) return false
+        if (!canToggleFolderRecentsForActiveTab()) return false
+        val toggled = activeItemsFragment()?.toggleFolderRecentsMode() == true
+        if (toggled) {
+            fileManagerControllerCommands.refreshMenuItems()
+        }
+        return toggled
+    }
+
+    fun showFolderRecentsForActiveTab(forceRefresh: Boolean = false): Boolean {
+        if (!canToggleFolderRecentsForActiveTab()) return false
+        val shown = activeItemsFragment()?.showFolderRecents(forceRefresh) == true
+        if (shown) {
+            fileManagerControllerCommands.refreshMenuItems()
+        }
+        return shown
+    }
+
+    fun showDirectoryForActiveTab(forceRefresh: Boolean = false): Boolean {
+        val fragment = activeItemsFragment() ?: return false
+        val shown = fragment.showDirectoryContents(forceRefresh)
+        if (shown) {
+            fileManagerControllerCommands.refreshMenuItems()
+        }
+        return shown
+    }
+
+    fun refreshVisibleFolderRecentsIfNeeded() {
+        surfaces.values.forEach { surface ->
+            if (surface.fragment.isShowingFolderRecents()) {
+                surface.fragment.refreshFragment()
+            }
+        }
     }
 
     fun openHomeWorkspace(forceRefresh: Boolean = false) {
@@ -188,6 +271,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         val removedIds = beforeIds - afterIds
         removedIds.forEach(::removeSurface)
         replaceState(nextState, persist = true)
+        markPagerStructureDirty()
         showActiveSurface(forceRefresh = false)
         notifyWorkspaceStateChanged()
     }
@@ -203,6 +287,12 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         val state = shellState ?: return false
         val activeTab = state.activeTab ?: return false
         val activeFragment = activeItemsFragment() ?: return false
+
+        if (activeFragment.isShowingFolderRecents()) {
+            activeFragment.showDirectoryContents(forceRefresh = true)
+            return true
+        }
+
         val current = normalizePath(activeFragment.currentPath)
         val root = normalizePath(activeTab.rootRoute)
 
@@ -295,6 +385,9 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         replaceState(nextState, persist = true)
         val addedIds = nextState.tabs.map { it.id }.toSet() - previousTabIds
         if (addedIds.isNotEmpty()) {
+            markPagerStructureDirty()
+        }
+        if (addedIds.isNotEmpty()) {
             ensureSurface(nextState.activeTab ?: return, forceRefresh = true)
         } else if (forceRefresh) {
             ensureSurface(nextState.activeTab ?: return, forceRefresh = true)
@@ -307,16 +400,13 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         val state = shellState ?: return
         val activeTab = state.activeTab ?: return
         ensureSurface(activeTab, forceRefresh = forceRefresh)
-        binding.workspaceFilesSurfaceHost.children.forEach { child ->
-            child.visibility = if (child === surfaces[activeTab.id]?.fragment) View.VISIBLE else View.GONE
-        }
         val activeFragment = surfaces[activeTab.id]?.fragment
         if (activeFragment != null) {
             currentPath = activeFragment.currentPath
             activeFragment.onResume(activity?.getProperTextColor() ?: return)
             activeFragment.searchQueryChanged(state.queryFor(activeTab.id))
-            activeFragment.bringToFront()
         }
+        syncPagerToActiveTab()
         fileManagerControllerCommands.refreshMenuItems()
     }
 
@@ -324,6 +414,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         surfaces.keys.toList().forEach(::removeSurface)
         val state = shellState ?: return
         state.tabs.forEach { ensureSurface(it, forceRefresh = forceRefresh) }
+        markPagerStructureDirty()
         showActiveSurface(forceRefresh = forceRefresh)
     }
 
@@ -339,7 +430,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
 
         val fragment = activity!!.layoutInflater.inflate(
             R.layout.items_fragment,
-            binding.workspaceFilesSurfaceHost,
+            binding.workspaceFilesPager,
             false
         ) as ItemsFragment
         fragment.id = View.generateViewId()
@@ -370,21 +461,13 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
             }
             notifyWorkspaceStateChanged()
         }
-        binding.workspaceFilesSurfaceHost.addView(
-            fragment,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-        )
-        fragment.visibility = View.GONE
         surfaces[tab.id] = WorkspaceSurface(tab.id, fragment)
         fragment.openPath(tab.currentRoute, forceRefresh)
     }
 
     private fun removeSurface(tabId: String) {
         val surface = surfaces.remove(tabId) ?: return
-        binding.workspaceFilesSurfaceHost.removeView(surface.fragment)
+        (surface.fragment.parent as? ViewGroup)?.removeView(surface.fragment)
     }
 
     private fun requireState(): WorkspaceShellState {
@@ -670,6 +753,48 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
             contentDescription = contentDescriptionOverride?.trim().orEmpty()
                 .ifBlank { sessionFileCoordinator.getDisplayPath(ctx, normalizedRoot) }
         )
+    }
+
+    private fun setupWorkspacePager() {
+        binding.workspaceFilesPager.adapter = workspacePagerAdapter
+        binding.workspaceFilesPager.offscreenPageLimit = 2
+        binding.workspaceFilesPager.addOnPageChangeListener(object : ViewPager.OnPageChangeListener {
+            override fun onPageScrolled(position: Int, positionOffset: Float, positionOffsetPixels: Int) = Unit
+
+            override fun onPageScrollStateChanged(state: Int) = Unit
+
+            override fun onPageSelected(position: Int) {
+                if (pagerSelectionInProgress) return
+                val tab = shellState?.tabs?.getOrNull(position) ?: return
+                if (tab.id == shellState?.activeTabId) return
+                dispatch(WorkspaceShellAction.SelectTab(tab.id))
+                showActiveSurface(forceRefresh = false)
+                notifyWorkspaceStateChanged()
+            }
+        })
+    }
+
+    private fun notifyPagerDataChanged() {
+        binding.workspaceFilesPager.adapter?.notifyDataSetChanged()
+    }
+
+    private fun markPagerStructureDirty() {
+        pagerStructureDirty = true
+        notifyPagerDataChanged()
+    }
+
+    private fun syncPagerToActiveTab() {
+        val state = shellState ?: return
+        val targetIndex = state.tabs.indexOfFirst { it.id == state.activeTabId }
+        if (targetIndex == -1) return
+        if (!pagerStructureDirty && binding.workspaceFilesPager.currentItem == targetIndex) return
+
+        pagerSelectionInProgress = true
+        binding.workspaceFilesPager.post {
+            pagerStructureDirty = false
+            binding.workspaceFilesPager.setCurrentItem(targetIndex, false)
+            pagerSelectionInProgress = false
+        }
     }
 
     class WorkspaceFilesInnerBinding : InnerBinding {

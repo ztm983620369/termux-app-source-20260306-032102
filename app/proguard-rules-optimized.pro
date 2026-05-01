@@ -19,3 +19,8 @@
 -dontwarn afu.org.checkerframework.checker.formatter.qual.ConversionCategory
 -dontwarn org.checkerframework.checker.formatter.qual.ConversionCategory
 -dontwarn org.checkerframework.dataflow.qual.Pure
+
+# JSch loads SFTP/SSH implementation classes by exact class name at runtime.
+# Without this, R8 can remove classes such as com.jcraft.jsch.jce.Random.
+-keep class com.jcraft.jsch.** { *; }
+-dontwarn com.jcraft.jsch.**

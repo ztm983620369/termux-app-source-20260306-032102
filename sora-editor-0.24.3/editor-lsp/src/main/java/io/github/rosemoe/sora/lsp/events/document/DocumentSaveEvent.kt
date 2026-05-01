@@ -38,12 +38,12 @@ class DocumentSaveEvent : AsyncEventListener() {
 
     var future: CompletableFuture<Void>? = null
 
-    override suspend fun handleAsync(context: EventContext) {
+    override suspend fun doHandleAsync(context: EventContext) {
         val editor = context.get<LspEditor>("lsp-editor")
 
         val params = editor.createDidSaveTextDocumentParams()
 
-        editor.requestManager?.let { requestManager ->
+        editor.requestManager.let { requestManager ->
             future = CompletableFuture.runAsync {
                 requestManager.didSave(
                     params
@@ -55,10 +55,9 @@ class DocumentSaveEvent : AsyncEventListener() {
     }
 
     override fun dispose() {
-        future?.cancel(true);
-        future = null;
+        future?.cancel(true)
+        future = null
     }
-
 }
 
 val EventType.documentSave: String

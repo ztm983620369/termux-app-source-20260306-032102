@@ -27,7 +27,8 @@ class EditorDocumentSyncManager(
     private val prefs: SharedPreferences,
     private val scope: CoroutineScope,
     private val textSnapshotProvider: () -> String,
-    private val sessionFileCoordinator: SessionFileCoordinator = SessionFileCoordinator.getInstance()
+    private val sessionFileCoordinator: SessionFileCoordinator = SessionFileCoordinator.getInstance(),
+    private val beforeSaveGuard: ((EditorSyncTarget, EditorSaveTrigger, ByteArray) -> String?)? = null
 ) {
 
     companion object {
@@ -304,6 +305,9 @@ class EditorDocumentSyncManager(
             val hash = fnv1a64(payload)
 
             val error = runCatching {
+                beforeSaveGuard?.invoke(target, trigger, payload)?.let { guardMessage ->
+                    throw IllegalStateException(guardMessage)
+                }
                 if (hash != lastSavedHash.get()) {
                     persist(target, payload, trigger)
                     lastSavedHash.set(hash)

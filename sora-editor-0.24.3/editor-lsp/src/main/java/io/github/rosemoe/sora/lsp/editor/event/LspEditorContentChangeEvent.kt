@@ -36,11 +36,12 @@ import io.github.rosemoe.sora.lsp.events.document.documentChange
 import io.github.rosemoe.sora.lsp.events.highlight.DocumentHighlightEvent
 import io.github.rosemoe.sora.lsp.events.highlight.documentHighlight
 import io.github.rosemoe.sora.lsp.events.hover.hover
-import io.github.rosemoe.sora.lsp.events.inlayhint.inlayHint
 import io.github.rosemoe.sora.lsp.events.signature.signatureHelp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.eclipse.lsp4j.DocumentDiagnosticReport
+
+private const val DIAGNOSTIC_QUERY_SOURCE = "sora.lsp.query"
 
 
 class LspEditorContentChangeEvent(private val editor: LspEditor) :
@@ -49,7 +50,6 @@ class LspEditorContentChangeEvent(private val editor: LspEditor) :
         if (!editor.isConnected) {
             return
         }
-
 
         editor.coroutineScope.launch(Dispatchers.IO) {
             // send to server

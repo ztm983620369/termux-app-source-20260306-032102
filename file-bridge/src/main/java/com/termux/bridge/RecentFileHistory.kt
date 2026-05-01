@@ -15,7 +15,8 @@ data class RecentFileEntry(
     val openedAtMs: Long,
     val originType: String? = null,
     val originPath: String? = null,
-    val originDisplayPath: String? = null
+    val originDisplayPath: String? = null,
+    val sizeBytes: Long? = null
 )
 
 object RecentFileHistory {
@@ -29,9 +30,10 @@ object RecentFileHistory {
     private const val KEY_ORIGIN_TYPE = "origin_type"
     private const val KEY_ORIGIN_PATH = "origin_path"
     private const val KEY_ORIGIN_DISPLAY_PATH = "origin_display_path"
+    private const val KEY_SIZE_BYTES = "size_bytes"
 
     private const val DB_NAME = "recent_files.db"
-    private const val DB_VERSION = 2
+    private const val DB_VERSION = 3
     private const val TABLE_RECENT_FILES = "recent_files"
 
     private const val MAX_ENTRIES = 300
@@ -57,7 +59,8 @@ object RecentFileHistory {
         displayName: String? = null,
         originType: String? = null,
         originPath: String? = null,
-        originDisplayPath: String? = null
+        originDisplayPath: String? = null,
+        sizeBytes: Long? = null
     ) {
         val normalizedPath = path.trim()
         if (normalizedPath.isEmpty()) return
@@ -71,7 +74,8 @@ object RecentFileHistory {
             openedAtMs = now,
             originType = originType?.trim().takeUnless { it.isNullOrEmpty() },
             originPath = originPath?.trim().takeUnless { it.isNullOrEmpty() },
-            originDisplayPath = originDisplayPath?.trim().takeUnless { it.isNullOrEmpty() }
+            originDisplayPath = originDisplayPath?.trim().takeUnless { it.isNullOrEmpty() },
+            sizeBytes = sizeBytes?.takeIf { it >= 0L }
         )
 
         pendingWrites[normalizedPath] = entry
@@ -140,7 +144,7 @@ object RecentFileHistory {
         val results = ArrayList<RecentFileEntry>(limit.coerceAtLeast(8))
         db.rawQuery(
             "SELECT $KEY_PATH, $KEY_DISPLAY_NAME, $KEY_OPENED_AT_MS, " +
-                "$KEY_ORIGIN_TYPE, $KEY_ORIGIN_PATH, $KEY_ORIGIN_DISPLAY_PATH " +
+                "$KEY_ORIGIN_TYPE, $KEY_ORIGIN_PATH, $KEY_ORIGIN_DISPLAY_PATH, $KEY_SIZE_BYTES " +
                 "FROM $TABLE_RECENT_FILES ORDER BY $KEY_OPENED_AT_MS DESC LIMIT ?",
             arrayOf(limit.toString())
         ).use { cursor ->
@@ -150,6 +154,7 @@ object RecentFileHistory {
             val originTypeIndex = cursor.getColumnIndex(KEY_ORIGIN_TYPE)
             val originPathIndex = cursor.getColumnIndex(KEY_ORIGIN_PATH)
             val originDisplayPathIndex = cursor.getColumnIndex(KEY_ORIGIN_DISPLAY_PATH)
+            val sizeBytesIndex = cursor.getColumnIndex(KEY_SIZE_BYTES)
             while (cursor.moveToNext()) {
                 val path = cursor.getString(pathIndex)
                 val displayName = cursor.getString(nameIndex)
@@ -157,6 +162,10 @@ object RecentFileHistory {
                 val originType = originTypeIndex.takeIf { it >= 0 }?.let(cursor::getString)
                 val originPath = originPathIndex.takeIf { it >= 0 }?.let(cursor::getString)
                 val originDisplayPath = originDisplayPathIndex.takeIf { it >= 0 }?.let(cursor::getString)
+                val sizeBytes = sizeBytesIndex
+                    .takeIf { it >= 0 && !cursor.isNull(it) }
+                    ?.let(cursor::getLong)
+                    ?.takeIf { it >= 0L }
                 results.add(
                     RecentFileEntry(
                         path = path,
@@ -164,7 +173,8 @@ object RecentFileHistory {
                         openedAtMs = openedAtMs,
                         originType = originType,
                         originPath = originPath,
-                        originDisplayPath = originDisplayPath
+                        originDisplayPath = originDisplayPath,
+                        sizeBytes = sizeBytes
                     )
                 )
             }
@@ -176,15 +186,16 @@ object RecentFileHistory {
         db.execSQL(
             "INSERT OR REPLACE INTO $TABLE_RECENT_FILES(" +
                 "$KEY_PATH, $KEY_DISPLAY_NAME, $KEY_OPENED_AT_MS, " +
-                "$KEY_ORIGIN_TYPE, $KEY_ORIGIN_PATH, $KEY_ORIGIN_DISPLAY_PATH" +
-                ") VALUES (?, ?, ?, ?, ?, ?)",
+                "$KEY_ORIGIN_TYPE, $KEY_ORIGIN_PATH, $KEY_ORIGIN_DISPLAY_PATH, $KEY_SIZE_BYTES" +
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
             arrayOf<Any?>(
                 entry.path,
                 entry.displayName,
                 entry.openedAtMs,
                 entry.originType,
                 entry.originPath,
-                entry.originDisplayPath
+                entry.originDisplayPath,
+                entry.sizeBytes
             )
         )
     }
@@ -245,6 +256,7 @@ object RecentFileHistory {
                 val originType = obj.optString(KEY_ORIGIN_TYPE).trim().ifEmpty { null }
                 val originPath = obj.optString(KEY_ORIGIN_PATH).trim().ifEmpty { null }
                 val originDisplayPath = obj.optString(KEY_ORIGIN_DISPLAY_PATH).trim().ifEmpty { null }
+                val sizeBytes = obj.optLong(KEY_SIZE_BYTES, -1L).takeIf { it >= 0L }
                 parsed.add(
                     RecentFileEntry(
                         path = path,
@@ -252,7 +264,8 @@ object RecentFileHistory {
                         openedAtMs = openedAtMs,
                         originType = originType,
                         originPath = originPath,
-                        originDisplayPath = originDisplayPath
+                        originDisplayPath = originDisplayPath,
+                        sizeBytes = sizeBytes
                     )
                 )
             }
@@ -296,7 +309,8 @@ object RecentFileHistory {
                     "$KEY_OPENED_AT_MS INTEGER NOT NULL, " +
                     "$KEY_ORIGIN_TYPE TEXT, " +
                     "$KEY_ORIGIN_PATH TEXT, " +
-                    "$KEY_ORIGIN_DISPLAY_PATH TEXT" +
+                    "$KEY_ORIGIN_DISPLAY_PATH TEXT, " +
+                    "$KEY_SIZE_BYTES INTEGER" +
                     ")"
             )
             db.execSQL(
@@ -309,6 +323,9 @@ object RecentFileHistory {
                 db.execSQL("ALTER TABLE $TABLE_RECENT_FILES ADD COLUMN $KEY_ORIGIN_TYPE TEXT")
                 db.execSQL("ALTER TABLE $TABLE_RECENT_FILES ADD COLUMN $KEY_ORIGIN_PATH TEXT")
                 db.execSQL("ALTER TABLE $TABLE_RECENT_FILES ADD COLUMN $KEY_ORIGIN_DISPLAY_PATH TEXT")
+            }
+            if (oldVersion < 3) {
+                db.execSQL("ALTER TABLE $TABLE_RECENT_FILES ADD COLUMN $KEY_SIZE_BYTES INTEGER")
             }
         }
     }

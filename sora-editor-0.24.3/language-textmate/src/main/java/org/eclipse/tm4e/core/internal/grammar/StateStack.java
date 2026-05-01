@@ -40,61 +40,15 @@ import org.eclipse.tm4e.core.internal.rule.RuleId;
 public final class StateStack implements IStateStack {
 
 	@NonNullByDefault({}) // https://github.com/eclipse-jdt/eclipse.jdt.core/issues/233
-	static final class Frame {
-		final RuleId ruleId;
-		final @Nullable Integer enterPos;
-		final @Nullable Integer anchorPos;
-		final boolean beginRuleCapturedEOL;
-		final @Nullable String endRule;
-		final List<AttributedScopeStack.Frame> nameScopesList;
-		final List<AttributedScopeStack.Frame> contentNameScopesList;
-
-		Frame(
-				final RuleId ruleId,
-				final @Nullable Integer enterPos,
-				final @Nullable Integer anchorPos,
-				final boolean beginRuleCapturedEOL,
-				final @Nullable String endRule,
-				final List<AttributedScopeStack.Frame> nameScopesList,
-				final List<AttributedScopeStack.Frame> contentNameScopesList) {
-			this.ruleId = ruleId;
-			this.enterPos = enterPos;
-			this.anchorPos = anchorPos;
-			this.beginRuleCapturedEOL = beginRuleCapturedEOL;
-			this.endRule = endRule;
-			this.nameScopesList = nameScopesList;
-			this.contentNameScopesList = contentNameScopesList;
-		}
-
-		@Override
-		public boolean equals(final Object o) {
-			if (this == o) return true;
-			if (!(o instanceof final Frame frame)) return false;
-			return beginRuleCapturedEOL == frame.beginRuleCapturedEOL
-					&& Objects.equals(ruleId, frame.ruleId)
-					&& Objects.equals(enterPos, frame.enterPos)
-					&& Objects.equals(anchorPos, frame.anchorPos)
-					&& Objects.equals(endRule, frame.endRule)
-					&& Objects.equals(nameScopesList, frame.nameScopesList)
-					&& Objects.equals(contentNameScopesList, frame.contentNameScopesList);
-		}
-
-		@Override
-		public int hashCode() {
-			return Objects.hash(ruleId, enterPos, anchorPos, beginRuleCapturedEOL, endRule, nameScopesList, contentNameScopesList);
-		}
-
-		@Override
-		public String toString() {
-			return "Frame[ruleId=" + ruleId
-					+ ", enterPos=" + enterPos
-					+ ", anchorPos=" + anchorPos
-					+ ", beginRuleCapturedEOL=" + beginRuleCapturedEOL
-					+ ", endRule=" + endRule
-					+ ", nameScopesList=" + nameScopesList
-					+ ", contentNameScopesList=" + contentNameScopesList
-					+ "]";
-		}
+	record Frame(
+			RuleId ruleId,
+			@Nullable Integer enterPos,
+			@Nullable Integer anchorPos,
+			boolean beginRuleCapturedEOL,
+			@Nullable String endRule,
+			List<AttributedScopeStack.Frame> nameScopesList,
+			/** on top of nameScopesList */
+			List<AttributedScopeStack.Frame> contentNameScopesList) {
 	}
 
 	public static final StateStack NULL = new StateStack(

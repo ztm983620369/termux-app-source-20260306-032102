@@ -45,6 +45,10 @@ public class TermuxTerminalSessionClientBase implements TerminalSessionClient {
     }
 
     @Override
+    public void onTerminalHostControlCommand(@NonNull TerminalSession session, @NonNull String command, @Nullable String argument) {
+    }
+
+    @Override
     public void setTerminalShellPid(@NonNull TerminalSession session, int pid) {
     }
 

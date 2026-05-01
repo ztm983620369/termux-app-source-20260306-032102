@@ -47,6 +47,7 @@ public class SymbolInputView extends LinearLayout {
 
     private int textColor;
     private CodeEditor editor;
+    private OnSymbolClickListener onSymbolClickListener;
 
     public SymbolInputView(Context context) {
         super(context);
@@ -69,7 +70,9 @@ public class SymbolInputView extends LinearLayout {
     }
 
     private void init() {
-        setBackgroundColor(getContext().getResources().getColor(R.color.defaultSymbolInputBackgroundColor));
+        if (getBackground() == null) {
+            setBackgroundColor(getContext().getResources().getColor(R.color.defaultSymbolInputBackgroundColor));
+        }
         setOrientation(HORIZONTAL);
         setTextColor(getContext().getResources().getColor(R.color.defaultSymbolInputTextColor));
     }
@@ -79,6 +82,10 @@ public class SymbolInputView extends LinearLayout {
      */
     public void bindEditor(CodeEditor editor) {
         this.editor = editor;
+    }
+
+    public void setOnSymbolClickListener(OnSymbolClickListener listener) {
+        this.onSymbolClickListener = listener;
     }
 
     /**
@@ -121,6 +128,10 @@ public class SymbolInputView extends LinearLayout {
             addView(btn, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT));
             int finalI = i;
             btn.setOnClickListener((view) -> {
+                if (onSymbolClickListener != null) {
+                    onSymbolClickListener.onSymbolClick(display[finalI], insertText[finalI], editor);
+                    return;
+                }
                 if (editor == null || !editor.isEditable()) {
                     return;
                 }
@@ -147,6 +158,12 @@ public class SymbolInputView extends LinearLayout {
     public interface ButtonConsumer {
 
         void accept(@NonNull Button btn);
+
+    }
+
+    public interface OnSymbolClickListener {
+
+        void onSymbolClick(@NonNull String displayText, @NonNull String insertText, CodeEditor editor);
 
     }
 

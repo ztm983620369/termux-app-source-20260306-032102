@@ -26,6 +26,7 @@ package io.github.rosemoe.sora.graphics;
 import android.graphics.Canvas;
 import android.graphics.Path;
 import android.graphics.RectF;
+import android.text.GetChars;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -156,15 +157,14 @@ public class TextRow {
      */
     private float getSingleRunAdvancesForBreaking(int start, int end, int contextStart, int contextEnd,
                                                   boolean isRtl, float[] advances) {
-        var chars = text.getBackingCharArray();
         int lastEnd = start;
         float tabWidth = params.getTabWidth() * paint.getSpaceWidth();
         float width = 0f;
         for (int i = start; i <= end; i++) {
-            if (i == end || chars[i] == '\t') {
+            if (i == end || text.charAt(i) == '\t') {
                 // commit [lastEnd, i)
                 if (i > lastEnd)
-                    width += paint.myGetTextRunAdvances(chars, lastEnd, i - lastEnd, contextStart, contextEnd - contextStart, isRtl, advances, (lastEnd - start));
+                    width += paint.myGetTextRunAdvances(text, lastEnd, i - lastEnd, contextStart, contextEnd - contextStart, isRtl, advances, (lastEnd - start));
                 if (i < end) {
                     width += tabWidth;
                     if (advances != null)
@@ -188,7 +188,7 @@ public class TextRow {
             }
             return measureCache.getAdvancesSum(index, index + count);
         }
-        return paint.myGetTextRunAdvances(text.getBackingCharArray(), index, count, contextIndex, contextCount, isRtl, advances, advancesIndex);
+        return paint.myGetTextRunAdvances(text, index, count, contextIndex, contextCount, isRtl, advances, advancesIndex);
     }
 
     /**
@@ -199,7 +199,7 @@ public class TextRow {
         if (measureCache != null) {
             return measureCache.getAdvancesSum(start, offset);
         }
-        return GraphicsCompat.getRunAdvance(paint, text.getBackingCharArray(), start, end, contextStart, contextEnd, isRtl, offset);
+        return GraphicsCompat.getRunAdvance(paint, text, start, end, contextStart, contextEnd, isRtl, offset);
     }
 
     /**
@@ -504,6 +504,8 @@ public class TextRow {
         /* for horizontal char offset seeking */
         public float targetHorizontalOffset = -1f;
         public int resultCharOffset = -1;
+        public RowElement resultElement;
+        public boolean isInElementBounds = false;
         /* for background region iterating / text patching */
         public int startCharOffset;
         public int endCharOffset;
@@ -577,19 +579,18 @@ public class TextRow {
     private void commitTextRunToCanvas(int paintStart, int paintEnd, int contextStart, int contextEnd, boolean isRtl,
                                        Canvas canvas, float offset, float width) {
         if (paint.isRenderFunctionCharacters()) {
-            var chars = text.getBackingCharArray();
             int lastEnd = paintStart;
             float initOffset = offset + (isRtl ? width : 0f);
             float drawOffset = initOffset;
             for (int i = paintStart; i <= paintEnd; i++) {
                 char ch = '\0';
-                if (i == paintEnd || FunctionCharacters.isEditorFunctionChar(ch = chars[i])) {
+                if (i == paintEnd || FunctionCharacters.isEditorFunctionChar(ch = text.charAt(i))) {
                     // commit [lastEnd, i)
                     if (i - lastEnd > 0) {
                         if (isRtl) {
                             paint.setTextAlign(android.graphics.Paint.Align.RIGHT);
                         }
-                        GraphicsCompat.drawTextRun(canvas, chars, lastEnd, i - lastEnd, contextStart, contextEnd - contextStart, drawOffset, params.getTextBaseline(), isRtl, paint);
+                        GraphicsCompat.drawTextRun(canvas, text, lastEnd, i - lastEnd, contextStart, contextEnd - contextStart, drawOffset, params.getTextBaseline(), isRtl, paint);
                         if (isRtl) {
                             paint.setTextAlign(android.graphics.Paint.Align.LEFT);
                         }
@@ -606,13 +607,13 @@ public class TextRow {
                 }
             }
         } else {
-            GraphicsCompat.drawTextRun(canvas, text.getBackingCharArray(), paintStart, paintEnd - paintStart, contextStart, contextEnd - contextStart, offset, params.getTextBaseline(), isRtl, paint);
+            GraphicsCompat.drawTextRun(canvas, text, paintStart, paintEnd - paintStart, contextStart, contextEnd - contextStart, offset, params.getTextBaseline(), isRtl, paint);
         }
     }
 
     private void commitTextRunToConsumer(int paintStart, int paintEnd, int contextStart, int contextEnd, boolean isRtl,
                                          Canvas canvas, float offset, float width, IteratingContext ctx) {
-        ctx.drawTextConsumer.drawText(canvas, text.getBackingCharArray(), paintStart, paintEnd - paintStart, contextStart, contextEnd - contextStart, isRtl, offset, width, params, ctx.currentSpan);
+        ctx.drawTextConsumer.drawText(canvas, text, paintStart, paintEnd - paintStart, contextStart, contextEnd - contextStart, isRtl, offset, width, params, ctx.currentSpan);
     }
 
     /**
@@ -636,12 +637,11 @@ public class TextRow {
 
             if (commitStart < commitEnd) {
                 int commitContextStart = commitStart, commitContextEnd = commitEnd;
-                var chars = text.getBackingCharArray();
-                while (commitContextStart - 1 >= contextStart && chars[commitContextStart - 1] != ' '
+                while (commitContextStart - 1 >= contextStart && text.charAt(commitContextStart - 1) != ' '
                         && (commitContextEnd - commitContextStart) < MAX_CONTEXT_LENGTH) {
                     commitContextStart--;
                 }
-                while (commitContextEnd + 1 < contextEnd && chars[commitContextEnd] != ' '
+                while (commitContextEnd + 1 < contextEnd && text.charAt(commitContextEnd) != ' '
                         && (commitContextEnd - commitContextStart) < MAX_CONTEXT_LENGTH) {
                     commitContextEnd++;
                 }
@@ -878,7 +878,7 @@ public class TextRow {
     }
 
     /**
-     * Split text in an unidirectional run with span boundaries
+     * Split text in a unidirectional run with span boundaries
      */
     private float handleMultiStyledText(int start, int end, boolean isRtl, ListPointers pointers,
                                         Canvas canvas, float offset, IteratingContext ctx) {
@@ -953,7 +953,6 @@ public class TextRow {
      */
     private float handleSingleTextElement(RowElement e, ListPointers pointers,
                                           Canvas canvas, float offset, IteratingContext ctx) {
-        var chars = text.getBackingCharArray();
         boolean isRtl = e.isRtlText;
         float localOffset = 0f;
         int lastEnd = isRtl ? e.endColumn : e.startColumn;
@@ -962,10 +961,13 @@ public class TextRow {
         for (int index = (isRtl ? e.endColumn - 1 : e.startColumn);
              isRtl ? (index >= terminalIndex) : (index <= terminalIndex);
              index += (isRtl ? -1 : 1)) {
-            if (index == terminalIndex || chars[index] == '\t') {
+            if (index == terminalIndex || text.charAt(index) == '\t') {
                 int regionStart = isRtl ? index + 1 : lastEnd;
                 int regionEnd = isRtl ? lastEnd : index;
                 localOffset += handleMultiStyledText(regionStart, regionEnd, isRtl, pointers, canvas, offset + localOffset, ctx);
+                if (offset + localOffset > ctx.maxOffset) {
+                    break;
+                }
                 if (index != terminalIndex) {
                     // tab consumed here
                     // [index, index+1)
@@ -978,6 +980,17 @@ public class TextRow {
                         }
                         ctx.maxOffset = 0f;
                     }
+                    if (ctx.targetHorizontalOffset != -1f) {
+                        float runOffset = ctx.targetHorizontalOffset - offset - localOffset;
+                        if (isRtl) {
+                            runOffset = tabWidth - runOffset;
+                        }
+                        if (runOffset > tabWidth / 2f) {
+                            ctx.resultCharOffset = index + 1;
+                        } else {
+                            ctx.resultCharOffset = index;
+                        }
+                    }
                     if (ctx.regionBuffer != null && index >= ctx.startCharOffset && index < ctx.endCharOffset) {
                         ctx.regionBuffer.commitRegion(offset + localOffset, offset + localOffset + tabWidth);
                     }
@@ -985,7 +998,7 @@ public class TextRow {
                         ctx.advances.setAdvanceAt(index, tabWidth);
                     }
                     if (ctx.drawTextConsumer != null && index >= ctx.startCharOffset && index < ctx.endCharOffset) {
-                        ctx.drawTextConsumer.drawText(canvas, chars, index, 1, index, 1, isRtl, offset + localOffset, tabWidth, params, null);
+                        ctx.drawTextConsumer.drawText(canvas, text, index, 1, index, 1, isRtl, offset + localOffset, tabWidth, params, null);
                     }
                     // virtually drawn
                     localOffset += tabWidth;
@@ -1000,7 +1013,7 @@ public class TextRow {
     }
 
     /**
-     * Handle a single inline element in an unidirectional run
+     * Handle a single inline element in a unidirectional run
      */
     private float handleSingleInlineElement(RowElement e,
                                             Canvas canvas, float offset, IteratingContext ctx) {
@@ -1039,11 +1052,18 @@ public class TextRow {
         var visualElements = isRtl ? new ReversedListView<>(e) : e;
         float localOffset = 0f;
         for (var element : visualElements) {
+            float offsetAdvance = 0f;
             if (element.type == RowElementTypes.TEXT) {
-                localOffset += handleSingleTextElement(element, pointers, canvas, offset + localOffset, ctx);
+                offsetAdvance = handleSingleTextElement(element, pointers, canvas, offset + localOffset, ctx);
             } else if (element.type == RowElementTypes.INLAY_HINT) {
-                localOffset += handleSingleInlineElement(element, canvas, offset + localOffset, ctx);
+                offsetAdvance = handleSingleInlineElement(element, canvas, offset + localOffset, ctx);
             }
+            if (ctx.targetHorizontalOffset != -1) {
+                ctx.resultElement = element;
+                float leftOffset = offset + localOffset;
+                ctx.isInElementBounds = leftOffset <= ctx.targetHorizontalOffset && ctx.targetHorizontalOffset <= leftOffset + offsetAdvance;
+            }
+            localOffset += offsetAdvance;
             if (offset + localOffset > ctx.maxOffset) {
                 break;
             }
@@ -1106,14 +1126,16 @@ public class TextRow {
     }
 
     /**
-     * Get text index from the given cursor horizontal offset
+     * Get text index and element (inline elements considered) from the given cursor horizontal offset
      */
-    public int getIndexForCursorOffset(float offset) {
+    @NonNull
+    public ElementPosition getElementPositionForCursorOffset(float offset) {
         var ctx = new IteratingContext();
         ctx.targetHorizontalOffset = offset;
         ctx.maxOffset = offset;
         iterateRuns(new MaxOffsetIterationConsumer(ctx), true);
-        return ctx.resultCharOffset == -1 ? textStart : ctx.resultCharOffset;
+        var charOffset = ctx.resultCharOffset == -1 ? textStart : ctx.resultCharOffset;
+        return new ElementPosition(ctx.resultElement, ctx.isInElementBounds, charOffset);
     }
 
     /**
@@ -1380,8 +1402,36 @@ public class TextRow {
         /**
          * @param span may be null, when tab encountered.
          */
-        void drawText(Canvas canvas, char[] text, int index, int count, int contextIndex, int contextCount, boolean isRtl,
+        void drawText(Canvas canvas, GetChars text, int index, int count, int contextIndex, int contextCount, boolean isRtl,
                       float horizontalOffset, float width, TextRowParams params, Span span);
+
+    }
+
+    public static class ElementPosition {
+
+        /**
+         * The row element where the horizontal offset is in
+         */
+        @Nullable
+        public RowElement element;
+
+        /**
+         * Whether the requested offset is in the horizontal bounds of the element.
+         * <p>
+         * Meaningless if element is null.
+         */
+        public boolean isInElementBounds;
+
+        /**
+         * Text offset in line text
+         */
+        public int textOffset;
+
+        public ElementPosition(@Nullable RowElement element, boolean isInElementBounds, int textOffset) {
+            this.element = element;
+            this.isInElementBounds = isInElementBounds;
+            this.textOffset = textOffset;
+        }
 
     }
 }

@@ -31,15 +31,15 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:ellipsize="middle"
+            android:includeFontPadding="false"
             android:maxLines="1"
             android:paddingStart="@dimen/tiny_margin"
             android:textSize="@dimen/normal_text_size"
             app:layout_constraintBottom_toTopOf="@+id/item_details"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toEndOf="@id/item_icon"
-            app:layout_constraintTop_toTopOf="parent"
-            app:layout_constraintVertical_bias="0.5"
-            app:layout_constraintVertical_chainStyle="packed"
+            app:layout_constraintTop_toTopOf="@id/item_icon"
+            app:layout_constraintVertical_bias="0"
             tools:text="Directory" />
 
         <TextView
@@ -47,13 +47,16 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:alpha="0.6"
+            android:ellipsize="middle"
+            android:includeFontPadding="false"
+            android:maxLines="1"
             android:paddingStart="@dimen/tiny_margin"
             android:textSize="@dimen/smaller_text_size"
-            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintBottom_toBottomOf="@id/item_icon"
             app:layout_constraintEnd_toStartOf="@+id/item_date"
             app:layout_constraintStart_toEndOf="@id/item_icon"
-            app:layout_constraintTop_toBottomOf="@+id/item_name"
-            app:layout_constraintVertical_bias="0.5"
+            app:layout_constraintTop_toBottomOf="@id/item_name"
+            app:layout_constraintVertical_bias="1"
             tools:text="1 KB" />
 
         <TextView
@@ -61,11 +64,13 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:alpha="0.6"
+            android:includeFontPadding="false"
             android:gravity="end"
+            android:maxLines="1"
+            android:paddingStart="@dimen/small_margin"
             android:textSize="@dimen/smaller_text_size"
             app:layout_constraintBottom_toBottomOf="@+id/item_details"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintTop_toTopOf="@+id/item_details"
             tools:text="1.1.1970" />
 
     </androidx.constraintlayout.widget.ConstraintLayout>

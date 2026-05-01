@@ -29,20 +29,27 @@ import io.github.rosemoe.sora.text.ContentLine;
 
 public class WordBreakerProgram extends WordBreakerIcu {
 
+    protected final int length;
+
     public WordBreakerProgram(@NonNull ContentLine text) {
         super(text);
+        this.length = text.length();
     }
 
     @Override
     public int getOptimizedBreakPoint(int start, int end) {
         int icuResult = super.getOptimizedBreakPoint(start, end);
-        if (icuResult != end || end <= start || /* end > start */ Character.isWhitespace(chars[end - 1])) {
+        if (icuResult != end || end <= start || /* end > start */ Character.isWhitespace(text.charAt(end - 1))) {
             return icuResult;
+        }
+        // The content can be placed on a single row
+        if (end == length) {
+            return end;
         }
         // Add extra opportunities for dots
         int index = end - 1;
         while (index > start) {
-            if (chars[index] == '.' && index - 1 >= start && !Character.isDigit(chars[index - 1])) {
+            if (text.charAt(index) == '.' && index - 1 >= start && !Character.isDigit(text.charAt(index - 1))) {
                 // Break after this dot
                 return index + 1;
             }

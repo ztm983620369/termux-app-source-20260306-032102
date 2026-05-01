@@ -39,6 +39,7 @@ import androidx.annotation.RequiresApi;
 
 import com.termux.terminal.KeyHandler;
 import com.termux.terminal.TextStyle;
+import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
 import com.termux.view.textselection.TextSelectionCursorController;
@@ -91,6 +92,11 @@ public final class TerminalView extends View {
     int mCombiningAccent;
     private boolean mFrameInvalidationScheduled;
     private boolean mAccessibilityContentDescriptionDirty;
+    private boolean mPendingFullInvalidation;
+    private int mPendingInvalidateTop = Integer.MAX_VALUE;
+    private int mPendingInvalidateBottom = Integer.MIN_VALUE;
+    private int mLastRenderedCursorRow = -1;
+    private boolean mLastRenderedCursorVisible;
 
     /**
      * The current AutoFill type returned for {@link View#getAutofillType()} by {@link #getAutofillType()}.
@@ -151,8 +157,14 @@ public final class TerminalView extends View {
                 if (mEmulator != null && shouldUseMouseTrackingForTouchTap() && !event.isFromSource(InputDevice.SOURCE_MOUSE) && !isSelectingText() && !scrolledWithFinger) {
                     // Quick event processing when mouse tracking is active - do not wait for check of double tapping
                     // for zooming.
+                    if (mClient == null || mClient.shouldTerminalViewRequestFocusOnTap()) {
+                        requestFocusFromTouch();
+                        requestFocus();
+                    }
                     sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, true);
                     sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, false);
+                    scrolledWithFinger = false;
+                    if (mClient != null) mClient.onSingleTapUp(event);
                     return true;
                 }
                 scrolledWithFinger = false;
@@ -167,7 +179,10 @@ public final class TerminalView extends View {
                     stopTextSelectionMode();
                     return true;
                 }
-                requestFocus();
+                if (mClient == null || mClient.shouldTerminalViewRequestFocusOnTap()) {
+                    requestFocusFromTouch();
+                    requestFocus();
+                }
                 mClient.onSingleTapUp(event);
                 return true;
             }
@@ -296,6 +311,8 @@ public final class TerminalView extends View {
     public boolean attachSession(TerminalSession session) {
         if (session == mTermSession) return false;
         mTopRow = 0;
+        mLastRenderedCursorRow = -1;
+        mLastRenderedCursorVisible = false;
 
         mTermSession = session;
         mEmulator = null;
@@ -463,8 +480,10 @@ public final class TerminalView extends View {
     public void onScreenUpdated(boolean skipScrolling) {
         if (mEmulator == null) return;
 
-        int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
+        TerminalBuffer screen = mEmulator.getScreen();
+        int rowsInHistory = screen.getActiveTranscriptRows();
         if (mTopRow < -rowsInHistory) mTopRow = -rowsInHistory;
+        boolean requireFullInvalidate = mEmulator.isFullRedrawRequired();
 
         // Only follow output when we are already at the bottom. If the user has scrolled up (mTopRow != 0),
         // keep their scroll position stable while new output is appended.
@@ -481,6 +500,7 @@ public final class TerminalView extends View {
                     mTopRow -= rowShift;
                     if (selectingText) decrementYTextSelectionCursors(rowShift);
                 }
+                requireFullInvalidate = true;
             }
             skipScrolling = true;
         }
@@ -494,11 +514,43 @@ public final class TerminalView extends View {
                 awakenScrollBars();
             }
             mTopRow = 0;
+            requireFullInvalidate = true;
+        }
+
+        int dirtyStart = Integer.MAX_VALUE;
+        int dirtyEnd = Integer.MIN_VALUE;
+        if (screen.hasDirtyRows()) {
+            dirtyStart = screen.getDirtyStartRow();
+            dirtyEnd = screen.getDirtyEndRow();
+        }
+        if (mLastRenderedCursorRow >= 0) {
+            dirtyStart = Math.min(dirtyStart, mLastRenderedCursorRow);
+            dirtyEnd = Math.max(dirtyEnd, mLastRenderedCursorRow + 1);
+        }
+        if (mEmulator.shouldCursorBeVisible()) {
+            int cursorRow = mEmulator.getCursorRow();
+            dirtyStart = Math.min(dirtyStart, cursorRow);
+            dirtyEnd = Math.max(dirtyEnd, cursorRow + 1);
         }
 
         mEmulator.clearScrollCounter();
+        mEmulator.clearFullRedrawRequired();
+        screen.clearDirtyRows();
 
-        scheduleRenderFrame(true);
+        if (requireFullInvalidate) {
+            scheduleRenderFrame(true);
+            return;
+        }
+
+        if (dirtyStart >= dirtyEnd) return;
+
+        int visibleStart = mTopRow;
+        int visibleEnd = mTopRow + mEmulator.mRows;
+        int overlapStart = Math.max(dirtyStart, visibleStart);
+        int overlapEnd = Math.min(dirtyEnd, visibleEnd);
+        if (overlapStart < overlapEnd) {
+            scheduleRenderFrame(true, overlapStart - mTopRow, overlapEnd - mTopRow);
+        }
     }
 
     /** This must be called by the hosting activity in {@link Activity#onContextMenuClosed(Menu)}
@@ -533,6 +585,14 @@ public final class TerminalView extends View {
     @Override
     public boolean isOpaque() {
         return true;
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasWindowFocus) {
+        super.onWindowFocusChanged(hasWindowFocus);
+        if (mEmulator != null) {
+            mEmulator.onHostWindowFocusChanged(hasWindowFocus);
+        }
     }
 
     /**
@@ -624,20 +684,81 @@ public final class TerminalView extends View {
     }
 
     private void scheduleRenderFrame(boolean updateAccessibilityDescription) {
+        scheduleRenderFrame(updateAccessibilityDescription, -1, -1);
+    }
+
+    private void scheduleRenderFrame(boolean updateAccessibilityDescription, int screenRowStart, int screenRowEndExclusive) {
         if (updateAccessibilityDescription && mAccessibilityEnabled) {
             mAccessibilityContentDescriptionDirty = true;
         }
+
+        if (screenRowStart < 0 || screenRowEndExclusive <= screenRowStart || mRenderer == null || getWidth() <= 0) {
+            mPendingFullInvalidation = true;
+        } else {
+            screenRowStart = Math.max(0, screenRowStart);
+            if (mEmulator != null) {
+                screenRowEndExclusive = Math.min(mEmulator.mRows, screenRowEndExclusive);
+            }
+            if (screenRowEndExclusive <= screenRowStart) return;
+            if (mEmulator != null && screenRowStart == 0 && screenRowEndExclusive == mEmulator.mRows) {
+                mPendingFullInvalidation = true;
+            } else if (!mPendingFullInvalidation) {
+                int top = getScreenRowTopPx(screenRowStart);
+                int bottom = getScreenRowBottomPx(screenRowEndExclusive);
+                if (top < mPendingInvalidateTop) mPendingInvalidateTop = top;
+                if (bottom > mPendingInvalidateBottom) mPendingInvalidateBottom = bottom;
+            }
+        }
+
         if (mFrameInvalidationScheduled) return;
 
         mFrameInvalidationScheduled = true;
         postOnAnimation(() -> {
             mFrameInvalidationScheduled = false;
-            invalidate();
+            if (mPendingFullInvalidation || mPendingInvalidateTop >= mPendingInvalidateBottom) {
+                invalidate();
+            } else {
+                invalidate(0, mPendingInvalidateTop, getWidth(), mPendingInvalidateBottom);
+            }
+            mPendingFullInvalidation = false;
+            mPendingInvalidateTop = Integer.MAX_VALUE;
+            mPendingInvalidateBottom = Integer.MIN_VALUE;
             if (mAccessibilityEnabled && mAccessibilityContentDescriptionDirty) {
                 mAccessibilityContentDescriptionDirty = false;
                 setContentDescription(getText());
             }
         });
+    }
+
+    private void scheduleCursorRenderFrame() {
+        if (mEmulator == null) return;
+
+        int dirtyStart = Integer.MAX_VALUE;
+        int dirtyEnd = Integer.MIN_VALUE;
+        if (mLastRenderedCursorVisible && mLastRenderedCursorRow >= 0) {
+            dirtyStart = Math.min(dirtyStart, mLastRenderedCursorRow);
+            dirtyEnd = Math.max(dirtyEnd, mLastRenderedCursorRow + 1);
+        }
+        if (mEmulator.shouldCursorBeVisible()) {
+            int cursorRow = mEmulator.getCursorRow();
+            dirtyStart = Math.min(dirtyStart, cursorRow);
+            dirtyEnd = Math.max(dirtyEnd, cursorRow + 1);
+        }
+        if (dirtyStart >= dirtyEnd) return;
+
+        int overlapStart = Math.max(dirtyStart, mTopRow);
+        int overlapEnd = Math.min(dirtyEnd, mTopRow + mEmulator.mRows);
+        if (overlapStart < overlapEnd) {
+            scheduleRenderFrame(false, overlapStart - mTopRow, overlapEnd - mTopRow);
+        }
+    }
+
+    private int getScreenRowTopPx(int screenRow) {
+        return Math.max(0, screenRow * mRenderer.mFontLineSpacing);
+    }
+
+    private int getScreenRowBottomPx(int screenRowExclusive) {
+        return Math.min(getHeight(), screenRowExclusive * mRenderer.mFontLineSpacing);
     }
 
     /** Overriding {@link View#onGenericMotionEvent(MotionEvent)}. */
@@ -1052,6 +1173,7 @@ public final class TerminalView extends View {
             mTopRow = 0;
             scrollTo(0, 0);
             invalidate();
+            mEmulator.getScreen().clearDirtyRows();
         }
     }
 
@@ -1059,6 +1181,8 @@ public final class TerminalView extends View {
     protected void onDraw(Canvas canvas) {
         if (mEmulator == null) {
             canvas.drawColor(0XFF000000);
+            mLastRenderedCursorRow = -1;
+            mLastRenderedCursorVisible = false;
         } else {
             // render the terminal view and highlight any selected text
             int[] sel = mDefaultSelectors;
@@ -1067,6 +1191,8 @@ public final class TerminalView extends View {
             }
 
             mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3]);
+            mLastRenderedCursorRow = mEmulator.getCursorRow();
+            mLastRenderedCursorVisible = mEmulator.shouldCursorBeVisible();
 
             // render the text selection handles
             renderTextSelection();
@@ -1385,7 +1511,7 @@ public final class TerminalView extends View {
                     mCursorVisible = !mCursorVisible;
                     //mClient.logVerbose(LOG_TAG, "Toggling cursor blink state to " + mCursorVisible);
                     mEmulator.setCursorBlinkState(mCursorVisible);
-                    scheduleRenderFrame(false);
+                    scheduleCursorRenderFrame();
                 }
             } finally {
                 // Recall the Runnable after mBlinkRate milliseconds to toggle the blink state

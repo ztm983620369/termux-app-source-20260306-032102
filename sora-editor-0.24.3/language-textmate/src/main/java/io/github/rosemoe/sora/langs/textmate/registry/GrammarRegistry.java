@@ -308,6 +308,7 @@ public class GrammarRegistry {
         }
     }
 
+    @Nullable
     public synchronized String getRegisteredScopeNameForLanguageId(String languageId) {
         if (languageId == null) {
             return null;

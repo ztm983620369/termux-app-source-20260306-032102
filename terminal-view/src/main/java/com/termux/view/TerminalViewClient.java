@@ -28,6 +28,8 @@ public interface TerminalViewClient {
      */
     void onSingleTapUp(MotionEvent e);
 
+    boolean shouldTerminalViewRequestFocusOnTap();
+
     boolean shouldBackButtonBeMappedToEscape();
 
     boolean shouldEnforceCharBasedInput();

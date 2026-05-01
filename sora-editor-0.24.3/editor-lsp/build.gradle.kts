@@ -54,6 +54,6 @@ android {
 
 dependencies {
     compileOnly(project(":sora-editor"))
-    implementation("org.eclipse.lsp4j:org.eclipse.lsp4j:0.21.1")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.eclipse.lsp4j:org.eclipse.lsp4j:1.0.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }

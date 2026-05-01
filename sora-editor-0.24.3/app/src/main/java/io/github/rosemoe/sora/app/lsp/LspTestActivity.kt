@@ -28,6 +28,7 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Typeface
 import android.os.Bundle
+import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
 import android.widget.Toast
@@ -43,10 +44,12 @@ import io.github.rosemoe.sora.langs.textmate.registry.ThemeRegistry
 import io.github.rosemoe.sora.langs.textmate.registry.dsl.languages
 import io.github.rosemoe.sora.langs.textmate.registry.model.ThemeModel
 import io.github.rosemoe.sora.langs.textmate.registry.provider.AssetsFileResolver
-import io.github.rosemoe.sora.lsp.client.connection.LocalSocketStreamConnectionProvider
-import io.github.rosemoe.sora.lsp.client.languageserver.serverdefinition.CustomLanguageServerDefinition
+import io.github.rosemoe.sora.lsp.client.languageserver.ServerStatus
+import io.github.rosemoe.sora.lsp.client.languageserver.serverdefinition.languageServerDefinition
 import io.github.rosemoe.sora.lsp.client.languageserver.wrapper.EventHandler
 import io.github.rosemoe.sora.lsp.editor.LspEditor
+import io.github.rosemoe.sora.lsp.editor.LspEditorEventListener
+import io.github.rosemoe.sora.lsp.editor.LspEditorStatus
 import io.github.rosemoe.sora.lsp.editor.LspProject
 import io.github.rosemoe.sora.lsp.editor.text.MarkdownCodeHighlighterRegistry
 import io.github.rosemoe.sora.lsp.editor.text.withEditorHighlighter
@@ -58,12 +61,16 @@ import io.github.rosemoe.sora.widget.component.EditorAutoCompletion
 import io.github.rosemoe.sora.widget.component.EditorTextActionWindow
 import io.github.rosemoe.sora.widget.getComponent
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.eclipse.lsp4j.DiagnosticRegistrationOptions
 import org.eclipse.lsp4j.DidChangeWorkspaceFoldersParams
 import org.eclipse.lsp4j.InitializeResult
+import org.eclipse.lsp4j.ServerCapabilities
 import org.eclipse.lsp4j.WorkspaceFolder
 import org.eclipse.lsp4j.WorkspaceFoldersChangeEvent
+import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.LanguageServer
 import org.eclipse.tm4e.core.registry.IThemeSource
 import java.io.FileOutputStream
@@ -74,9 +81,13 @@ class LspTestActivity : BaseEditorActivity() {
 
     private lateinit var lspEditor: LspEditor
     private lateinit var lspProject: LspProject
+    private val projectPath by lazy(LazyThreadSafetyMode.NONE) {
+        externalCacheDir?.resolve("testProject")?.absolutePath ?: ""
+    }
 
     private lateinit var rootMenu: Menu
 
+    private val ref = WeakReference(this)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -143,37 +154,28 @@ class LspTestActivity : BaseEditorActivity() {
             editor.editable = false
         }
 
-        val projectPath = externalCacheDir?.resolve("testProject")?.absolutePath ?: ""
 
         startService(
             Intent(this@LspTestActivity, LspLanguageServerService::class.java)
         )
 
-        val luaServerDefinition =
-            object : CustomLanguageServerDefinition(
-                "lua",
-                ServerConnectProvider {
-                    LocalSocketStreamConnectionProvider("lua-lsp")
-                }
-            ) {
-                /* override fun getInitializationOptions(uri: URI?): Any {
-                     return InitializationOption(
-                         stdFolder = "file:/$projectPath/std/Lua53",
-                     )
-                 }*/
-
-                private val _eventListener = EventListener(this@LspTestActivity)
-
-                override val eventListener: EventHandler.EventListener
-                    get() = _eventListener
-
+        val luaServerDefinition = languageServerDefinition {
+            name("lua-lsp")
+            ext("lua")
+            connection {
+                local("lua-lsp")
             }
+            eventListener(EventListener(this@LspTestActivity.ref))
+            val expectedCapabilities = ServerCapabilities().apply {
+                documentFormattingProvider = Either.forLeft(true)
+                diagnosticProvider = DiagnosticRegistrationOptions(true, false)
+            }
+            expectedCapabilities(expectedCapabilities)
+        }
 
         lspProject = LspProject(projectPath)
 
         lspProject.addServerDefinition(luaServerDefinition)
-
-
 
         withContext(Dispatchers.Main) {
             lspEditor = lspProject.createEditor("$projectPath/sample.lua")
@@ -192,20 +194,27 @@ class LspTestActivity : BaseEditorActivity() {
 
         var connected: Boolean
 
-        // delay(Timeout[Timeouts.INIT].toLong()) //wait for server start
-
-        try {
-            lspEditor.connectWithTimeout()
-
-            lspEditor.requestManager?.didChangeWorkspaceFolders(
+        lspEditor.eventListener = LspEditorEventListener { _, new, _ ->
+            if (new != LspEditorStatus.CONNECTED) {
+                return@LspEditorEventListener
+            }
+            lspEditor.requestManager.didChangeWorkspaceFolders(
                 DidChangeWorkspaceFoldersParams().apply {
                     this.event = WorkspaceFoldersChangeEvent().apply {
                         added =
-                            listOf(WorkspaceFolder("file://$projectPath/std/Lua53", "MyLuaProject"))
+                            listOf(
+                                WorkspaceFolder(
+                                    "file://$projectPath/std/Lua53",
+                                    "MyLuaProject"
+                                )
+                            )
                     }
                 }
             )
+        }
 
+        try {
+            lspEditor.connectWithTimeout()
             connected = true
 
         } catch (e: Exception) {
@@ -303,6 +312,18 @@ class LspTestActivity : BaseEditorActivity() {
             } else {
                 editor.formatCodeAsync()
             }
+        } else if (id == R.id.restart_server) {
+            lifecycleScope.launch(Dispatchers.Main) {
+                val languageServerWrapper =
+                    lspProject.getLanguageServerWrapper("lua", "lua-lsp") ?: return@launch
+                toast("Restarting language server...")
+                languageServerWrapper.restartAndReconnect()
+                if (languageServerWrapper.status == ServerStatus.INITIALIZED) {
+                    toast("Initialized language server")
+                } else {
+                    toast("Unable to connect language server")
+                }
+            }
         }
         return super.onOptionsItemSelected(item)
     }
@@ -310,6 +331,7 @@ class LspTestActivity : BaseEditorActivity() {
     override fun onDestroy() {
         super.onDestroy()
 
+        ref.clear()
         editor.release()
         lifecycleScope.launch {
             lspEditor.dispose()
@@ -320,19 +342,21 @@ class LspTestActivity : BaseEditorActivity() {
 
 
     class EventListener(
-        activity: LspTestActivity
+        private val activityRef: WeakReference<LspTestActivity>,
     ) : EventHandler.EventListener {
-        private val activityRef = WeakReference(activity)
         override fun initialize(server: LanguageServer?, result: InitializeResult) {
-            activityRef.get()?.apply {
+            val activity = activityRef.get() ?: return
+            activity.apply {
                 runOnUiThread {
                     rootMenu.findItem(R.id.code_format).isEnabled =
                         result.capabilities.documentFormattingProvider != null
                 }
             }
         }
+
+        override fun onStatusChange(newStatus: ServerStatus, oldStatus: ServerStatus) {
+            Log.d("LSP_TEST_ACTIVITY", "New status: $newStatus; Old status: $oldStatus")
+        }
     }
-
-
 }
 

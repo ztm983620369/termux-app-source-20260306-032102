@@ -22,6 +22,9 @@ public final class TerminalBuffer {
 
     /** Scratch buffer for row rotations (IL/DL). */
     private TerminalRow[] mRowSwapTmp;
+    /** Dirty visible screen rows tracked as [start, end). */
+    private int mDirtyStartRow = Integer.MAX_VALUE;
+    private int mDirtyEndRow = Integer.MIN_VALUE;
 
     /**
      * Create a transcript screen.
@@ -173,6 +176,36 @@ public final class TerminalBuffer {
 
     public int getActiveRows() {
         return mActiveTranscriptRows + mScreenRows;
+    }
+
+    public boolean hasDirtyRows() {
+        return mDirtyStartRow < mDirtyEndRow;
+    }
+
+    public int getDirtyStartRow() {
+        return hasDirtyRows() ? mDirtyStartRow : 0;
+    }
+
+    public int getDirtyEndRow() {
+        return hasDirtyRows() ? mDirtyEndRow : 0;
+    }
+
+    public void clearDirtyRows() {
+        mDirtyStartRow = Integer.MAX_VALUE;
+        mDirtyEndRow = Integer.MIN_VALUE;
+    }
+
+    public void markAllScreenRowsDirty() {
+        markDirtyRows(0, mScreenRows);
+    }
+
+    public void markDirtyRows(int startRow, int endRow) {
+        if (mScreenRows <= 0) return;
+        if (startRow < 0) startRow = 0;
+        if (endRow > mScreenRows) endRow = mScreenRows;
+        if (endRow <= startRow) return;
+        if (startRow < mDirtyStartRow) mDirtyStartRow = startRow;
+        if (endRow > mDirtyEndRow) mDirtyEndRow = endRow;
     }
 
     /**
@@ -374,6 +407,7 @@ public final class TerminalBuffer {
 
         // Handle cursor scrolling off screen:
         if (cursor[0] < 0 || cursor[1] < 0) cursor[0] = cursor[1] = 0;
+        markAllScreenRowsDirty();
     }
 
     /**
@@ -429,6 +463,7 @@ public final class TerminalBuffer {
         // Clearing a row should never keep a stale wrap flag, otherwise selection/join logic may
         // treat the blank row as a continuation of previous output.
         mLines[blankRow].mLineWrap = false;
+        markDirtyRows(topMargin, bottomMargin);
     }
 
     /**
@@ -455,6 +490,7 @@ public final class TerminalBuffer {
         } else {
             rotateScreenRowsDown(startRow, regionHeight, k);
         }
+        markDirtyRows(startRow, startRow + regionHeight);
     }
 
     private TerminalRow[] ensureRowSwapTmp(int size) {
@@ -532,6 +568,7 @@ public final class TerminalBuffer {
             TerminalRow sourceRow = allocateFullLineIfNecessary(externalToInternalRow(sy + y2));
             allocateFullLineIfNecessary(externalToInternalRow(dy + y2)).copyInterval(sourceRow, sx, sx + w, dx);
         }
+        markDirtyRows(Math.min(sy, dy), Math.max(sy + h, dy + h));
     }
 
     /**
@@ -544,6 +581,7 @@ public final class TerminalBuffer {
             throw new IllegalArgumentException(
                 "Illegal arguments! blockSet(" + sx + ", " + sy + ", " + w + ", " + h + ", " + val + ", " + mColumns + ", " + mScreenRows + ")");
         }
+        markDirtyRows(sy, sy + h);
 
         // Fast path: full-width clears are extremely common (tmux, full-screen TUIs).
         // Avoid per-cell setChar() overhead when we can clear whole rows at once.
@@ -589,6 +627,7 @@ public final class TerminalBuffer {
     public void setChar(int column, int row, int codePoint, long style) {
         if (row  < 0 || row >= mScreenRows || column < 0 || column >= mColumns)
             throw new IllegalArgumentException("TerminalBuffer.setChar(): row=" + row + ", column=" + column + ", mScreenRows=" + mScreenRows + ", mColumns=" + mColumns);
+        markDirtyRows(row, row + 1);
         row = externalToInternalRow(row);
         allocateFullLineIfNecessary(row).setChar(column, codePoint, style);
     }
@@ -600,6 +639,7 @@ public final class TerminalBuffer {
     /** Support for http://vt100.net/docs/vt510-rm/DECCARA and http://vt100.net/docs/vt510-rm/DECCARA */
     public void setOrClearEffect(int bits, boolean setOrClear, boolean reverse, boolean rectangular, int leftMargin, int rightMargin, int top, int left,
                                  int bottom, int right) {
+        markDirtyRows(top, bottom);
         for (int y = top; y < bottom; y++) {
             TerminalRow line = mLines[externalToInternalRow(y)];
             int startOfLine = (rectangular || y == top) ? left : leftMargin;

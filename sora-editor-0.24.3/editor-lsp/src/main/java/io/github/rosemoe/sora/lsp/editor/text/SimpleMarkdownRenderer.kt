@@ -16,10 +16,10 @@ import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.URLSpan
 import android.util.Base64
+import androidx.annotation.VisibleForTesting
 import java.util.Locale
 
 object SimpleMarkdownRenderer {
-    private const val maxImageWidth = 800
     var globalImageProvider: ImageProvider = DefaultImageProvider(maxImageWidth)
 
     fun render(
@@ -433,7 +433,8 @@ object SimpleMarkdownRenderer {
         }
     }
 
-    private fun parseBlocks(text: String): List<Block> {
+    @VisibleForTesting
+    internal fun parseBlocks(text: String): List<Block> {
         val blocks = mutableListOf<Block>()
         val lines = text.split('\n')
         var index = 0
@@ -482,12 +483,15 @@ object SimpleMarkdownRenderer {
 
     private fun parseCodeBlock(lines: List<String>, startIndex: Int): Pair<Block.CodeBlock, Int> {
         val firstLine = lines[startIndex].trim()
-        val language = if (firstLine.length > 3) firstLine.substring(3).trim() else null
+        val backquotes = firstLine.takeWhile { it == '`' }
+        val language =
+            if (firstLine.length > backquotes.length) firstLine.substring(backquotes.length)
+                .trim() else null
         val builder = StringBuilder()
         var index = startIndex + 1
         while (index < lines.size) {
             val line = lines[index]
-            if (line.trim().startsWith("```")) {
+            if (line.trim() == backquotes) {
                 index++
                 break
             }
@@ -930,7 +934,8 @@ object SimpleMarkdownRenderer {
         fun load(src: String): Drawable?
     }
 
-    private sealed interface Block {
+    @VisibleForTesting
+    internal interface Block {
         class Heading(val level: Int, val inlines: List<Inline>) : Block
         class Paragraph(val inlines: List<Inline>) : Block
         class CodeBlock(val content: String, val language: String?) : Block
@@ -941,7 +946,8 @@ object SimpleMarkdownRenderer {
         data object HorizontalRule : Block
     }
 
-    private sealed interface Inline {
+    @VisibleForTesting
+    internal sealed interface Inline {
         class Text(val value: String) : Inline
         class Bold(val children: List<Inline>) : Inline
         class Italic(val children: List<Inline>) : Inline
@@ -971,6 +977,7 @@ object SimpleMarkdownRenderer {
     private val pOpenRegex = Regex("(?is)<p[^>]*>")
     private val pCloseRegex = Regex("(?is)</p>")
     private val multiNewlineRegex = Regex("\n{3,}")
+    private const val maxImageWidth = 800
     private const val leadingMargin = 24
     private const val indentMargin = 24
     private const val lineSeparator = "──────────"

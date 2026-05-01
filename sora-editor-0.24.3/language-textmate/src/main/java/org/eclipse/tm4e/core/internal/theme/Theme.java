@@ -201,11 +201,7 @@ public final class Theme {
 			}
 
 			for (int j = 0, lenJ = scopes.size(); j < lenJ; j++) {
-				final var scopeEntry = scopes.get(j);
-				if (scopeEntry == null) {
-					continue;
-				}
-				final var _scope = scopeEntry.trim();
+				final var _scope = scopes.get(j).trim();
 
 				final var segments = StringUtils.splitToList(_scope, ' ');
 

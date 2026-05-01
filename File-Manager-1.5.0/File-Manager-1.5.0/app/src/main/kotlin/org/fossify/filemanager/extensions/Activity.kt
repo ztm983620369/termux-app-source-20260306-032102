@@ -56,7 +56,9 @@ fun Activity.tryOpenPathIntent(path: String, forceChooser: Boolean, openAsType: 
                     extension = ext,
                     mimeType = mimeType,
                     originType = FileOpenRequest.ORIGIN_LOCAL,
-                    originPath = file.absolutePath
+                    originPath = file.absolutePath,
+                    originModifiedMs = file.lastModified().takeIf { it > 0L },
+                    originSize = file.length().takeIf { it >= 0L }
                 )
             )
             if (finishActivity) {

@@ -92,14 +92,15 @@ dependencies {
     implementation("io.github.dingyi222666.monarch:monarch-language-pack:1.0.2")
 
     // Kotlin coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     implementation(project(":file-bridge"))
     implementation(project(":editor-sync-core"))
     implementation(project(":termux-shared"))
 
     // Lua language server
-    implementation("org.eclipse.lsp4j:org.eclipse.lsp4j:0.21.1")
+    implementation(fileTree("dir" to "libs", "includes" to listOf("*.jar")))
+    implementation("org.eclipse.lsp4j:org.eclipse.lsp4j:1.0.0")
 
     debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
 }

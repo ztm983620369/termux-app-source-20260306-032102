@@ -90,7 +90,17 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
         storedItems = recents
         val existingAdapter = binding.recentsList.adapter as? ItemsAdapter
         if (existingAdapter == null || forceRefresh) {
-            ItemsAdapter(activity as SimpleActivity, storedItems, this, binding.recentsList, isPickMultipleIntent, binding.recentsSwipeRefresh, false, false) {
+            ItemsAdapter(
+                activity = activity as SimpleActivity,
+                listItems = storedItems,
+                listener = this,
+                recyclerView = binding.recentsList,
+                isPickMultipleIntent = isPickMultipleIntent,
+                swipeRefreshLayout = binding.recentsSwipeRefresh,
+                canHaveIndividualViewType = false,
+                showFileDate = false,
+                showRecentPathMetadata = true
+            ) {
                 handleRecentClick((it as FileDirItem).path)
             }.apply {
                 setupZoomListener(zoomListener)
@@ -98,6 +108,7 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
             }
         } else {
             existingAdapter.apply {
+                setRecentPathMetadataEnabled(true)
                 updateItems(storedItems)
                 setupZoomListener(zoomListener)
             }
@@ -242,7 +253,7 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
 
                 if (wantedMimeTypes.any { isProperMimeType(it, listPath, false) }) {
                     val name = entry.displayName.ifBlank { listPath.getFilenameFromPath() }
-                    val size = if (file.exists() && file.isFile) file.length() else 0L
+                    val size = entry.resolveRecentSize(file, isRemote)
                     val modified = entry.openedAtMs
                     listItems.add(ListItem(listPath, name, false, 0, size, modified, false, false))
                     recentEntries[listPath] = entry
@@ -264,6 +275,16 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
 
     private fun RecentFileEntry.listPath(): String {
         return remoteOriginPath() ?: path
+    }
+
+    private fun RecentFileEntry.resolveRecentSize(file: File, isRemote: Boolean): Long {
+        if (isRemote) {
+            return sizeBytes ?: file.takeIf { it.exists() && it.isFile }?.length() ?: -1L
+        }
+        return when {
+            file.exists() && file.isFile -> file.length()
+            else -> -1L
+        }
     }
 
     private fun getRecyclerAdapter() = binding.recentsList.adapter as? ItemsAdapter
@@ -314,7 +335,8 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
         lastSearchedText = text
         val normalizedText = text.normalizeString()
         val filtered = filesIgnoringSearch.filter {
-            it.mName.normalizeString().contains(normalizedText, true)
+            it.mName.normalizeString().contains(normalizedText, true) ||
+                it.mPath.normalizeString().contains(normalizedText, true)
         }.toMutableList() as ArrayList<ListItem>
 
         binding.apply {

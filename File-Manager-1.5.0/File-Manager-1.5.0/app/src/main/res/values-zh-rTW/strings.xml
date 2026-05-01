@@ -42,6 +42,22 @@
     <string name="archives">封存</string>
     <string name="recents">最近造訪</string>
     <string name="show_recents">顯示最近造訪</string>
+    <string name="recent_file_size_unknown">未知大小</string>
+    <string name="recent_time_today">今天</string>
+    <string name="recent_time_yesterday">昨天</string>
+    <string name="recent_time_day_before_yesterday">前天</string>
+    <string name="recent_time_last_week">一週前</string>
+    <string name="recent_time_last_month">上個月</string>
+    <plurals name="recent_time_days_ago">
+        <item quantity="other">%d天前</item>
+    </plurals>
+    <plurals name="recent_time_weeks_ago">
+        <item quantity="other">%d週前</item>
+    </plurals>
+    <plurals name="recent_time_months_ago">
+        <item quantity="other">%d個月前</item>
+    </plurals>
     <string name="documents">文件</string>
     <string name="storage_free">可用空間</string>
+    <string name="multi_select">多選</string>
 </resources>

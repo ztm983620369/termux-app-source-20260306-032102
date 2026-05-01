@@ -26,10 +26,13 @@ package io.github.rosemoe.sora.lsp.editor.completion
 
 import io.github.rosemoe.sora.lang.completion.CompletionItemKind
 import io.github.rosemoe.sora.lang.completion.SimpleCompletionIconDrawer.draw
+import io.github.rosemoe.sora.lang.completion.SimpleCompletionIconDrawer.drawColorSpan
+import io.github.rosemoe.sora.lang.completion.SimpleCompletionIconDrawer.drawFileFolder
 import io.github.rosemoe.sora.lang.completion.snippet.parser.CodeSnippetParser
 import io.github.rosemoe.sora.lsp.editor.LspEventManager
 import io.github.rosemoe.sora.lsp.events.EventType
 import io.github.rosemoe.sora.lsp.events.document.applyEdits
+import io.github.rosemoe.sora.lsp.utils.ColorUtils
 import io.github.rosemoe.sora.lsp.utils.asLspPosition
 import io.github.rosemoe.sora.lsp.utils.createPosition
 import io.github.rosemoe.sora.lsp.utils.createRange
@@ -38,9 +41,9 @@ import io.github.rosemoe.sora.text.Content
 import io.github.rosemoe.sora.util.Logger
 import io.github.rosemoe.sora.widget.CodeEditor
 import org.eclipse.lsp4j.CompletionItem
+import org.eclipse.lsp4j.CompletionItemTag
 import org.eclipse.lsp4j.InsertTextFormat
 import org.eclipse.lsp4j.TextEdit
-
 
 class LspCompletionItem(
     private val completionItem: CompletionItem,
@@ -50,7 +53,6 @@ class LspCompletionItem(
     completionItem.label,
     completionItem.detail
 ) {
-
     init {
         this.prefixLength = prefixLength
         kind =
@@ -60,10 +62,52 @@ class LspCompletionItem(
         sortText = completionItem.sortText
         filterText = completionItem.filterText
         val labelDetails = completionItem.labelDetails
-        if (labelDetails != null && labelDetails.description?.isNotEmpty() == true) {
-            desc = labelDetails.description
+        if (labelDetails != null) {
+            if (labelDetails.description?.isNotEmpty() == true) {
+                desc = labelDetails.description
+            }
+            detail = labelDetails.detail
         }
-        icon = draw(kind ?: CompletionItemKind.Text)
+        val tags = completionItem.tags
+        if (tags != null) {
+            deprecated = tags.contains(CompletionItemTag.Deprecated)
+        }
+
+        val isFile = kind == CompletionItemKind.File
+        val isFolder = kind == CompletionItemKind.Folder
+        val fileIcon = when {
+            isFile || isFolder -> {
+                label?.let { drawFileFolder(it.toString(), isFolder) }
+                    ?: desc?.let { drawFileFolder(it.toString(), isFolder) }
+            }
+
+            else -> null
+        }
+
+        icon = fileIcon ?: run {
+            val colorValue = extractColor()
+            if (kind == CompletionItemKind.Color && colorValue != null) {
+                drawColorSpan(colorValue)
+            } else {
+                draw(kind ?: CompletionItemKind.Text)
+            }
+        }
+    }
+
+    fun extractColor(): Int? {
+        val labelColor = label?.let { ColorUtils.parseColor(it.toString()) }
+        val detailColor = desc?.let { ColorUtils.parseColor(it.toString()) }
+
+        val documentation = completionItem.documentation?.let {
+            if (it.isLeft) it.left else it.right.value
+        }
+        val documentationColor = documentation?.let { ColorUtils.parseColor(it) }
+
+        if (documentationColor != null && detailColor == null && labelColor == null && desc == null) {
+            desc = documentation
+        }
+
+        return labelColor ?: detailColor ?: documentationColor
     }
 
     override fun performCompletion(editor: CodeEditor, text: Content, position: CharPosition) {
@@ -84,7 +128,10 @@ class LspCompletionItem(
         if (completionItem.textEdit != null && completionItem.textEdit.isLeft) {
             textEdit = completionItem.textEdit.left
         } else if (completionItem.textEdit?.isRight == true) {
-            textEdit = TextEdit(completionItem.textEdit.right.insert, completionItem.textEdit.right.newText)
+            textEdit = TextEdit(
+                completionItem.textEdit.right.insert,
+                completionItem.textEdit.right.newText
+            )
         }
 
         if (textEdit.newText == null && completionItem.label != null) {
@@ -164,5 +211,3 @@ class LspCompletionItem(
         // do nothing
     }
 }
-
-

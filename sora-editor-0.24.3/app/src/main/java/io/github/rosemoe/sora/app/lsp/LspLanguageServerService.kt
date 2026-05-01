@@ -30,13 +30,25 @@ import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.IBinder
 import android.util.Log
-import kotlin.concurrent.thread
+import com.tang.vscode.LuaLanguageClient
+import com.tang.vscode.LuaLanguageServer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.eclipse.lsp4j.jsonrpc.Launcher
+import java.util.concurrent.Future
 
 
 class LspLanguageServerService : Service() {
+    private lateinit var socket: LocalServerSocket
 
-    private var socket: LocalServerSocket? = null
-    private var socketClient: LocalSocket? = null
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private var acceptJob: Job? = null
 
     companion object {
         private const val TAG = "LanguageServer"
@@ -46,38 +58,65 @@ class LspLanguageServerService : Service() {
         return null
     }
 
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Only used in test
-        thread {
+        if (!::socket.isInitialized) {
             socket = LocalServerSocket("lua-lsp")
+        }
 
-            Log.d(TAG, "Starting socket on address ${socket?.localSocketAddress}")
-
-            socketClient = socket?.accept()
-
-            runCatching {
-            }.onFailure {
-                Log.d(TAG, "Unexpected exception is thrown in the Language Server Thread.", it)
+        if (acceptJob == null) {
+            acceptJob = serviceScope.launch {
+                Log.d(TAG, "Starting accept loop on address ${socket.localSocketAddress.namespace}")
+                while (true) {
+                    try {
+                        val socketClient = socket.accept()
+                        Log.d(TAG, "Accepted client $socketClient")
+                        launch { handleClient(socketClient) }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "Error accepting connection", e)
+                        break
+                    }
+                }
             }
-
-            socketClient?.close()
-            socketClient = null
-
-            socket?.close()
-            socket = null
         }
 
         return START_STICKY
     }
 
-    override fun onDestroy() {
-        socketClient?.close()
-        socketClient = null
-        socket?.close()
-        socket = null
-        super.onDestroy()
+    private suspend fun handleClient(socketClient: LocalSocket) {
+        var future: Future<Void>? = null
+
+        val server = LuaLanguageServer()
+
+        runCatching {
+
+            val inputStream = socketClient.inputStream
+            val outputStream = socketClient.outputStream
+
+            val launcher = Launcher.createLauncher(
+                server, LuaLanguageClient::class.java,
+                inputStream, outputStream
+            )
+
+            server.connect(launcher.remoteProxy)
+
+            future = launcher.startListening()
+
+            // Suspend until the session ends, without blocking the dispatcher thread
+            withContext(Dispatchers.IO) {
+                future?.get()
+            }
+        }.onFailure {
+            Log.d(TAG, "Unexpected exception in Language Server client thread.", it)
+        }
+
+        Log.d(TAG, "Closed client $socketClient")
+        future?.cancel(true)
+        runCatching { socketClient.close() }
     }
 
-
+    override fun onDestroy() {
+        serviceScope.cancel()
+        runCatching { socket.close() }
+        super.onDestroy()
+    }
 }

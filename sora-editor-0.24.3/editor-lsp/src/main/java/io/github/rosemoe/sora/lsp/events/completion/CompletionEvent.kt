@@ -24,7 +24,6 @@
 
 package io.github.rosemoe.sora.lsp.events.completion
 
-import android.util.Log
 import io.github.rosemoe.sora.lsp.editor.LspEditor
 import io.github.rosemoe.sora.lsp.events.AsyncEventListener
 import io.github.rosemoe.sora.lsp.events.EventContext
@@ -34,24 +33,22 @@ import io.github.rosemoe.sora.lsp.utils.asLspPosition
 import io.github.rosemoe.sora.lsp.utils.createCompletionParams
 import io.github.rosemoe.sora.text.CharPosition
 import io.github.rosemoe.sora.util.Logger
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.future.await
 import org.eclipse.lsp4j.CompletionContext
 import org.eclipse.lsp4j.CompletionItem
 import java.util.concurrent.CompletableFuture
 
-
 class CompletionEvent : AsyncEventListener() {
     override val eventName = EventType.completion
 
     private var future: CompletableFuture<List<CompletionItem>>? = null
 
-    override suspend fun handleAsync(context: EventContext) {
+    override suspend fun doHandleAsync(context: EventContext) {
         val editor = context.get<LspEditor>("lsp-editor")
         val position = context.getByClass<CharPosition>() ?: return
 
-        val requestManager = editor.requestManager ?: return
+        val requestManager = editor.requestManager
 
         val future = requestManager
             .completion(
@@ -76,14 +73,17 @@ class CompletionEvent : AsyncEventListener() {
 
         this.future = future
 
-        try {
-            context.put("completion-items", future.await())
-        } catch (e: Exception) {
-            if (e !is TimeoutCancellationException) {
-                Logger.instance(this.javaClass.name)
-                    .e("Request completion failed", e)
-                throw e
-            }
+        context.put("completion-items", future.await())
+    }
+
+    override fun onException(context: EventContext, exception: Exception) {
+        val editor = context.getOrNull<LspEditor>("lsp-editor")
+        editor?.requestManager?.getSessions()?.forEach {
+            it.reportEventException(this, exception)
+        }
+        if (exception !is TimeoutCancellationException) {
+            Logger.instance(this.javaClass.name).e("Request completion failed", exception)
+            throw exception
         }
     }
 
@@ -91,7 +91,6 @@ class CompletionEvent : AsyncEventListener() {
         future?.cancel(true)
         future = null
     }
-
 }
 
 val EventType.completion: String

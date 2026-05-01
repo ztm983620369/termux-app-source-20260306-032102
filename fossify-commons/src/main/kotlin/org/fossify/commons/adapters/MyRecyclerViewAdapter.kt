@@ -260,6 +260,22 @@ abstract class MyRecyclerViewAdapter(val activity: BaseSimpleActivity, val recyc
         }
     }
 
+    fun enterSelectionMode(position: Int) {
+        if (position < 0 || !getIsItemSelectable(position)) {
+            return
+        }
+
+        if (!actModeCallback.isSelectable) {
+            activity.startActionMode(actModeCallback)
+            if (!actModeCallback.isSelectable) {
+                return
+            }
+        }
+
+        toggleItemSelection(true, position, true)
+        itemLongClicked(position)
+    }
+
     fun setupZoomListener(zoomListener: MyRecyclerView.MyZoomListener?) {
         recyclerView.setupZoomListener(zoomListener)
     }

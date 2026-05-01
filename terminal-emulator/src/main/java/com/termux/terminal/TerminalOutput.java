@@ -29,4 +29,7 @@ public abstract class TerminalOutput {
 
     public abstract void onColorsChanged();
 
+    /** Notify the terminal client that the host should handle a Termux-specific control command. */
+    public abstract void onTerminalHostControlCommand(String command, String argument);
+
 }

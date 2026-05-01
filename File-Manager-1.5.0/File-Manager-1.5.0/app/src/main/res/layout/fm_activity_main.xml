@@ -30,7 +30,8 @@
         android:layout_gravity="bottom|end"
         android:layout_marginEnd="@dimen/activity_margin"
         android:layout_marginBottom="152dp"
-        android:src="@drawable/ic_search_vector" />
+        android:src="@drawable/ic_search_vector"
+        android:visibility="gone" />
 
     <org.fossify.commons.views.MyFloatingActionButton
         android:id="@+id/main_more_fab"

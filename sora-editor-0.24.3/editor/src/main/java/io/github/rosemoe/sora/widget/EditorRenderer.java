@@ -40,6 +40,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.os.Build;
 import android.os.SystemClock;
+import android.text.GetChars;
 import android.util.Log;
 import android.util.SparseArray;
 
@@ -48,7 +49,6 @@ import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.collection.MutableIntList;
 import androidx.collection.MutableLongLongMap;
-import androidx.collection.MutableLongObjectMap;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -90,6 +90,7 @@ import io.github.rosemoe.sora.util.Numbers;
 import io.github.rosemoe.sora.util.TemporaryCharBuffer;
 import io.github.rosemoe.sora.widget.layout.Row;
 import io.github.rosemoe.sora.widget.layout.RowIterator;
+import io.github.rosemoe.sora.widget.minimap.MinimapRenderer;
 import io.github.rosemoe.sora.widget.rendering.RenderingConstants;
 import io.github.rosemoe.sora.widget.rendering.TextAdvancesCache;
 import io.github.rosemoe.sora.widget.schemes.EditorColorScheme;
@@ -144,6 +145,7 @@ public class EditorRenderer {
     protected Content content;
     private volatile boolean renderingFlag;
     protected boolean forcedRecreateLayout;
+    private final MinimapRenderer minimapRenderer;
 
     public EditorRenderer(@NonNull CodeEditor editor) {
         this.editor = editor;
@@ -172,6 +174,7 @@ public class EditorRenderer {
         lineBreakGraph = editor.getContext().getDrawable(R.drawable.line_break);
         softwrapLeftGraph = editor.getContext().getDrawable(R.drawable.softwrap_left);
         softwrapRightGraph = editor.getContext().getDrawable(R.drawable.softwrap_right);
+        minimapRenderer = new MinimapRenderer(editor);
 
         onEditorFullTextUpdate();
     }
@@ -391,14 +394,14 @@ public class EditorRenderer {
         var widths = cache != null && cache.getUpdateTimestamp() >= displayTimestamp ? cache.getWidths() : null;
         widths = widths != null && widths.getSize() > line.length() ? widths : null;
         tr.set(line, row.startColumn, row.endColumn, spanReader.getSpansOnLine(row.lineIndex), row.inlayHints, content.getLineDirections(row.lineIndex), paintGeneral, widths, createTextRowParams());
-        applySelectedTextRange(tr, row.lineIndex);
+        applySelectedTextRange(tr, row.lineIndex, line);
         return tr;
     }
 
-    private void applySelectedTextRange(TextRow tr, int lineIndex) {
+    private void applySelectedTextRange(TextRow tr, int lineIndex, ContentLine line) {
         if (cursor.isSelected() && lineIndex >= cursor.getLeftLine() && lineIndex <= cursor.getRightLine()) {
             int startColInLine = lineIndex == cursor.getLeftLine() ? cursor.getLeftColumn() : 0;
-            int endColInLine = lineIndex == cursor.getRightLine() ? cursor.getRightColumn() : lineBuf.length();
+            int endColInLine = lineIndex == cursor.getRightLine() ? cursor.getRightColumn() : line.length();
             startColInLine = Math.max(tr.getTextStart(), startColInLine);
             endColInLine = Math.min(tr.getTextEnd(), endColInLine);
             if (startColInLine < endColInLine) {
@@ -420,7 +423,7 @@ public class EditorRenderer {
         var widths = cache != null && cache.getUpdateTimestamp() >= displayTimestamp ? cache.getWidths() : null;
         widths = widths != null && widths.getSize() > lineBuf.length() ? widths : null;
         tr.set(lineBuf, 0, columnCount, spans.getSpansOnLine(line), lineInlays, getLineDirections(line), paintGeneral, widths, createTextRowParams());
-        applySelectedTextRange(tr, line);
+        applySelectedTextRange(tr, line, lineBuf);
         if (canvas != null) {
             canvas.save();
             canvas.translate(offsetX, editor.getRowTop(0) + offsetY);
@@ -509,7 +512,7 @@ public class EditorRenderer {
         canvas.save();
         float stuckLineBottom = getStuckLineBottom(stuckLines);
         canvas.clipRect(0, stuckLineBottom, editor.getWidth(), editor.getHeight());
-        drawRows(canvas, textOffset, postDrawLineNumbers, postDrawCursor, postDrawCurrentLines, firstLn);
+        drawRows(canvas, textOffset, postDrawLineNumbers, postDrawCursor, postDrawCurrentLines, firstLn, stuckLines);
         patchHighlightedDelimiters(canvas, textOffset);
         drawDiagnosticIndicators(canvas, offsetX);
         canvas.restore();
@@ -629,7 +632,7 @@ public class EditorRenderer {
         }
 
         drawStuckLineNumbers(canvas, stuckLines, offsetX, lineNumberWidth, editor.getColorScheme().getColor(EditorColorScheme.LINE_NUMBER));
-        drawScrollBars(canvas);
+        drawScrollBarsAndMinimap(canvas);
         drawEdgeEffect(canvas);
 
         releasePreloadedData();
@@ -1022,38 +1025,53 @@ public class EditorRenderer {
         int startLine = editor.getFirstVisibleLine();
         int offsetY = editor.getOffsetY(), rowHeight = editor.getRowHeight();
         List<CodeBlock> codeBlocks;
-        if ((styles = editor.getStyles()) == null || (codeBlocks = styles.blocksByStart) == null) {
+        if ((styles = editor.getStyles()) == null || (codeBlocks = styles.blocks) == null) {
             return null;
         }
-        int size = codeBlocks.size();
-        List<CodeBlock> candidates = new ArrayList<>();
-        var limit = editor.getProps().stickyScrollIterationLimit;
-        var maxLine = content.getLineCount();
-        for (int i = 0; i < size && i < limit; i++) {
-            var block = codeBlocks.get(i);
-            if (block == null || block.startLine > block.endLine ||
-                    block.startLine > maxLine || block.endLine > maxLine ||
-                    block.startLine < 0) {
+
+        List<CodeBlock> visibleBlocks = new ArrayList<>();
+        int first = editor.getFirstVisibleLine();
+        int last = editor.getLastVisibleLine();
+        boolean mark = false;
+        int invalidCount = 0;
+        int maxCount = styles.getSuppressSwitch();
+        int mm = editor.binarySearchEndBlock(first, codeBlocks);
+        if (mm == -1) {
+            mm = 0;
+        }
+        for (int curr = mm; curr < codeBlocks.size(); curr++) {
+            CodeBlock block = codeBlocks.get(curr);
+            if (block == null) {
                 continue;
             }
-            if (block.startLine > startLine) {
-                break;
+            if (CodeEditor.hasVisibleRegion(block.startLine, block.endLine, first, last)) {
+                visibleBlocks.add(block);
+                mark = true;
+            } else if (mark) {
+                if (invalidCount >= maxCount) break;
+                invalidCount++;
             }
+        }
+        // Sort visible blocks by start position and check constraints
+        Collections.sort(visibleBlocks, CodeBlock.COMPARATOR_START);
+        List<CodeBlock> finalCandidates = new ArrayList<>();
+        for (int i = 0; i < visibleBlocks.size(); i++) {
+            var block = visibleBlocks.get(i);
             if (block.endLine > startLine && editor.getRowTop(block.startLine) - offsetY < 0) {
-                candidates.add(block);
+                finalCandidates.add(block);
                 startLine++;
                 offsetY += rowHeight;
             }
         }
         var maxLines = editor.getProps().stickyScrollMaxLines;
-        if (candidates.size() > maxLines) {
+        if (finalCandidates.size() > maxLines) {
             if (maxLines <= 0) {
                 return null;
             }
             if (editor.getProps().stickyScrollPreferInnerScope) {
-                candidates = candidates.subList(candidates.size() - maxLines, candidates.size());
+                finalCandidates = finalCandidates.subList(finalCandidates.size() - maxLines, finalCandidates.size());
             } else {
-                candidates = candidates.subList(0, maxLines);
+                finalCandidates = finalCandidates.subList(0, maxLines);
             }
         }
         if (editor.getCursor().isSelected() && editor.getProps().stickyScrollAutoCollapse) {
@@ -1061,12 +1079,12 @@ public class EditorRenderer {
             var firstVis = editor.getFirstVisibleLine();
             int lastSelectionLine = editor.getCursor().getRightLine();
             if (lastSelectionLine >= firstVis) {
-                while (!candidates.isEmpty() && firstVis + candidates.size() >= limitLine) {
-                    candidates.remove(candidates.size() - 1);
+                while (!finalCandidates.isEmpty() && firstVis + finalCandidates.size() >= limitLine) {
+                    finalCandidates.remove(finalCandidates.size() - 1);
                 }
             }
         }
-        return candidates;
+        return finalCandidates;
     }
 
     private final LineStyles coordinateLine = new LineStyles(0);
@@ -1140,7 +1158,9 @@ public class EditorRenderer {
      * @param postDrawLineNumbers Line numbers to be drawn later
      * @param postDrawCursor      Cursors to be drawn later
      */
-    protected void drawRows(Canvas canvas, float offset, LongArrayList postDrawLineNumbers, List<DrawCursorTask> postDrawCursor, MutableIntList postDrawCurrentLines, MutableInt requiredFirstLn) {
+    protected void drawRows(Canvas canvas, float offset, LongArrayList postDrawLineNumbers,
+                            List<DrawCursorTask> postDrawCursor, MutableIntList postDrawCurrentLines,
+                            MutableInt requiredFirstLn, List<CodeBlock> stuckLines) {
         int firstVis = editor.getFirstVisibleRow();
         RowIterator rowIterator = editor.getLayout().obtainRowIterator(firstVis, preloadedLines);
         Spans spans = editor.getStyles() == null ? null : editor.getStyles().spans;
@@ -1165,7 +1185,7 @@ public class EditorRenderer {
             circleRadius = Math.min(editor.getRowHeight(), spaceWidth) * RenderingConstants.NON_PRINTABLE_CIRCLE_RADIUS_FACTOR;
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !editor.isWordwrap() && canvas.isHardwareAccelerated() && editor.isHardwareAcceleratedDrawAllowed()) {
-            editor.getRenderContext().getRenderNodeHolder().keepCurrentInDisplay(firstVis, editor.getLastVisibleRow());
+            editor.getRenderContext().getRenderNodeHolder().keepCurrentInDisplay(firstVis, editor.getLastVisibleRow(), stuckLines);
         }
         float offset2 = editor.getOffsetX() - editor.measureTextRegionOffset();
 
@@ -1252,11 +1272,12 @@ public class EditorRenderer {
 
             // Draw matched text background
             if (matchedPositions.size() > 0) {
+                var tr = createTextRow(row);
                 for (int i = 0; i < matchedPositions.size(); i++) {
                     var position = matchedPositions.get(i);
                     var start = IntPair.getFirst(position);
                     var end = IntPair.getSecond(position);
-                    drawRowRegionBackground(canvas, row, start, end, rowInf.startColumn,
+                    drawRowRegionBackground(canvas, row, tr, start, end, rowInf.startColumn,
                             rowInf.endColumn, editor.getColorScheme().getColor(EditorColorScheme.MATCHED_TEXT_BACKGROUND),
                             editor.getColorScheme().getColor(EditorColorScheme.MATCHED_TEXT_BORDER));
                 }
@@ -1265,10 +1286,11 @@ public class EditorRenderer {
             // Draw highlight text background
             if (highlightPositions.getSize() > 0) {
                 int finalRow = row;
+                var tr = createTextRow(row);
                 highlightPositions.forEach((position, colorPair) -> {
                     var start = IntPair.getFirst(position);
                     var end = IntPair.getSecond(position);
-                    drawRowRegionBackground(canvas, finalRow, start, end, rowInf.startColumn,
+                    drawRowRegionBackground(canvas, finalRow, tr, start, end, rowInf.startColumn,
                             rowInf.endColumn, IntPair.getFirst(colorPair), IntPair.getSecond(colorPair));
                     return null;
                 });
@@ -1293,7 +1315,7 @@ public class EditorRenderer {
                             editor.getColorScheme().getColor(EditorColorScheme.SELECTED_TEXT_BACKGROUND),
                             editor.getColorScheme().getColor(EditorColorScheme.SELECTED_TEXT_BORDER));
                 } else if (selectionStart < selectionEnd) {
-                    drawRowRegionBackground(canvas, row, selectionStart, selectionEnd, rowInf.startColumn, rowInf.endColumn,
+                    drawRowRegionBackground(canvas, row, null, selectionStart, selectionEnd, rowInf.startColumn, rowInf.endColumn,
                             editor.getColorScheme().getColor(EditorColorScheme.SELECTED_TEXT_BACKGROUND),
                             editor.getColorScheme().getColor(EditorColorScheme.SELECTED_TEXT_BORDER));
                 }
@@ -1404,7 +1426,7 @@ public class EditorRenderer {
                 // Draw without hardware acceleration
                 TextRow tr = new TextRow();
                 tr.set(lineBuf, rowInf.startColumn, rowInf.endColumn, reader.getSpansOnLine(line), rowInf.inlayHints, getLineDirections(line), paintGeneral, lineCache, createTextRowParams());
-                applySelectedTextRange(tr, line);
+                applySelectedTextRange(tr, line, lineBuf);
 
                 canvas.save();
                 canvas.translate(-offsetCopy, editor.getRowTop(row) - editor.getOffsetY());
@@ -1445,14 +1467,14 @@ public class EditorRenderer {
                 canvas.save();
                 canvas.translate(paintingOffset, editor.getRowTopOfText(row) - editor.getOffsetY());
                 bufferedDrawPoints.setOffsets(paintingOffset, editor.getRowTopOfText(row) - editor.getOffsetY());
-                float beginOffset = Math.max(0, paintingOffset);
+                float beginOffset = Math.max(0, offsetCopy);
                 float endOffset = beginOffset + editor.getWidth();
                 final var wsLeadingEnd = leadingWhitespaceEnd;
                 final var wsTrailingStart = trailingWhitespaceStart;
 
                 paintOther.setColor(editor.getColorScheme().getColor(EditorColorScheme.NON_PRINTABLE_CHAR));
                 tr.iterateDrawTextRegions(rowInf.startColumn, rowInf.endColumn, canvas, beginOffset, endOffset, false,
-                        (Canvas _canvas, char[] text, int index, int count, int contextIndex, int contextCount, boolean isRtl,
+                        (Canvas _canvas, GetChars text, int index, int count, int contextIndex, int contextCount, boolean isRtl,
                          float horizontalOffset, float width, TextRowParams params, Span span) -> {
                             if ((nonPrintableFlags & CodeEditor.FLAG_DRAW_WHITESPACE_LEADING) != 0) {
                                 drawWhitespaces(_canvas, tr, text, index, count, contextIndex, contextCount, isRtl, horizontalOffset, width, 0, wsLeadingEnd);
@@ -1507,7 +1529,7 @@ public class EditorRenderer {
                     tr.iterateBackgroundRegions(paintStart, paintEnd, false, false, (left, right) -> {
                         tmpRect.left = finalOffset + left;
                         tmpRect.right = finalOffset + right;
-                        if (tmpRect.left > 0f)
+                        if (tmpRect.right > 0f && tmpRect.left < editor.getWidth())
                             drawColor(canvas, editor.getColorScheme().getColor(EditorColorScheme.UNDERLINE), tmpRect);
                         return tmpRect.right < editor.getWidth();
                     });
@@ -1712,7 +1734,7 @@ public class EditorRenderer {
     /**
      * Draw non-printable characters
      */
-    private void drawWhitespaces(Canvas canvas, TextRow tr, char[] chars, int index, int count, int contextIndex, int contextCount, boolean isRtl, float horizontalOffset, float width, int min, int max) {
+    private void drawWhitespaces(Canvas canvas, TextRow tr, GetChars chars, int index, int count, int contextIndex, int contextCount, boolean isRtl, float horizontalOffset, float width, int min, int max) {
         int paintStart = Math.max(index, Math.min(index + count, min));
         int paintEnd = Math.max(index, Math.min(index + count, max));
 
@@ -1721,7 +1743,7 @@ public class EditorRenderer {
             float rowCenter = (editor.getRowHeightOfText() / 2f + editor.getRowTopOfText(0));
             float offset = isRtl ? horizontalOffset + width : horizontalOffset;
             while (paintStart < paintEnd) {
-                char ch = chars[paintStart];
+                char ch = chars.charAt(paintStart);
                 int paintCount = 0;
                 boolean paintLine = false;
                 if (ch == ' ' || ch == '\t') {
@@ -1819,7 +1841,7 @@ public class EditorRenderer {
      * @param highlightEnd   Region end
      * @param color          Color of background
      */
-    protected void drawRowRegionBackground(Canvas canvas, int row, int highlightStart, int highlightEnd, int rowStart, int rowEnd, int color, int borderColor) {
+    protected void drawRowRegionBackground(@NonNull Canvas canvas, int row, @Nullable TextRow tr, int highlightStart, int highlightEnd, int rowStart, int rowEnd, int color, int borderColor) {
         highlightStart = Math.max(highlightStart, rowStart);
         highlightEnd = Math.min(highlightEnd, rowEnd);
         if (highlightStart < highlightEnd) {
@@ -1830,7 +1852,9 @@ public class EditorRenderer {
                 offset += getMiniGraphWidth();
             }
             float finalOffset = offset;
-            var tr = createTextRow(row);
+            if (tr == null) {
+                tr = createTextRow(row);
+            }
             var width = editor.getWidth();
             tr.iterateBackgroundRegions(highlightStart, highlightEnd, false, false, (left, right) -> {
                 tmpRect.left = finalOffset + left;
@@ -2037,18 +2061,17 @@ public class EditorRenderer {
      *
      * @param canvas The canvas to draw
      */
-    protected void drawScrollBars(Canvas canvas) {
+    protected void drawScrollBarsAndMinimap(Canvas canvas) {
+        var minimapWidth = minimapRenderer.onDrawToCanvas(canvas, editor.getWidth(), displayTimestamp);
         verticalScrollBarRect.setEmpty();
         horizontalScrollBarRect.setEmpty();
-        if (!editor.getEventHandler().shouldDrawScrollBarForTouch() && !(editor.isInMouseMode() && editor.getProps().mouseModeAlwaysShowScrollbars)) {
-            return;
-        }
+        boolean shouldShowScrollbars = editor.getEventHandler().shouldDrawScrollBarForTouch() || (editor.isInMouseMode() && editor.getProps().mouseModeAlwaysShowScrollbars);
         var percentage = editor.getEventHandler().getScrollBarFadeOutPercentageForTouch();
-        if (editor.isInMouseMode() && editor.getProps().mouseModeAlwaysShowScrollbars) {
+        if (shouldShowScrollbars && editor.isInMouseMode() && editor.getProps().mouseModeAlwaysShowScrollbars) {
             percentage = 0f;
         }
         var size = editor.getDpUnit() * RenderingConstants.SCROLLBAR_WIDTH_DIP;
-        if (editor.isHorizontalScrollBarEnabled() && !editor.isWordwrap() && editor.getScrollMaxX() > editor.getWidth() * 3 / 4) {
+        if (shouldShowScrollbars && editor.isHorizontalScrollBarEnabled() && !editor.isWordwrap() && editor.getScrollMaxX() > editor.getWidth() * 3 / 4) {
             canvas.save();
             canvas.translate(0f, size * percentage);
 
@@ -2057,7 +2080,8 @@ public class EditorRenderer {
 
             canvas.restore();
         }
-        if (editor.isVerticalScrollBarEnabled() && editor.getScrollMaxY() > editor.getHeight() / 2) {
+        boolean shouldShowVerticalScrollbar = shouldShowScrollbars && !editor.getProps().showMinimap;
+        if (shouldShowVerticalScrollbar && editor.isVerticalScrollBarEnabled() && editor.getScrollMaxY() > editor.getHeight() / 2) {
             canvas.save();
             canvas.translate(size * percentage, 0f);
 
@@ -2065,6 +2089,14 @@ public class EditorRenderer {
             drawScrollBarVertical(canvas);
 
             canvas.restore();
+        }
+
+        if (minimapWidth != 0) {
+            getVerticalScrollBarRect(tmpRect, minimapWidth);
+            verticalScrollBarRect.set(tmpRect);
+            if (editor.getEventHandler().holdVerticalScrollBar()) {
+                drawLineInfoPanel(canvas, tmpRect.top, tmpRect.height(), minimapWidth + 5 * editor.getDpUnit());
+            }
         }
     }
 
@@ -2088,27 +2120,33 @@ public class EditorRenderer {
         }
     }
 
+    private void getVerticalScrollBarRect(RectF rect, float width) {
+        int height = editor.getHeight();
+        float all = editor.getScrollMaxY() + height;
+        float length = Math.max(height / all * height, editor.getDpUnit() * RenderingConstants.SCROLLBAR_LENGTH_MIN_DIP);
+        float topY = editor.getOffsetY() * 1.0f / editor.getScrollMaxY() * (height - length);
+        rect.right = editor.getWidth();
+        rect.left = editor.getWidth() - width;
+        rect.top = topY;
+        rect.bottom = topY + length;
+    }
+
     /**
      * Draw vertical scroll bar
      *
      * @param canvas Canvas to draw
      */
     protected void drawScrollBarVertical(Canvas canvas) {
-        int height = editor.getHeight();
-        float all = editor.getScrollMaxY() + height;
-        float length = Math.max(height / all * height, editor.getDpUnit() * RenderingConstants.SCROLLBAR_LENGTH_MIN_DIP);
-        float topY = editor.getOffsetY() * 1.0f / editor.getScrollMaxY() * (height - length);
-        if (editor.getEventHandler().holdVerticalScrollBar()) {
-            drawLineInfoPanel(canvas, topY, length);
-        }
-        tmpRect.right = editor.getWidth();
-        tmpRect.left = editor.getWidth() - editor.getDpUnit() * RenderingConstants.SCROLLBAR_WIDTH_DIP;
-        tmpRect.top = topY;
-        tmpRect.bottom = topY + length;
+        getVerticalScrollBarRect(tmpRect, editor.getDpUnit() * RenderingConstants.SCROLLBAR_WIDTH_DIP);
         verticalScrollBarRect.set(tmpRect);
+        if (editor.getEventHandler().holdVerticalScrollBar()) {
+            drawLineInfoPanel(canvas, tmpRect.top, tmpRect.height(), 30 * editor.getDpUnit());
+        }
         if (verticalScrollbarThumbDrawable != null) {
             verticalScrollbarThumbDrawable.setState(editor.getEventHandler().holdVerticalScrollBar() ? PRESSED_DRAWABLE_STATE : DEFAULT_DRAWABLE_STATE);
-            verticalScrollbarThumbDrawable.setBounds((int) tmpRect.left, (int) tmpRect.top, (int) tmpRect.right, (int) tmpRect.bottom);
+            verticalScrollbarThumbDrawable.setBounds((int) verticalScrollBarRect.left,
+                    (int) verticalScrollBarRect.top, (int) verticalScrollBarRect.right,
+                    (int) verticalScrollBarRect.bottom);
             verticalScrollbarThumbDrawable.draw(canvas);
         } else {
             drawColor(canvas, editor.getColorScheme().getColor(editor.getEventHandler().holdVerticalScrollBar() ? EditorColorScheme.SCROLL_BAR_THUMB_PRESSED : EditorColorScheme.SCROLL_BAR_THUMB), tmpRect);
@@ -2122,7 +2160,7 @@ public class EditorRenderer {
      * @param topY   The y at the top of the vertical scrollbar
      * @param length The length of vertical scrollbar
      */
-    protected void drawLineInfoPanel(Canvas canvas, float topY, float length) {
+    protected void drawLineInfoPanel(Canvas canvas, float topY, float length, float rightMargin) {
         if (!editor.isDisplayLnPanel()) {
             return;
         }
@@ -2130,6 +2168,8 @@ public class EditorRenderer {
         int position = editor.getLnPanelPosition();
         String text = editor.getLineNumberTipTextProvider().getCurrentText(editor);
         float backupSize = paintGeneral.getTextSize();
+        paintGeneral.setTextSkewX(0f);
+        paintGeneral.setFakeBoldText(false);
         paintGeneral.setTextSize(editor.getLineInfoTextSize());
         Paint.FontMetricsInt backupMetrics = metricsText;
         metricsText = paintGeneral.getFontMetricsInt();
@@ -2167,8 +2207,8 @@ public class EditorRenderer {
             drawColorRound(canvas, editor.getColorScheme().getColor(EditorColorScheme.LINE_NUMBER_PANEL), tmpRect);
         } else {
             float[] radii = null;
-            tmpRect.right = editor.getWidth() - 30 * editor.getDpUnit();
-            tmpRect.left = editor.getWidth() - 30 * editor.getDpUnit() - expand * 2 - textWidth;
+            tmpRect.right = editor.getWidth() - rightMargin;
+            tmpRect.left = tmpRect.right - expand * 2 - textWidth;
             if (position == LineInfoPanelPosition.TOP) {
                 tmpRect.top = topY;
                 tmpRect.bottom = topY + editor.getRowHeight() + 2 * expand;
@@ -2296,7 +2336,7 @@ public class EditorRenderer {
         paintGeneral.setStyle(useBoldStyle ? Paint.Style.FILL_AND_STROKE : Paint.Style.FILL);
         paintGeneral.setFakeBoldText(useBoldStyle);
 
-        patchTextRegions(canvas, textOffset, start, end, (Canvas canvasLocal, char[] text, int index, int count, int contextIndex, int contextCount, boolean isRtl,
+        patchTextRegions(canvas, textOffset, start, end, (Canvas canvasLocal, GetChars text, int index, int count, int contextIndex, int contextCount, boolean isRtl,
                                                           float horizontalOffset, float width, TextRowParams params, Span span) -> {
             if (span == null) {
                 return;

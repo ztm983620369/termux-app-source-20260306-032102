@@ -3,6 +3,7 @@ package com.termux.view;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 
 import com.termux.terminal.TerminalBuffer;
@@ -89,7 +90,6 @@ public final class TerminalRenderer {
     public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
                              int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
         final boolean reverseVideo = mEmulator.isReverseVideo();
-        final int endRow = topRow + mEmulator.mRows;
         final int columns = mEmulator.mColumns;
         final int cursorCol = mEmulator.getCursorCol();
         final int cursorRow = mEmulator.getCursorRow();
@@ -97,13 +97,25 @@ public final class TerminalRenderer {
         final TerminalBuffer screen = mEmulator.getScreen();
         final int[] palette = mEmulator.mColors.mCurrentColors;
         final int cursorShape = mEmulator.getCursorStyle();
+        final Rect clipRect = canvas.getClipBounds();
+        if (clipRect.isEmpty()) return;
 
-        if (reverseVideo)
+        if (reverseVideo) {
             canvas.drawColor(palette[TextStyle.COLOR_INDEX_FOREGROUND], PorterDuff.Mode.SRC);
+        } else {
+            mTextPaint.setColor(palette[TextStyle.COLOR_INDEX_BACKGROUND]);
+            canvas.drawRect(clipRect, mTextPaint);
+        }
 
-        float heightOffset = mFontLineSpacingAndAscent;
-        for (int row = topRow; row < endRow; row++) {
+        final int firstScreenRow = Math.max(0, clipRect.top / mFontLineSpacing);
+        final int lastScreenRowExclusive = Math.min(
+            mEmulator.mRows,
+            (clipRect.bottom + mFontLineSpacing - 1) / mFontLineSpacing
+        );
+        float heightOffset = mFontLineSpacingAndAscent + firstScreenRow * mFontLineSpacing;
+        for (int screenRowIndex = firstScreenRow; screenRowIndex < lastScreenRowExclusive; screenRowIndex++) {
             heightOffset += mFontLineSpacing;
+            final int row = topRow + screenRowIndex;
 
             final int cursorX = (row == cursorRow && cursorVisible) ? cursorCol : -1;
             int selx1 = -1, selx2 = -1;

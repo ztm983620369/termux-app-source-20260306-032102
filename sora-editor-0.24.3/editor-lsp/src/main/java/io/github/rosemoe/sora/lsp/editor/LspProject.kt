@@ -24,11 +24,12 @@
 
 package io.github.rosemoe.sora.lsp.editor
 
+import io.github.rosemoe.sora.lsp.client.languageserver.ShutdownReason
 import io.github.rosemoe.sora.lsp.client.languageserver.serverdefinition.LanguageServerDefinition
 import io.github.rosemoe.sora.lsp.client.languageserver.wrapper.LanguageServerWrapper
 import io.github.rosemoe.sora.lsp.editor.diagnostics.DiagnosticsContainer
 import io.github.rosemoe.sora.lsp.events.EventEmitter
-import io.github.rosemoe.sora.lsp.events.code.CodeActionEventEvent
+import io.github.rosemoe.sora.lsp.events.code.CodeActionEvent
 import io.github.rosemoe.sora.lsp.events.color.DocumentColorEvent
 import io.github.rosemoe.sora.lsp.events.completion.CompletionEvent
 import io.github.rosemoe.sora.lsp.events.diagnostics.PublishDiagnosticsEvent
@@ -63,9 +64,11 @@ class LspProject(
 
     val eventEmitter = EventEmitter()
 
-    private val languageServerWrappers = ConcurrentHashMap<String, LanguageServerWrapper>()
+    private data class ServerKey(val ext: String, val name: String)
 
-    private val serverDefinitions = mutableMapOf<String, LanguageServerDefinition>()
+    private val wrappers = ConcurrentHashMap<ServerKey, LanguageServerWrapper>()
+
+    private val definitions = ConcurrentHashMap<ServerKey, LanguageServerDefinition>()
 
     private val editors = ConcurrentHashMap<FileUri, LspEditor>()
 
@@ -77,15 +80,36 @@ class LspProject(
         CoroutineScope(ForkJoinPool.commonPool().asCoroutineDispatcher() + SupervisorJob())
 
     fun addServerDefinition(definition: LanguageServerDefinition) {
-        serverDefinitions[definition.ext] = definition
+        for (ext in definition.exts) {
+            val key = ServerKey(ext, definition.name)
+            if (definitions.containsKey(key)) {
+                throw IllegalArgumentException("Server definition already exists for ext $ext with name ${definition.name}")
+            }
+            definitions[key] = definition
+        }
     }
 
-    fun removeServerDefinition(ext: String) {
-        serverDefinitions.remove(ext)
+    fun addServerDefinitions(list: List<LanguageServerDefinition>) {
+        list.forEach { addServerDefinition(it) }
     }
 
-    fun getServerDefinition(ext: String): LanguageServerDefinition? {
-        return serverDefinitions[ext]
+    fun removeServerDefinition(ext: String, name: String? = null) {
+        if (name == null) {
+            definitions.keys.removeIf { it.ext == ext }
+        } else {
+            definitions.remove(ServerKey(ext, name))
+        }
+    }
+
+    fun getServerDefinition(ext: String, name: String? = null): LanguageServerDefinition? {
+        return definitions[ServerKey(ext, name ?: ext)]
+    }
+
+    fun getServerDefinitions(ext: String): Collection<LanguageServerDefinition> {
+        return definitions.entries
+            .filter { it.key.ext == ext }
+            .map { it.value }
+            .distinctBy { it.name }
     }
 
     fun createEditor(path: String): LspEditor {
@@ -97,6 +121,10 @@ class LspProject(
 
     fun removeEditor(path: String) {
         editors.remove(path.toFileUri())
+    }
+
+    fun getEditors(): List<LspEditor> {
+        return editors.values.toList()
     }
 
     fun getEditor(path: String): LspEditor? {
@@ -112,36 +140,45 @@ class LspProject(
     }
 
     fun closeAllEditors() {
-        val editorsSnapshot = editors.values.toList()
+        val editorsSnapshot = getEditors()
         editorsSnapshot.forEach {
             it.dispose()
         }
         editors.clear()
     }
 
-    internal fun getLanguageServerWrapper(ext: String): LanguageServerWrapper? {
-        return languageServerWrappers[ext]
+    fun getLanguageServerWrapper(ext: String, name: String): LanguageServerWrapper? {
+        return wrappers[ServerKey(ext, name)]
     }
 
-    internal fun getOrCreateLanguageServerWrapper(ext: String): LanguageServerWrapper {
-        return languageServerWrappers[ext] ?: createLanguageServerWrapper(ext)
+    internal fun getOrCreateLanguageServerWrapper(ext: String, name: String = ext): LanguageServerWrapper {
+        val key = ServerKey(ext, name)
+        return wrappers.computeIfAbsent(key) {
+            val definition = getServerDefinition(ext, name)
+                ?: throw IllegalArgumentException("No server definition for extension $ext with name $name")
+            LanguageServerWrapper(definition, this)
+        }
     }
 
-    internal fun createLanguageServerWrapper(ext: String): LanguageServerWrapper {
-        val definition = serverDefinitions[ext]
-            ?: throw IllegalArgumentException("No server definition for extension $ext")
+    internal fun createLanguageServerWrapper(ext: String, name: String): LanguageServerWrapper {
+        val definition = getServerDefinition(ext, name)
+            ?: throw IllegalArgumentException("No server definition for extension $ext with name $name")
         val wrapper = LanguageServerWrapper(definition, this)
-        languageServerWrappers[ext] = wrapper
+        wrappers[ServerKey(ext, name)] = wrapper
         return wrapper
+    }
+
+    fun getLanguageServerWrappers(ext: String): List<LanguageServerWrapper> {
+        return wrappers.entries.filter { it.key.ext == ext }.map { it.value }
     }
 
     fun dispose() {
         closeAllEditors()
-        languageServerWrappers.forEach {
-            it.value.stop(true)
+        wrappers.values.forEach {
+            it.stop(true, ShutdownReason.UNUSED)
         }
-        languageServerWrappers.clear()
-        serverDefinitions.clear()
+        wrappers.clear()
+        definitions.clear()
         coroutineScope.coroutineContext.cancelChildren()
     }
 
@@ -159,7 +196,7 @@ class LspProject(
             ::ApplyEditsEvent, ::CompletionEvent,
             ::PublishDiagnosticsEvent, ::FullFormattingEvent,
             ::RangeFormattingEvent, ::QueryDocumentDiagnosticsEvent,
-            ::DocumentOpenEvent, ::HoverEvent, ::CodeActionEventEvent,
+            ::DocumentOpenEvent, ::HoverEvent, ::CodeActionEvent,
             ::WorkSpaceApplyEditEvent, ::WorkSpaceExecuteCommand,
             ::InlayHintEvent, ::DocumentHighlightEvent,
             ::DocumentColorEvent

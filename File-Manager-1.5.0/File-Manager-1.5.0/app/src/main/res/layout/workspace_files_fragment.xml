@@ -4,8 +4,8 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <FrameLayout
-        android:id="@+id/workspace_files_surface_host"
+    <org.fossify.commons.views.MyViewPager
+        android:id="@+id/workspace_files_pager"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 </org.fossify.filemanager.fragments.WorkspaceFilesFragment>

@@ -14,11 +14,30 @@
     <string name="home_folder_updated">Home folder updated</string>
     <string name="copy_path">Copy path to clipboard</string>
     <string name="path_copied">Path copied</string>
+    <string name="multi_select">Multi-select</string>
     <string name="select_audio_file">Please select an audio file</string>
     <string name="search_folder">Search folder</string>
     <string name="rooted_device_only">This operation works only on rooted devices</string>
     <string name="recents">Recents</string>
     <string name="show_recents">Show recents</string>
+    <string name="recent_file_size_unknown">Unknown size</string>
+    <string name="recent_time_today">Today</string>
+    <string name="recent_time_yesterday">Yesterday</string>
+    <string name="recent_time_day_before_yesterday">2 days ago</string>
+    <string name="recent_time_last_week">Last week</string>
+    <string name="recent_time_last_month">Last month</string>
+    <plurals name="recent_time_days_ago">
+        <item quantity="one">%d day ago</item>
+        <item quantity="other">%d days ago</item>
+    </plurals>
+    <plurals name="recent_time_weeks_ago">
+        <item quantity="one">%d week ago</item>
+        <item quantity="other">%d weeks ago</item>
+    </plurals>
+    <plurals name="recent_time_months_ago">
+        <item quantity="one">%d month ago</item>
+        <item quantity="other">%d months ago</item>
+    </plurals>
     <string name="invert_colors">Invert colors</string>
 
     <!-- Open as -->

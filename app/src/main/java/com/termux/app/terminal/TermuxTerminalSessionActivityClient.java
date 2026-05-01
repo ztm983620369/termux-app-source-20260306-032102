@@ -11,6 +11,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Typeface;
 import android.media.AudioAttributes;
 import android.media.SoundPool;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.text.InputType;
 import android.view.Gravity;
@@ -504,6 +505,44 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         TerminalView terminalView = mActivity.getTerminalView();
         if (terminalView != null) {
             terminalView.setTerminalCursorBlinkerState(enabled, false);
+        }
+    }
+
+    @Override
+    public void onTerminalHostControlCommand(@NonNull TerminalSession session, @NonNull String command, @Nullable String argument) {
+        if (!mActivity.isVisible()) return;
+        if (session != mActivity.getCurrentSession()) return;
+
+        Runnable action = () -> {
+            TermuxTerminalViewClient terminalViewClient = mActivity.getTermuxTerminalViewClient();
+            if (terminalViewClient == null) return;
+
+            if ("soft-keyboard".equals(command)) {
+                String normalizedArgument = argument == null ? "" : argument.trim().toLowerCase(Locale.ROOT);
+                switch (normalizedArgument) {
+                    case "show":
+                        terminalViewClient.showSoftKeyboardForTerminal();
+                        break;
+                    case "hide":
+                        terminalViewClient.hideSoftKeyboardForTerminal();
+                        break;
+                    case "toggle":
+                        terminalViewClient.toggleSoftKeyboardForTerminal();
+                        break;
+                    default:
+                        Logger.logWarn(LOG_TAG, "Unsupported soft-keyboard control argument: " + argument);
+                        break;
+                }
+            } else {
+                Logger.logWarn(LOG_TAG, "Unsupported terminal host control command: " + command);
+            }
+        };
+
+        if (mActivity.isFinishing() || mActivity.isDestroyed()) return;
+        if (Looper.myLooper() == mActivity.getMainLooper()) {
+            action.run();
+        } else {
+            mActivity.runOnUiThread(action);
         }
     }
 

@@ -132,8 +132,10 @@ import com.termux.sessionsync.SftpProtocolManager
 import java.io.BufferedInputStream
 import java.io.Closeable
 import java.io.File
+import java.util.Calendar
 import java.util.LinkedList
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ItemsAdapter(
@@ -145,6 +147,7 @@ class ItemsAdapter(
     private val swipeRefreshLayout: SwipeRefreshLayout?,
     canHaveIndividualViewType: Boolean = true,
     private val showFileDate: Boolean = true,
+    private var showRecentPathMetadata: Boolean = false,
     itemClick: (Any) -> Unit,
 ) : MyRecyclerViewAdapter(activity, recyclerView, itemClick),
     RecyclerViewFastScroller.OnPopupTextUpdate {
@@ -157,6 +160,7 @@ class ItemsAdapter(
     private val hasOTGConnected = activity.hasOTGConnected()
     private var fontSize = 0f
     private var smallerFontSize = 0f
+    private var recentMetadataFontSize = 0f
     private var dateFormat = ""
     private var timeFormat = ""
     private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
@@ -175,6 +179,7 @@ class ItemsAdapter(
     private var displayFilenamesInGrid = config.displayFilenames
 
     companion object {
+        private const val ACTION_ENTER_MULTI_SELECT = -1
         private const val TYPE_FILE = 1
         private const val TYPE_DIR = 2
         private const val TYPE_SECTION = 3
@@ -237,7 +242,7 @@ class ItemsAdapter(
 
     override fun getIsItemSelectable(position: Int): Boolean {
         val item = listItems[position]
-        return !item.isSectionTitle && !item.isGridTypeDivider && item.children >= 0
+        return !item.isSectionTitle && !item.isGridTypeDivider
     }
 
     override fun getItemSelectionKey(position: Int): Int? {
@@ -291,7 +296,11 @@ class ItemsAdapter(
             if (adapterPosition == RecyclerView.NO_POSITION) return@setOnLongClickListener true
             val itemPosition = adapterPosition - positionOffset
             if (!getIsItemSelectable(itemPosition)) return@setOnLongClickListener true
-            showLongPressActionDialog(itemPosition)
+            if (actModeCallback.isSelectable) {
+                enterSelectionMode(itemPosition)
+            } else {
+                showLongPressActionDialog(itemPosition)
+            }
             true
         }
         bindViewHolder(holder)
@@ -324,19 +333,26 @@ class ItemsAdapter(
         val dialogTitle = selectedItem?.name?.takeIf { it.isNotBlank() } ?: activity.getString(R.string.app_launcher_name)
         val labels = actions.map { it.title }.toTypedArray()
         var actionChosen = false
+        var dismissAction: (() -> Unit)? = null
 
         activity.getAlertDialogBuilder()
             .setTitle(dialogTitle)
             .setItems(labels) { _, which ->
                 val actionId = actions.getOrNull(which)?.id ?: return@setItems
                 actionChosen = true
+                if (actionId == ACTION_ENTER_MULTI_SELECT) {
+                    dismissAction = { enterSelectionMode(position) }
+                    return@setItems
+                }
                 actionItemPressed(actionId)
                 if (shouldClearSelectionImmediately(actionId)) {
                     finishActMode()
                 }
             }
             .setOnDismissListener {
-                if (!actionChosen) {
+                if (dismissAction != null) {
+                    dismissAction?.invoke()
+                } else if (!actionChosen) {
                     finishActMode()
                 }
             }
@@ -358,6 +374,7 @@ class ItemsAdapter(
         if (isPickMultipleIntent) {
             actions.add(LongPressAction(R.id.cab_confirm_selection, activity.getString(R.string.confirm_selection)))
         }
+        actions.add(LongPressAction(ACTION_ENTER_MULTI_SELECT, activity.getString(R.string.multi_select)))
         actions.add(LongPressAction(R.id.cab_rename, activity.getString(R.string.rename)))
         actions.add(LongPressAction(R.id.cab_properties, activity.getString(R.string.properties)))
 
@@ -2010,6 +2027,7 @@ class ItemsAdapter(
     fun updateFontSizes() {
         fontSize = activity.getTextSize()
         smallerFontSize = fontSize * 0.8f
+        recentMetadataFontSize = fontSize * 0.68f
         notifyDataSetChanged()
     }
 
@@ -2021,6 +2039,12 @@ class ItemsAdapter(
 
     fun updateDisplayFilenamesInGrid() {
         displayFilenamesInGrid = config.displayFilenames
+        notifyDataSetChanged()
+    }
+
+    fun setRecentPathMetadataEnabled(enabled: Boolean) {
+        if (showRecentPathMetadata == enabled) return
+        showRecentPathMetadata = enabled
         notifyDataSetChanged()
     }
 
@@ -2096,6 +2120,7 @@ class ItemsAdapter(
                 )
 
                 itemDate?.setTextColor(textColor)
+                itemDate?.alpha = 0.6f
                 itemDate?.setTextSize(TypedValue.COMPLEX_UNIT_PX, smallerFontSize)
 
                 itemCheck?.beVisibleIf(isSelected)
@@ -2115,12 +2140,22 @@ class ItemsAdapter(
                     itemDetails?.text = getChildrenCnt(listItem)
                     itemDate?.beGone()
                 } else {
-                    itemDetails?.text = listItem.size.formatSize()
-                    if (showFileDate) {
+                    if (showRecentPathMetadata && isListViewType) {
+                        itemDetails?.text = listItem.path
+                        itemDetails?.alpha = 0.48f
+                        itemDetails?.setTextSize(TypedValue.COMPLEX_UNIT_PX, recentMetadataFontSize)
                         itemDate?.beVisible()
-                        itemDate?.text = listItem.modified.formatDate(activity, dateFormat, timeFormat)
+                        itemDate?.alpha = 0.5f
+                        itemDate?.setTextSize(TypedValue.COMPLEX_UNIT_PX, recentMetadataFontSize)
+                        itemDate?.text = listItem.getRecentMetadataText()
                     } else {
-                        itemDate?.beGone()
+                        itemDetails?.text = listItem.size.formatSize()
+                        if (showFileDate) {
+                            itemDate?.beVisible()
+                            itemDate?.text = listItem.modified.formatDate(activity, dateFormat, timeFormat)
+                        } else {
+                            itemDate?.beGone()
+                        }
                     }
 
                     val drawable = fileDrawables.getOrElse(
@@ -2144,6 +2179,50 @@ class ItemsAdapter(
                 }
             }
         }
+    }
+
+    private fun ListItem.getRecentMetadataText(): String {
+        val sizeText = if (size >= 0L) {
+            size.formatSize()
+        } else {
+            activity.getString(R.string.recent_file_size_unknown)
+        }
+        val timeText = modified.formatRecentTime()
+        return if (timeText.isEmpty()) sizeText else "$sizeText · $timeText"
+    }
+
+    private fun Long.formatRecentTime(): String {
+        if (this <= 0L) {
+            return ""
+        }
+
+        val now = System.currentTimeMillis()
+        val diffDays = (now.localEpochDay() - localEpochDay()).toInt()
+        return when {
+            diffDays < 0 -> formatDate(activity, dateFormat, timeFormat)
+            diffDays == 0 -> activity.getString(R.string.recent_time_today)
+            diffDays == 1 -> activity.getString(R.string.recent_time_yesterday)
+            diffDays == 2 -> activity.getString(R.string.recent_time_day_before_yesterday)
+            diffDays < 7 -> activity.resources.getQuantityString(R.plurals.recent_time_days_ago, diffDays, diffDays)
+            diffDays < 14 -> activity.getString(R.string.recent_time_last_week)
+            diffDays < 30 -> {
+                val weeks = (diffDays / 7).coerceAtLeast(2)
+                activity.resources.getQuantityString(R.plurals.recent_time_weeks_ago, weeks, weeks)
+            }
+            diffDays < 60 -> activity.getString(R.string.recent_time_last_month)
+            diffDays < 365 -> {
+                val months = (diffDays / 30).coerceAtLeast(2)
+                activity.resources.getQuantityString(R.plurals.recent_time_months_ago, months, months)
+            }
+            else -> formatDate(activity, dateFormat, timeFormat)
+        }
+    }
+
+    private fun Long.localEpochDay(): Long {
+        val calendar = Calendar.getInstance()
+        calendar.timeInMillis = this
+        val offset = calendar.timeZone.getOffset(this)
+        return TimeUnit.MILLISECONDS.toDays(this + offset)
     }
 
     private fun getChildrenCnt(item: FileDirItem): String {

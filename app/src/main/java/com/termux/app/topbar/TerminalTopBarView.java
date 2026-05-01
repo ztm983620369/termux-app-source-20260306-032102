@@ -20,7 +20,6 @@ import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.core.graphics.ColorUtils;
 
 import com.termux.R;
 
@@ -405,11 +404,10 @@ public class TerminalTopBarView extends LinearLayout {
             return;
         }
 
-        int toneColor = getToneColor(item.tone);
         badgeView.setVisibility(View.VISIBLE);
         badgeView.setText(item.badgeText);
-        badgeView.setTextColor(toneColor);
-        badgeView.setBackground(createBadgeBackground(toneColor, item.selected));
+        badgeView.setTextColor(item.selected ? 0xFFE0E0E0 : 0xFFB0B0B0);
+        badgeView.setBackground(createBadgeBackground(item.selected));
     }
 
     private GradientDrawable createTabBackground(boolean selected, @NonNull TerminalTopBarStateMachine.Tone tone) {
@@ -429,38 +427,21 @@ public class TerminalTopBarView extends LinearLayout {
         return drawable;
     }
 
-    private GradientDrawable createBadgeBackground(int toneColor, boolean selected) {
+    private GradientDrawable createBadgeBackground(boolean selected) {
         GradientDrawable drawable = new GradientDrawable();
         drawable.setShape(GradientDrawable.RECTANGLE);
         drawable.setCornerRadius(dp(8));
-        drawable.setColor(ColorUtils.setAlphaComponent(toneColor, selected ? 82 : 58));
-        drawable.setStroke(dp(1), ColorUtils.setAlphaComponent(toneColor, selected ? 210 : 170));
+        drawable.setColor(selected ? 0xFF2A2A2A : 0xFF202020);
+        drawable.setStroke(dp(1), selected ? 0xFF5A5A5A : 0xFF3A3A3A);
         return drawable;
     }
 
     private int getToneFillColor(@NonNull TerminalTopBarStateMachine.Tone tone, boolean selected) {
-        switch (tone) {
-            case ACTIVE:
-                return selected ? 0xFF353535 : 0xFF242424;
-            case REMOTE:
-                return selected ? 0xFF16364F : 0xFF102537;
-            case PERSISTENT:
-                return selected ? 0xFF1B5E20 : 0xFF143F17;
-            case BUSY:
-                return selected ? 0xFF5D4315 : 0xFF3E2D10;
-            case SUCCESS:
-                return selected ? 0xFF1E4D2B : 0xFF14331D;
-            case ERROR:
-                return selected ? 0xFF5A1E1E : 0xFF381313;
-            case NEUTRAL:
-            default:
-                return selected ? 0xFF333333 : 0xFF1E1E1E;
-        }
+        return selected ? 0xFF2A2A2A : 0xFF1A1A1A;
     }
 
     private int getToneStrokeColor(@NonNull TerminalTopBarStateMachine.Tone tone, boolean selected) {
-        int toneColor = getToneColor(tone);
-        return ColorUtils.setAlphaComponent(toneColor, selected ? 255 : 204);
+        return selected ? 0xFF545454 : 0xFF2F2F2F;
     }
 
     private int getToneColor(@NonNull TerminalTopBarStateMachine.Tone tone) {

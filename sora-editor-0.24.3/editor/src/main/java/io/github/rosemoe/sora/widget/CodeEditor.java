@@ -128,7 +128,6 @@ import io.github.rosemoe.sora.text.LineSeparator;
 import io.github.rosemoe.sora.text.TextLayoutHelper;
 import io.github.rosemoe.sora.text.TextRange;
 import io.github.rosemoe.sora.text.TextUtils;
-import io.github.rosemoe.sora.text.TextUtilsP;
 import io.github.rosemoe.sora.text.method.KeyMetaStates;
 import io.github.rosemoe.sora.util.Chars;
 import io.github.rosemoe.sora.util.ClipDataUtils;
@@ -707,6 +706,7 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         array.recycle();
     }
 
+    @NonNull
     public SnippetController getSnippetController() {
         return snippetController;
     }
@@ -714,8 +714,9 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
     /**
      * Get {@code DirectAccessProps} object of the editor.
      * <p>
-     * You can update some features in editor with the instance without disturb to call methods.
+     * You can adjust some settings of the editor by modifying the fields in the object direcly.
      */
+    @NonNull
     public DirectAccessProps getProps() {
         return props;
     }
@@ -968,6 +969,11 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         styleDelegate.reset();
         this.editorLanguage = lang;
         this.textStyles = null;
+
+        if (this.diagnostics != null) {
+            this.diagnostics.detachEditor();
+        }
+
         this.diagnostics = null;
 
         // Setup new one
@@ -1435,16 +1441,15 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
      * @param line The line to search
      */
     protected long findLeadingAndTrailingWhitespacePos(ContentLine line) {
-        var buffer = line.getBackingCharArray();
         int column = line.length();
         int leading = 0;
         int trailing = column;
-        while (leading < column && isWhitespace(buffer[leading])) {
+        while (leading < column && isWhitespace(line.charAt(leading))) {
             leading++;
         }
         // Only when this action is needed
         if (leading != column && (nonPrintableOptions & (FLAG_DRAW_WHITESPACE_INNER | FLAG_DRAW_WHITESPACE_TRAILING)) != 0) {
-            while (trailing > 0 && isWhitespace(buffer[trailing - 1])) {
+            while (trailing > 0 && isWhitespace(line.charAt(trailing - 1))) {
                 trailing--;
             }
         }
@@ -1769,14 +1774,14 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
             final var requiredSpaces = tabWidth - (spaces % tabWidth);
             if (spaceCount > 0 && tabCount > 0) {
                 // indentation contains spaces as well as tabs
-                // replace the leading indentation with appropriate indendation (according to language.useTabs())
+                // replace the leading indentation with appropriate indentation (according to language.useTabs())
                 // this should be done while incrementing the indentation
                 final var finalSpaceCount = ((requiredSpaces == 0 ? tabWidth : requiredSpaces) + spaces) / tabWidth;
                 text.replace(i, 0, i, endColumn, StringsKt.repeat(tabString, finalSpaceCount));
                 continue;
             }
 
-            if (requiredSpaces == 0) {
+            if (requiredSpaces == tabWidth) {
                 // line is evenly indented
                 // increase the indentation by \t or tabWidthSpaces
                 text.insert(i, endColumn, tabString);
@@ -1818,7 +1823,7 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
             final var extraSpaces = spaces % tabWidth;
             if (spaceCount > 0 && tabCount > 0) {
                 // indentation contains spaces as well as tabs
-                // replace the leading indentation with appropriate indendation (according to language.useTabs())
+                // replace the leading indentation with appropriate indentation (according to language.useTabs())
                 // this should be done while decrementing the indentation
                 final var finalSpaceCount = Math.abs(spaces - (extraSpaces == 0 ? tabWidth : extraSpaces)) / tabWidth;
                 text.replace(i, 0, i, endColumn, StringsKt.repeat(tabString, finalSpaceCount));
@@ -1846,6 +1851,10 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
      */
     protected void commitTab() {
         if (inputConnection != null && isEditable()) {
+            if (inputConnection.composingText.isComposing()) {
+                // This external change will damage the composing text (#784)
+                restartInput();
+            }
             inputConnection.commitTextInternal(createTabString(), true);
         }
     }
@@ -1897,12 +1906,21 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         int l = cursor.getRightLine();
         int column = cursor.getRightColumn();
         boolean visible = true;
-        float x = measureTextRegionOffset();
-        x = x + layout.getCharLayoutOffset(l, column)[1];
-        x = x - getOffsetX();
+        float[] offsets = layout.getCharLayoutOffset(l, column);
+        float x = measureTextRegionOffset() + offsets[1] - getOffsetX();
+        float charBottom = offsets[0] - getOffsetY();
+        float charTop = charBottom - getRowHeight();
+        float charBaseline = getRowBaseline(Math.round(charTop / (float) getRowHeight()));
         if (x < 0) {
             visible = false;
             x = 0;
+        } else if (x > getWidth()) {
+            visible = false;
+            x = getWidth();
+        }
+        var composingText = inputConnection.composingText;
+        if (composingText.preSetComposing) {
+            return x;
         }
         if (props.reportCursorAnchor) {
             CursorAnchorInfo.Builder builder = anchorInfoBuilder;
@@ -1913,7 +1931,11 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
             matrix.postTranslate(b[0], b[1]);
             builder.setMatrix(matrix);
             builder.setSelectionRange(cursor.getLeft(), cursor.getRight());
-            builder.setInsertionMarkerLocation(x, getRowTop(l) - getOffsetY(), getRowBaseline(l) - getOffsetY(), getRowBottom(l) - getOffsetY(), visible ? CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION : CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION);
+
+            if (composingText.isComposing()) {
+                builder.setComposingText(composingText.startIndex, text.substring(composingText.startIndex, composingText.endIndex));
+            }
+            builder.setInsertionMarkerLocation(x, charTop, charBaseline, charBottom, visible ? CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION : CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION);
             inputMethodManager.updateCursorAnchorInfo(this, builder.build());
         }
         return x;
@@ -1931,10 +1953,10 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
             int line = cur.getLeftLine();
             if (props.deleteEmptyLineFast || (props.deleteMultiSpaces != 1 && col > 0 && text.charAt(line, col - 1) == ' ')) {
                 // Check whether selection is in leading spaces
-                var text = this.text.getLine(cur.getLeftLine()).getBackingCharArray();
+                var text = this.text.getLine(cur.getLeftLine());
                 var inLeading = true;
                 for (int i = col - 1; i >= 0; i--) {
-                    char ch = text[i];
+                    char ch = text.charAt(i);
                     if (ch != ' ' && ch != '\t') {
                         inLeading = false;
                         break;
@@ -1946,7 +1968,7 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
                     var emptyLine = true;
                     var max = this.text.getColumnCount(line);
                     for (int i = col; i < max; i++) {
-                        char ch = text[i];
+                        char ch = text.charAt(i);
                         if (ch != ' ' && ch != '\t') {
                             emptyLine = false;
                             break;
@@ -1970,9 +1992,10 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
             }
             // Do not put cursor inside combined characters
             int begin;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                begin = TextUtilsP.getOffsetForBackspaceKey(text.getLine(cur.getLeftLine()), col);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                begin = TextUtils.getOffsetForBackspaceKey(text.getLine(cur.getLeftLine()), col);
             } else {
+                // Devices under API 23 does not use the strategy above
                 begin = TextLayoutHelper.get().getCurPosLeft(col, text.getLine(cur.getLeftLine()));
             }
             int end = cur.getLeftColumn();
@@ -2368,6 +2391,23 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
             }
         }
         return getPointPosition(x + getOffsetX(), y + getOffsetY());
+    }
+
+    public Layout.VisualLocation getPointVisualPosition(float xOffset, float yOffset) {
+        return layout.getVisualPositionForLayoutOffset(xOffset - measureTextRegionOffset(), yOffset);
+    }
+
+    public Layout.VisualLocation getPointVisualPositionOnScreen(float x, float y) {
+        y = Math.max(0, y);
+        var stuckLines = renderer.lastStuckLines;
+        if (stuckLines != null) {
+            // position Y maybe negative
+            var index = (int) Math.max(0, (y / getRowHeight()));
+            if (y < stuckLines.size() * getRowHeight() && index < stuckLines.size()) {
+                return getPointVisualPosition(x, layout.getCharLayoutOffset(stuckLines.get(index).startLine, 0)[0] - getRowHeight() / 2f);
+            }
+        }
+        return getPointVisualPosition(x + getOffsetX(), y + getOffsetY());
     }
 
     /**
@@ -4243,7 +4283,15 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
 
     @UiThread
     public void setDiagnostics(@Nullable DiagnosticsContainer diagnostics) {
+        if (this.diagnostics != null) {
+            this.diagnostics.detachEditor();
+        }
+
         this.diagnostics = diagnostics;
+
+        if (this.diagnostics != null) {
+            this.diagnostics.attachEditor(this);
+        }
         invalidate();
     }
 
@@ -4428,6 +4476,9 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         if (props.disallowSuggestions) {
             var index = new java.util.Random().nextInt();
             inputMethodManager.updateSelection(this, index, index, -1, -1);
+            return;
+        }
+        if (inputConnection.composingText.preSetComposing) {
             return;
         }
         int candidatesStart = -1, candidatesEnd = -1;
@@ -4675,16 +4726,20 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
     public AccessibilityNodeInfo createAccessibilityNodeInfo() {
         var info = super.createAccessibilityNodeInfo();
         if (isEnabled()) {
-            info.setEditable(isEditable());
-            info.setTextSelection(cursor.getLeft(), cursor.getRight());
-            info.setInputType(InputType.TYPE_CLASS_TEXT);
-            info.setMultiLine(true);
-            info.setText(getText().toStringBuilder());
+            var maxTextLength = props.maxAccessibilityTextLength;
+            if (maxTextLength > 0) {
+                info.setEditable(isEditable());
+                info.setTextSelection(cursor.getLeft(), cursor.getRight());
+                info.setInputType(InputType.TYPE_CLASS_TEXT);
+                info.setMultiLine(true);
+                info.setText(TextUtils.trimToSize(getText(), maxTextLength).toString());
+                info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_COPY);
+                info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_CUT);
+                info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_PASTE);
+                info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_TEXT);
+            }
+
             info.setLongClickable(true);
-            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_COPY);
-            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_CUT);
-            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_PASTE);
-            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_TEXT);
             final int scrollRange = getScrollMaxY();
             if (scrollRange > 0) {
                 info.setScrollable(true);
@@ -5225,13 +5280,6 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         renderer.buildMeasureCacheForLines(startLine, endLine);
         checkForRelayout();
 
-        // Notify input method
-        updateCursor();
-        waitForNextChange = false;
-
-        updateCursorAnchor();
-        ensureSelectionVisible();
-
         editorLanguage.getAnalyzeManager().insert(start, end, insertedContent);
         touchHandler.hideInsertHandle();
         if (editable && !cursor.isSelected() && !inputConnection.composingText.isComposing() && acceptsComposingText()) {
@@ -5242,6 +5290,11 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         dispatchEvent(new ContentChangeEvent(this, ContentChangeEvent.ACTION_INSERT, start, end, insertedContent, text.isUndoManagerWorking()));
         onSelectionChanged(SelectionChangeEvent.CAUSE_TEXT_MODIFICATION);
         lastInsertion = new TextRange(start.fromThis(), end.fromThis());
+        waitForNextChange = false;
+        ensureSelectionVisible();
+
+        // Notify input method
+        updateCursor();
     }
 
     @Override
@@ -5277,13 +5330,6 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         renderer.buildMeasureCacheForLines(startLine, startLine + 1);
         checkForRelayout();
 
-        updateCursor();
-
-        if (!waitForNextChange) {
-            updateCursorAnchor();
-            ensureSelectionVisible();
-            touchHandler.hideInsertHandle();
-        }
         if (editable && !cursor.isSelected() && !waitForNextChange && !inputConnection.composingText.isComposing() && acceptsComposingText()) {
             cursorAnimator.markEndPos();
             cursorAnimator.start();
@@ -5292,6 +5338,12 @@ public class CodeEditor extends View implements ContentListener, Formatter.Forma
         selectionAnchor = lastAnchorIsSelLeft ? cursor.left() : cursor.right();
         dispatchEvent(new ContentChangeEvent(this, ContentChangeEvent.ACTION_DELETE, start, end, deletedContent, text.isUndoManagerWorking()));
         onSelectionChanged(SelectionChangeEvent.CAUSE_TEXT_MODIFICATION);
+
+        if (!waitForNextChange) {
+            updateCursor();
+            ensureSelectionVisible();
+            touchHandler.hideInsertHandle();
+        }
     }
 
     @Override

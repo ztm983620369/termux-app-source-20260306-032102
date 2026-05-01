@@ -32,18 +32,17 @@ import io.github.rosemoe.sora.lsp.utils.createDidCloseTextDocumentParams
 import kotlinx.coroutines.future.await
 import java.util.concurrent.CompletableFuture
 
-
 class DocumentCloseEvent : AsyncEventListener() {
     override val eventName = EventType.documentClose
 
     var future: CompletableFuture<Void>? = null
 
-    override suspend fun handleAsync(context: EventContext) {
+    override suspend fun doHandleAsync(context: EventContext) {
         val editor = context.get<LspEditor>("lsp-editor")
 
         val params = editor.uri.createDidCloseTextDocumentParams()
 
-        editor.requestManager?.let { requestManager ->
+        editor.requestManager.let { requestManager ->
             future = CompletableFuture.runAsync {
                 requestManager.didClose(
                     params
@@ -55,11 +54,9 @@ class DocumentCloseEvent : AsyncEventListener() {
     }
 
     override fun dispose() {
-        future?.cancel(true);
-        future = null;
+        future?.cancel(true)
+        future = null
     }
-
-
 }
 
 val EventType.documentClose: String

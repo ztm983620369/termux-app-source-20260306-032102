@@ -40,8 +40,8 @@ import io.github.rosemoe.sora.widget.CodeEditor;
 /**
  * This class manages the colors of editor.
  * You can use color IDs that are not in pre-defined id pool for custom languages. We recommend
- *  adding a base offset for your custom color IDs. For example, first custom color ID is 256. This
- *   leaves enough space for editor's future built-in colors.
+ * adding a base offset for your custom color IDs. For example, first custom color ID is 256. This
+ * leaves enough space for editor's future built-in colors.
  * <p>
  * This is also the default color scheme of editor.
  * Be careful to change this class, because this can cause its
@@ -175,6 +175,10 @@ public class EditorColorScheme {
     public static final int TEXT_ACTION_WINDOW_BACKGROUND = 65;
     public static final int TEXT_ACTION_WINDOW_ICON_COLOR = 66;
 
+    public static final int MINIMAP_BACKGROUND = 81;
+    public static final int MINIMAP_VIEWPORT = 82;
+    public static final int MINIMAP_VIEWPORT_BORDER = 83;
+
     /**
      * Min pre-defined color id
      */
@@ -183,7 +187,7 @@ public class EditorColorScheme {
     /**
      * Max pre-defined color id
      */
-    protected static final int END_COLOR_ID = 80;
+    protected static final int END_COLOR_ID = 83;
 
 
     /**
@@ -295,6 +299,15 @@ public class EditorColorScheme {
             case COMPLETION_WND_CORNER:
                 color = isDark() ? BACKGROUND_COLOR_DARK : 0xffffffff;
                 break;
+            case MINIMAP_BACKGROUND:
+                color = ((isDark() ? BACKGROUND_COLOR_DARK : 0xffffffff) & 0x00ffffff) | 0xa0000000;
+                break;
+            case MINIMAP_VIEWPORT:
+                color = isDark() ? 0x30ffffff : 0x30333333;
+                break;
+            case MINIMAP_VIEWPORT_BORDER:
+                color = isDark() ? 0xb0ffffff : 0xb0333333;
+                break;
             case LINE_NUMBER_PANEL_TEXT:
                 color = 0xffffffff;
                 break;
@@ -393,9 +406,11 @@ public class EditorColorScheme {
                 color = 0xff3f51b5;
                 break;
             case COMPLETION_WND_TEXT_PRIMARY:
-            case COMPLETION_WND_TEXT_SECONDARY:
             case TEXT_INLAY_HINT_FOREGROUND:
                 color = isDark() ? 0xffffffff : 0xff000000;
+                break;
+            case COMPLETION_WND_TEXT_SECONDARY:
+                color = isDark() ? 0xffaaaaaa : 0xff545454;
                 break;
             case COMPLETION_WND_ITEM_CURRENT:
                 color = 0xffeeeeee;

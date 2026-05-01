@@ -5,6 +5,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.text.TextUtils;
 import android.util.AttributeSet;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -12,6 +13,7 @@ import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -135,7 +137,7 @@ public class TerminalSessionSurfaceView extends LinearLayout {
                 if (TextUtils.equals(holder.key, CONFIG_PAGE_KEY)) {
                     return holder.root;
                 }
-                return mFullScreenSessionSwipeEnabled ? holder.root : holder.extraKeysContainer;
+                return mFullScreenSessionSwipeEnabled ? holder.terminalView : null;
             });
             programmaticViewPager.setSwipeGestureListener(new ProgrammaticViewPager.SwipeGestureListener() {
                 @Override
@@ -802,12 +804,39 @@ public class TerminalSessionSurfaceView extends LinearLayout {
             ViewGroup configContainer = root.findViewById(R.id.terminal_session_page_config_container);
             SessionSwipeFrameLayout extraKeysContainer =
                 root.findViewById(R.id.terminal_session_page_extra_keys_container);
-            ExtraKeysView extraKeysView = root.findViewById(R.id.terminal_session_page_extra_keys);
+            ViewPager bottomPanelPager = root.findViewById(R.id.terminal_session_page_bottom_panel_pager);
+            ExtraKeysView extraKeysView = (ExtraKeysView) LayoutInflater.from(getContext())
+                .inflate(R.layout.view_terminal_session_surface_extra_keys, bottomPanelPager, false);
+            View placeholderPanel = createBottomPanelPlaceholderView();
+            bottomPanelPager.setAdapter(new BottomPanelPagerAdapter(extraKeysView, placeholderPanel));
+            bottomPanelPager.setOffscreenPageLimit(1);
             applyTerminalViewConfig(terminalView);
             reloadExtraKeysView(extraKeysView);
-            PageHolder holder = new PageHolder(root, terminalView, configContainer, extraKeysContainer, extraKeysView);
+            PageHolder holder = new PageHolder(
+                root,
+                terminalView,
+                configContainer,
+                extraKeysContainer,
+                bottomPanelPager,
+                extraKeysView
+            );
             root.setTag(holder);
             return holder;
+        }
+
+        @NonNull
+        private View createBottomPanelPlaceholderView() {
+            TextView textView = new TextView(getContext());
+            textView.setLayoutParams(new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            ));
+            textView.setGravity(Gravity.CENTER);
+            textView.setText("第二小面板占位");
+            textView.setTextColor(0x99FFFFFF);
+            textView.setTextSize(13f);
+            textView.setBackgroundColor(0xFF000000);
+            return textView;
         }
 
         private void bindHolder(@NonNull PageHolder holder, @NonNull TerminalSessionSurfaceItem item) {
@@ -939,11 +968,49 @@ public class TerminalSessionSurfaceView extends LinearLayout {
         }
     }
 
+    private final class BottomPanelPagerAdapter extends PagerAdapter {
+        @NonNull private final View extraKeysPanel;
+        @NonNull private final View placeholderPanel;
+
+        BottomPanelPagerAdapter(@NonNull View extraKeysPanel, @NonNull View placeholderPanel) {
+            this.extraKeysPanel = extraKeysPanel;
+            this.placeholderPanel = placeholderPanel;
+        }
+
+        @Override
+        public int getCount() {
+            return 2;
+        }
+
+        @Override
+        public boolean isViewFromObject(@NonNull View view, @NonNull Object object) {
+            return view == object;
+        }
+
+        @NonNull
+        @Override
+        public Object instantiateItem(@NonNull ViewGroup container, int position) {
+            View view = position == 0 ? extraKeysPanel : placeholderPanel;
+            View parent = (View) view.getParent();
+            if (parent instanceof ViewGroup) {
+                ((ViewGroup) parent).removeView(view);
+            }
+            container.addView(view);
+            return view;
+        }
+
+        @Override
+        public void destroyItem(@NonNull ViewGroup container, int position, @NonNull Object object) {
+            container.removeView((View) object);
+        }
+    }
+
     private static final class PageHolder {
         @NonNull final View root;
         @NonNull final TerminalView terminalView;
         @NonNull final ViewGroup configContainer;
         @NonNull final SessionSwipeFrameLayout extraKeysContainer;
+        @NonNull final ViewPager bottomPanelPager;
         @NonNull final ExtraKeysView extraKeysView;
         @Nullable TerminalSession session;
         @Nullable String key;
@@ -952,11 +1019,13 @@ public class TerminalSessionSurfaceView extends LinearLayout {
                    @NonNull TerminalView terminalView,
                    @NonNull ViewGroup configContainer,
                    @NonNull SessionSwipeFrameLayout extraKeysContainer,
+                   @NonNull ViewPager bottomPanelPager,
                    @NonNull ExtraKeysView extraKeysView) {
             this.root = root;
             this.terminalView = terminalView;
             this.configContainer = configContainer;
             this.extraKeysContainer = extraKeysContainer;
+            this.bottomPanelPager = bottomPanelPager;
             this.extraKeysView = extraKeysView;
         }
     }

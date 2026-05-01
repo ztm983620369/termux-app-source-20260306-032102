@@ -30,7 +30,6 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.net.SocketAddress
 
 
 /**
@@ -46,7 +45,7 @@ class SocketStreamConnectionProvider(
     override fun start() {
         val port = port
         socket = Socket()
-        socket.connect(InetSocketAddress(host ?: "localhost", port), 20_000)
+        socket.connect(InetSocketAddress(host ?: "localhost", port), 20)
         socket.soTimeout = 0
     }
 
@@ -55,6 +54,9 @@ class SocketStreamConnectionProvider(
 
     override val outputStream: OutputStream
         get() = socket.getOutputStream()
+
+    override val isClosed: Boolean
+        get() = !::socket.isInitialized || socket.isClosed
 
     override fun close() {
         try {

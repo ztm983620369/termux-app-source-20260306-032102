@@ -7,7 +7,6 @@ import android.view.ViewGroup
 import androidx.viewpager.widget.PagerAdapter
 import org.fossify.commons.extensions.getProperTextColor
 import org.fossify.commons.helpers.TAB_FILES
-import org.fossify.commons.helpers.TAB_RECENT_FILES
 import org.fossify.commons.helpers.TAB_STORAGE_ANALYSIS
 import org.fossify.filemanager.R
 import org.fossify.filemanager.activities.SimpleActivity
@@ -64,25 +63,25 @@ class ViewPagerAdapter(
         container.removeView(item as View)
     }
 
-    override fun getCount() = tabsToShow.filter { it and activity.config.showTabs != 0 }.size
+    override fun getCount(): Int {
+        val showTabs = activity.config.showTabs
+        var count = 0
+        if (showTabs and TAB_FILES != 0) count++
+        if (showTabs and TAB_STORAGE_ANALYSIS != 0) count++
+        return count
+    }
 
     override fun isViewFromObject(view: View, item: Any) = view == item
 
     private fun getFragment(position: Int): Int {
-        val showTabs = activity.config.showTabs
         val fragments = arrayListOf<Int>()
+        val showTabs = activity.config.showTabs
         if (showTabs and TAB_FILES != 0) {
             fragments.add(R.layout.workspace_files_fragment)
         }
-
-        if (showTabs and TAB_RECENT_FILES != 0) {
-            fragments.add(R.layout.recents_fragment)
-        }
-
         if (showTabs and TAB_STORAGE_ANALYSIS != 0) {
             fragments.add(R.layout.storage_fragment)
         }
-
         return fragments[position]
     }
 }

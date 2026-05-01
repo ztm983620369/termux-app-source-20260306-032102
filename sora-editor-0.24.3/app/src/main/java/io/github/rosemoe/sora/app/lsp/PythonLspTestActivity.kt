@@ -290,10 +290,11 @@ class PythonLspTestActivity : BaseEditorActivity() {
             val serverDefinition =
                 object : CustomLanguageServerDefinition(
                     "py",
-                    mapOf("py" to "python"),
                     ServerConnectProvider {
                         SocketStreamConnectionProvider(port, host)
-                    }
+                    },
+                    "python-lsp",
+                    extensionsOverride = listOf("py")
                 ) {
                     private val listener = PythonLspEventListener(this@PythonLspTestActivity)
                     override val eventListener: EventHandler.EventListener

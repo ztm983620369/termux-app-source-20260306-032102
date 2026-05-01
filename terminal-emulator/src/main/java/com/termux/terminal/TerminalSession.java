@@ -306,6 +306,11 @@ public final class TerminalSession extends TerminalOutput {
     }
 
     @Override
+    public void onTerminalHostControlCommand(String command, String argument) {
+        mClient.onTerminalHostControlCommand(this, command, argument);
+    }
+
+    @Override
     public void onColorsChanged() {
         mClient.onColorsChanged(this);
     }

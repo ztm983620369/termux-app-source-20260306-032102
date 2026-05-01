@@ -14,6 +14,21 @@
     <string name="rooted_device_only">這個操作只對已 root 的裝置有用</string>
     <string name="recents">最近瀏覽</string>
     <string name="show_recents">顯示最近瀏覽</string>
+    <string name="recent_file_size_unknown">未知大小</string>
+    <string name="recent_time_today">今天</string>
+    <string name="recent_time_yesterday">昨天</string>
+    <string name="recent_time_day_before_yesterday">前天</string>
+    <string name="recent_time_last_week">一星期前</string>
+    <string name="recent_time_last_month">上個月</string>
+    <plurals name="recent_time_days_ago">
+        <item quantity="other">%d日前</item>
+    </plurals>
+    <plurals name="recent_time_weeks_ago">
+        <item quantity="other">%d星期前</item>
+    </plurals>
+    <plurals name="recent_time_months_ago">
+        <item quantity="other">%d個月前</item>
+    </plurals>
     <string name="invert_colors">顏色反轉</string>
     <string name="open_as">開啟為</string>
     <string name="text_file">文字檔案</string>
@@ -44,4 +59,5 @@
     <string name="total_storage">總儲存空間：%s</string>
     <string name="enable_root_access">啟用 root 權限</string>
     <string name="press_back_twice">需按兩次返回鍵才能離開 app</string>
+    <string name="multi_select">多選</string>
 </resources>

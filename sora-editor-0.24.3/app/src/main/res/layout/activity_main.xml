@@ -32,6 +32,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:layout_alignParentStart="true"
+        android:layout_above="@id/main_bottom_bar"
         android:orientation="vertical">
 
 
@@ -57,6 +58,18 @@
             android:layout_height="0dp"
             android:layout_weight="1">
 
+            <io.github.rosemoe.sora.app.SharedImeHostEditText
+                android:id="@+id/shared_ime_host"
+                android:layout_width="1dp"
+                android:layout_height="1dp"
+                android:alpha="0"
+                android:background="@android:color/transparent"
+                android:importantForAutofill="no"
+                android:inputType="textMultiLine|textNoSuggestions"
+                android:imeOptions="flagNoExtractUi|flagNoFullscreen"
+                android:padding="0dp"
+                android:textColor="@android:color/transparent" />
+
             <LinearLayout
                 android:id="@+id/editor_content_layout"
                 android:layout_width="match_parent"
@@ -70,7 +83,6 @@
                     android:orientation="vertical"
                     android:visibility="gone">
 
-
                     <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
@@ -80,44 +92,43 @@
                         <Button
                             android:id="@+id/btn_goto_prev"
                             style="?buttonBarButtonStyle"
-                            android:layout_weight="1"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
+                            android:layout_weight="1"
                             android:text="@string/layout_tv_prev" />
 
                         <Button
                             android:id="@+id/btn_goto_next"
                             style="?buttonBarButtonStyle"
-                            android:layout_weight="1"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
+                            android:layout_weight="1"
                             android:text="@string/layout_tv_next" />
 
                         <Button
                             android:id="@+id/btn_replace"
                             style="?buttonBarButtonStyle"
-                            android:layout_weight="1"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
+                            android:layout_weight="1"
                             android:text="@string/layout_tv_replace" />
 
                         <Button
                             android:id="@+id/btn_replace_all"
                             style="?buttonBarButtonStyle"
-                            android:layout_weight="1"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
+                            android:layout_weight="1"
                             android:text="@string/layout_tv_replaceAll" />
 
                         <ImageView
                             android:id="@+id/search_options"
-                            android:layout_weight="0.5"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
+                            android:layout_weight="0.5"
                             android:src="@drawable/baseline_more_vert_24" />
 
                     </LinearLayout>
-
 
                     <EditText
                         android:id="@+id/search_editor"
@@ -162,21 +173,129 @@
         android:layout_height="wrap_content"
         android:layout_alignParentStart="true"
         android:layout_alignParentBottom="true"
+        android:background="@color/defaultSymbolInputBackgroundColor"
+        android:gravity="center_vertical"
         android:orientation="vertical"
-        android:visibility="invisible">
+        android:visibility="visible">
 
-        <HorizontalScrollView
+        <LinearLayout
+            android:id="@+id/symbol_bar"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:overScrollMode="never"
-            android:scrollbars="none">
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-            <io.github.rosemoe.sora.widget.SymbolInputView
-                android:id="@+id/symbol_input"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content" />
+            <HorizontalScrollView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:overScrollMode="never"
+                android:scrollbars="none">
 
-        </HorizontalScrollView>
+                <io.github.rosemoe.sora.widget.SymbolInputView
+                    android:id="@+id/symbol_input"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+
+            </HorizontalScrollView>
+
+            <ImageButton
+                android:id="@+id/open_terminal_workspace_button"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:adjustViewBounds="false"
+                android:background="?attr/selectableItemBackground"
+                android:contentDescription="@string/open_terminal_workspace"
+                android:minWidth="48dp"
+                android:minHeight="48dp"
+                android:padding="12dp"
+                android:scaleType="center"
+                android:src="@drawable/ic_terminal_workspace"
+                android:visibility="gone"
+                app:tint="@color/defaultSymbolInputTextColor" />
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/titlebar_search_panel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="8dp"
+            android:paddingTop="4dp"
+            android:paddingEnd="6dp"
+            android:paddingBottom="4dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/titlebar_search_editor"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:hint="@string/text_to_search"
+                    android:imeOptions="actionSearch|flagNoExtractUi|flagNoFullscreen"
+                    android:inputType="textNoSuggestions"
+                    android:maxLines="1"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:singleLine="true"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/titlebar_btn_goto_prev"
+                    style="?buttonBarButtonStyle"
+                    android:layout_width="44dp"
+                    android:layout_height="match_parent"
+                    android:includeFontPadding="false"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:paddingStart="0dp"
+                    android:paddingEnd="0dp"
+                    android:text="@string/layout_tv_prev"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/titlebar_btn_goto_next"
+                    style="?buttonBarButtonStyle"
+                    android:layout_width="44dp"
+                    android:layout_height="match_parent"
+                    android:includeFontPadding="false"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:paddingStart="0dp"
+                    android:paddingEnd="0dp"
+                    android:text="@string/layout_tv_next"
+                    android:textSize="12sp" />
+
+                <ImageButton
+                    android:id="@+id/titlebar_search_options_button"
+                    android:layout_width="40dp"
+                    android:layout_height="match_parent"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/layout_tv_search_options"
+                    android:padding="8dp"
+                    android:src="@drawable/baseline_more_vert_24"
+                    app:tint="@color/defaultSymbolInputTextColor" />
+
+                <ImageButton
+                    android:id="@+id/titlebar_search_close_button"
+                    android:layout_width="40dp"
+                    android:layout_height="match_parent"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/close_search"
+                    android:padding="8dp"
+                    android:src="@drawable/ic_close_24"
+                    app:tint="@color/defaultSymbolInputTextColor" />
+
+            </LinearLayout>
+
+        </LinearLayout>
 
     </LinearLayout>
 
