@@ -1,4 +1,4 @@
-include ':app', ':termux-shared', ':terminal-emulator', ':terminal-view', ':ui-shell',
+include ':app', ':termux-shared', ':terminal-emulator', ':terminal-view',
         ':sora-editor', ':sora-demo',
         ':sora-language-java', ':sora-language-textmate', ':sora-language-monarch',
         ':sora-editor-lsp', ':sora-language-treesitter', ':sora-oniguruma-native',
@@ -12,6 +12,7 @@ include ':app', ':termux-shared', ':terminal-emulator', ':terminal-view', ':ui-s
         ':editor-sync-core',
         ':system-status-surface',
         ':session-sync-core',
+        ':ecj-bridge-core',
         ':file-bridge',
         ':file-manager',
         ':fossify-commons'

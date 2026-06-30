@@ -8,6 +8,7 @@ class EditorSyncStateMachine {
     private var lastSuccessfulRevision: Long = 0L
     private var inFlightRevision: Long? = null
     private var inFlightTrigger: EditorSaveTrigger? = null
+    private var externalReloadInProgress: Boolean = false
     private var lastError: String? = null
     private var lastSuccessfulSaveAtMs: Long = 0L
     private var lastSuccessfulTrigger: EditorSaveTrigger? = null
@@ -19,6 +20,7 @@ class EditorSyncStateMachine {
         lastSuccessfulRevision = 0L
         inFlightRevision = null
         inFlightTrigger = null
+        externalReloadInProgress = false
         lastError = null
         lastSuccessfulTrigger = null
         lastSuccessfulSaveAtMs = if (target?.supportsSaving() == true) nowMs else 0L
@@ -69,6 +71,19 @@ class EditorSyncStateMachine {
         return snapshot()
     }
 
+    fun onExternalReloadStarted(): EditorSyncSnapshot {
+        if (target?.supportsSaving() != true) return snapshot()
+        externalReloadInProgress = true
+        lastError = null
+        return snapshot()
+    }
+
+    fun onExternalReloadFinished(error: String? = null): EditorSyncSnapshot {
+        externalReloadInProgress = false
+        lastError = error
+        return snapshot()
+    }
+
     fun snapshot(): EditorSyncSnapshot {
         val currentTarget = target
         val canSave = currentTarget?.supportsSaving() == true
@@ -76,6 +91,7 @@ class EditorSyncStateMachine {
         val saving = inFlightRevision != null
         val indicator = when {
             !canSave -> EditorSyncIndicatorState.HIDDEN
+            externalReloadInProgress -> EditorSyncIndicatorState.SPINNING
             saving -> EditorSyncIndicatorState.SPINNING
             autoSaveEnabled && hasUnsavedChanges -> EditorSyncIndicatorState.SPINNING
             autoSaveEnabled -> EditorSyncIndicatorState.SYNCED
@@ -85,7 +101,9 @@ class EditorSyncStateMachine {
         val statusText = when (indicator) {
             EditorSyncIndicatorState.HIDDEN -> lastError
             EditorSyncIndicatorState.SPINNING -> {
-                if (saving) {
+                if (externalReloadInProgress) {
+                    if (currentTarget?.supportsRemoteSync() == true) "刷新远程文件中" else "刷新文件中"
+                } else if (saving) {
                     when (inFlightTrigger) {
                         EditorSaveTrigger.RUN -> "运行前保存中"
                         EditorSaveTrigger.MANUAL -> "手动保存中"
@@ -105,6 +123,7 @@ class EditorSyncStateMachine {
             lastSuccessfulRevision = lastSuccessfulRevision,
             inFlightRevision = inFlightRevision,
             inFlightTrigger = inFlightTrigger,
+            externalReloadInProgress = externalReloadInProgress,
             hasUnsavedChanges = hasUnsavedChanges,
             canSave = canSave,
             indicatorState = indicator,

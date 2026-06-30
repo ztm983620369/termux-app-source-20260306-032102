@@ -40,6 +40,29 @@
     </plurals>
     <string name="invert_colors">Invert colors</string>
 
+    <!-- Transfer progress -->
+    <string name="transfer_download_title">下载中</string>
+    <string name="transfer_apk_download_title">下载 APK</string>
+    <string name="transfer_preparing">准备中...</string>
+    <string name="transfer_running">正在下载...</string>
+    <string name="transfer_cancel">取消</string>
+    <string name="transfer_cancelling">正在取消...</string>
+    <string name="transfer_current_file">当前文件</string>
+    <string name="transfer_files_count">文件</string>
+    <string name="transfer_size">大小</string>
+    <string name="transfer_speed">速度</string>
+    <string name="transfer_status">状态</string>
+    <string name="transfer_failed">失败</string>
+    <string name="transfer_unknown">未知</string>
+    <string name="transfer_percent_unknown">--</string>
+    <string name="transfer_badge_apk">APK</string>
+    <string name="transfer_badge_file">文件</string>
+    <string name="transfer_badge_folder">文件夹</string>
+    <string name="transfer_done_success">下载完成</string>
+    <string name="transfer_done_partial">部分完成</string>
+    <string name="transfer_done_cancelled">下载已取消</string>
+    <string name="transfer_done_failed">下载失败</string>
+
     <!-- Open as -->
     <string name="open_as">Open as</string>
     <string name="text_file">Text file</string>
@@ -49,15 +72,15 @@
     <string name="other_file">Other file</string>
 
     <!-- Compression -->
-    <string name="compress">Compress</string>
-    <string name="decompress">Decompress</string>
-    <string name="compress_as">Compress as</string>
-    <string name="compressing">Compressing…</string>
-    <string name="decompressing">Decompressing…</string>
-    <string name="compression_successful">Compression successful</string>
-    <string name="decompression_successful">Decompression successful</string>
-    <string name="compressing_failed">Compressing failed</string>
-    <string name="decompressing_failed">Decompressing failed</string>
+    <string name="compress">压缩</string>
+    <string name="decompress">解压</string>
+    <string name="compress_as">压缩为</string>
+    <string name="compressing">正在压缩…</string>
+    <string name="decompressing">正在解压…</string>
+    <string name="compression_successful">压缩成功</string>
+    <string name="decompression_successful">解压成功</string>
+    <string name="compressing_failed">压缩失败</string>
+    <string name="decompressing_failed">解压失败</string>
 
     <!-- Favorites -->
     <string name="manage_favorites">Manage favorites</string>
@@ -76,6 +99,7 @@
     <string name="industrial_self_test_report_copied">Self-test report copied</string>
     <string name="industrial_self_test_open_report_folder">Open report folder</string>
     <string name="manage_session_trust">Manage server fingerprint</string>
+    <string name="run_ecj_project">Run ECJ project</string>
 
     <!-- Storage analysis -->
     <string name="storage_analysis">Storage analysis</string>

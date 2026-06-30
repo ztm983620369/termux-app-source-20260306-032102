@@ -60,11 +60,11 @@ android {
         implementation project(":terminal-session-runtime")
         implementation project(":ssh-connection-core")
         implementation project(":system-status-surface")
-        implementation project(":ui-shell")
         implementation(project(":sora-demo")) {
             exclude group: "com.squareup.leakcanary"
         }
         implementation project(":session-sync-core")
+        implementation project(":ecj-bridge-core")
         implementation project(":file-bridge")
         implementation project(":file-manager")
         implementation project(":fossify-commons")

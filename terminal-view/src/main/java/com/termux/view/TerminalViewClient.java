@@ -28,6 +28,15 @@ public interface TerminalViewClient {
      */
     void onSingleTapUp(MotionEvent e);
 
+    /**
+     * On a single tap that may be handled as text input focus by the client.
+     *
+     * This is called even while terminal mouse reporting is enabled so clients
+     * can show the IME for application-owned input regions without disabling
+     * mouse reporting for the running terminal program.
+     */
+    void onTextInputTap(MotionEvent e);
+
     boolean shouldTerminalViewRequestFocusOnTap();
 
     boolean shouldBackButtonBeMappedToEscape();

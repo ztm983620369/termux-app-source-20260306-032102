@@ -50,7 +50,14 @@ final class LineTokenizer {
 
     private static final Logger LOGGER = Logger.instance(LineTokenizer.class.getName());
 
-	private record LocalStackElement(AttributedScopeStack scopes, int endPos) {
+	private static final class LocalStackElement {
+		final AttributedScopeStack scopes;
+		final int endPos;
+
+		LocalStackElement(final AttributedScopeStack scopes, final int endPos) {
+			this.scopes = scopes;
+			this.endPos = endPos;
+		}
 	}
 
 	private static class MatchResult {
@@ -73,11 +80,22 @@ final class LineTokenizer {
 	}
 
 	@NonNullByDefault({})
-	private record WhileCheckResult(
-			@NonNull StateStack stack,
-			int linePos,
-			int anchorPosition,
-			boolean isFirstLine) {
+	private static final class WhileCheckResult {
+		final @NonNull StateStack stack;
+		final int linePos;
+		final int anchorPosition;
+		final boolean isFirstLine;
+
+		WhileCheckResult(
+				final @NonNull StateStack stack,
+				final int linePos,
+				final int anchorPosition,
+				final boolean isFirstLine) {
+			this.stack = stack;
+			this.linePos = linePos;
+			this.anchorPosition = anchorPosition;
+			this.isFirstLine = isFirstLine;
+		}
 	}
 
 	static final class TokenizeStringResult {

@@ -21,7 +21,12 @@ object TermuxPathScope {
     fun navigatorRootPath(context: Context): String = normalizePath("${termuxRootPath(context)}/$NAV_ROOT_RELATIVE_PATH")
 
     fun preferredLocalRoot(context: Context): String {
-        return if (context.config.showTermuxSystemDirs) preferredPhoneRoot(context) else termuxHomePath(context)
+        return termuxHomePath(context)
+    }
+
+    fun preferredTermuxWorkPath(context: Context, path: String?): String {
+        val normalized = normalizePath(path)
+        return if (isInTermuxHome(context, normalized)) normalized else termuxHomePath(context)
     }
 
     fun isScopedHost(context: Context): Boolean {
@@ -58,6 +63,12 @@ object TermuxPathScope {
             normalized.startsWith("$mountRoot/")
     }
 
+    fun isNavigatorPath(context: Context, path: String?): Boolean {
+        val normalized = normalizePath(path)
+        val root = navigatorRootPath(context)
+        return normalized == root || normalized.startsWith("$root/")
+    }
+
     fun phoneStorageRoots(context: Context): List<String> {
         val roots = LinkedHashSet<String>()
         val internal = normalizePath(context.internalStoragePath)
@@ -90,7 +101,7 @@ object TermuxPathScope {
         if (!isScopedHost) return true
 
         val normalized = normalizePath(path)
-        if (normalized == navigatorRootPath(context)) return true
+        if (isNavigatorPath(context, normalized)) return true
         if (isVirtualWorkspacePath(context, normalized)) return true
 
         return if (context.config.showTermuxSystemDirs) {
@@ -119,6 +130,6 @@ object TermuxPathScope {
         return (isInPhoneStorage(context, normalized) || isInTermuxRoot(context, normalized)) &&
             !isInTermuxHome(context, normalized) &&
             !isVirtualWorkspacePath(context, normalized) &&
-            normalized != navigatorRootPath(context)
+            !isNavigatorPath(context, normalized)
     }
 }

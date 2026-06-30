@@ -67,6 +67,7 @@ import com.termux.editorsync.EditorDocumentSyncManager
 import com.termux.editorsync.EditorSaveTrigger
 import com.termux.editorsync.EditorSyncTarget
 import com.termux.editorsync.EditorSyncTargetKind
+import com.termux.sessionsync.SessionFileCoordinator
 import io.github.rosemoe.sora.app.databinding.ActivityMainBinding
 import io.github.rosemoe.sora.app.lsp.LspTestActivity
 import io.github.rosemoe.sora.app.lsp.LspTestJavaActivity
@@ -106,6 +107,9 @@ import kotlinx.coroutines.withContext
 import org.eclipse.tm4e.core.internal.oniguruma.Oniguruma
 import java.io.File
 import java.io.FileInputStream
+import java.security.DigestInputStream
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicLong
 import java.util.regex.PatternSyntaxException
 import kotlin.math.abs
 import kotlin.math.max
@@ -159,11 +163,30 @@ class MainActivity : AppCompatActivity() {
     private lateinit var documentSync: EditorDocumentSyncManager
     private val saveStatusUi = EditorSaveStatusUi()
 
+    private data class FileDiskState(
+        val path: String,
+        val lastModified: Long,
+        val length: Long,
+        val sha256: String
+    )
+
+    private data class DiskFileContent(
+        val content: io.github.rosemoe.sora.text.Content,
+        val diskState: FileDiskState
+    )
+
+    private data class MaterializedOpenRequest(
+        val request: FileOpenRequest,
+        val file: File
+    )
+
     private var lastBridgeSeqHandled: Long = 0L
     private var lastOpenRequest: FileOpenRequest? = null
     private var lastOpenAttemptAtMs: Long = 0L
     private var lastOpenOkAtMs: Long = 0L
     private var lastOpenError: String? = null
+    private var lastKnownDiskSha256: String? = null
+    private val openGeneration = AtomicLong(0L)
     private var suppressContentChangeCallbacks: Boolean = false
 
     private val prefs by lazy { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
@@ -674,47 +697,225 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun readDiskFileForEditorStable(file: File): DiskFileContent {
+        repeat(2) { attempt ->
+            val beforeModified = file.lastModified()
+            val beforeLength = file.length()
+            val digest = MessageDigest.getInstance("SHA-256")
+            val content = DigestInputStream(FileInputStream(file).buffered(), digest).use { stream ->
+                ContentIO.createFrom(stream)
+            }
+            val diskState = FileDiskState(
+                path = file.absolutePath,
+                lastModified = file.lastModified(),
+                length = file.length(),
+                sha256 = toHex(digest.digest())
+            )
+            if (attempt > 0 ||
+                (beforeModified == diskState.lastModified && beforeLength == diskState.length)
+            ) {
+                return DiskFileContent(content = content, diskState = diskState)
+            }
+        }
+        throw IllegalStateException("file changed while reading: ${file.absolutePath}")
+    }
+
+    private fun materializeOpenRequestForRead(request: FileOpenRequest, forceRemoteRefresh: Boolean): MaterializedOpenRequest {
+        if (request.originType == FileOpenRequest.ORIGIN_SFTP_VIRTUAL &&
+            !request.originPath.isNullOrBlank() &&
+            (forceRemoteRefresh || request.path.isBlank())
+        ) {
+            val result = SessionFileCoordinator.getInstance()
+                .materializeVirtualFile(applicationContext, request.originPath)
+            if (!result.success) {
+                throw IllegalStateException(result.messageCn.ifBlank { "remote refresh failed" })
+            }
+            val localPath = result.localPath
+            if (localPath.isBlank()) {
+                throw IllegalStateException("remote refresh returned empty local path")
+            }
+            return MaterializedOpenRequest(
+                request = request.copy(
+                    path = localPath,
+                    originModifiedMs = result.remoteModifiedMs.takeIf { it >= 0L },
+                    originSize = result.remoteSize.takeIf { it >= 0L },
+                    originSha256 = result.remoteSha256.takeIf { it.isNotBlank() },
+                    originFingerprintLevel = result.remoteSha256.takeIf { it.isNotBlank() }?.let { "STRONG_CONTENT" },
+                    originFingerprintMethod = result.remoteSha256.takeIf { it.isNotBlank() }?.let { "remote-native-or-sftp-sha256" }
+                ),
+                file = File(localPath)
+            )
+        }
+        return MaterializedOpenRequest(
+            request = request,
+            file = File(request.path)
+        )
+    }
+
+    private fun requireReadableFile(file: File, rawPath: String = file.path) {
+        if (!file.exists()) {
+            throw IllegalStateException("文件不存在: $rawPath")
+        }
+        if (!file.isFile) {
+            throw IllegalStateException("路径不是文件: $rawPath")
+        }
+        if (!file.canRead()) {
+            throw IllegalStateException("文件不可读: $rawPath")
+        }
+    }
+
+    private fun toHex(bytes: ByteArray): String {
+        val out = CharArray(bytes.size * 2)
+        val alphabet = "0123456789abcdef"
+        for (i in bytes.indices) {
+            val v = bytes[i].toInt() and 0xff
+            out[i * 2] = alphabet[v ushr 4]
+            out[i * 2 + 1] = alphabet[v and 0x0f]
+        }
+        return String(out)
+    }
+
+    private fun currentEditorSha256(): String {
+        return toHex(MessageDigest.getInstance("SHA-256").digest(binding.editor.text.toString().toByteArray(Charsets.UTF_8)))
+    }
+
     private fun openDiskFile(request: FileOpenRequest) {
         val path = request.path
+        val openToken = openGeneration.incrementAndGet()
         lifecycleScope.launch(Dispatchers.IO) {
-            val file = File(path)
+            val materialized = runCatching { materializeOpenRequestForRead(request, forceRemoteRefresh = false) }
+                .getOrElse {
+                    if (openToken == openGeneration.get()) {
+                        lastOpenError = it.message ?: it.toString()
+                        withContext(Dispatchers.Main) {
+                            if (openToken == openGeneration.get()) toast("打开失败：${lastOpenError ?: "unknown"}")
+                        }
+                    }
+                    return@launch
+                }
+            val normalizedRequest = materialized.request
+            val file = materialized.file
+            val absolutePath = file.absolutePath
             lastOpenAttemptAtMs = System.currentTimeMillis()
             lastOpenError = null
 
-            if (!file.exists()) {
-                lastOpenError = "文件不存在: $path"
-                withContext(Dispatchers.Main) { toast(lastOpenError ?: "文件不存在") }
-                return@launch
-            }
-            if (!file.isFile) {
-                lastOpenError = "不是文件: $path"
-                withContext(Dispatchers.Main) { toast(lastOpenError ?: "不是文件") }
-                return@launch
-            }
-            if (!file.canRead()) {
-                lastOpenError = "不可读: $path"
-                withContext(Dispatchers.Main) { toast(lastOpenError ?: "不可读") }
+            val readError = runCatching { requireReadableFile(file, path) }.exceptionOrNull()
+            if (readError != null) {
+                lastOpenError = readError.message ?: readError.toString()
+                withContext(Dispatchers.Main) {
+                    if (openToken == openGeneration.get()) toast(lastOpenError ?: "不可读")
+                }
                 return@launch
             }
 
-            val text = runCatching { FileInputStream(file).use { ContentIO.createFrom(it) } }
+            val diskFile = runCatching { readDiskFileForEditorStable(file) }
                 .getOrElse {
                     lastOpenError = it.toString()
-                    withContext(Dispatchers.Main) { toast(it.toString()) }
+                    withContext(Dispatchers.Main) {
+                        if (openToken == openGeneration.get()) toast(it.toString())
+                    }
                     return@launch
-            }
+                }
 
             withContext(Dispatchers.Main) {
+                if (openToken != openGeneration.get()) return@withContext
                 suppressContentChangeCallbacks = true
-                binding.editor.setText(text, null)
-                documentSync.bindDocument(buildSyncTarget(request, file), binding.editor.text.toString())
+                binding.editor.setText(diskFile.content, null)
+                lastOpenRequest = normalizedRequest.copy(path = absolutePath)
+                title = lastOpenRequest?.displayName ?: file.name
+                documentSync.bindDocument(
+                    buildSyncTarget(lastOpenRequest ?: normalizedRequest, file),
+                    binding.editor.text.toString()
+                )
                 updateBtnState()
                 lastOpenOkAtMs = System.currentTimeMillis()
+                lastKnownDiskSha256 = diskFile.diskState.sha256
                 invalidateOptionsMenu()
                 binding.editor.post {
                     suppressContentChangeCallbacks = false
-                    vscode.maybeAutoApplyVSCodeSyntaxByFileName(path)
+                    vscode.maybeAutoApplyVSCodeSyntaxByFileName(absolutePath)
                 }
+            }
+        }
+    }
+
+    private fun refreshCurrentEditorFromSource() {
+        val request = lastOpenRequest
+        if (request == null) {
+            toast("当前没有可刷新的文件")
+            return
+        }
+
+        val refreshToken = openGeneration.incrementAndGet()
+        lifecycleScope.launch {
+            val result = runCatching {
+                documentSync.runExclusiveExternalReload {
+                    val beforeDiskSha256 = lastKnownDiskSha256
+                    val (materialized, fileContent) = withContext(Dispatchers.IO) {
+                        val materialized = materializeOpenRequestForRead(request, forceRemoteRefresh = true)
+                        val file = materialized.file
+                        requireReadableFile(file, request.path)
+                        val fileContent = readDiskFileForEditorStable(file)
+                        Pair(materialized, fileContent)
+                    }
+
+                    if (refreshToken != openGeneration.get()) return@runExclusiveExternalReload
+                    val file = materialized.file
+                    val absolutePath = file.absolutePath
+
+                    if (beforeDiskSha256 == fileContent.diskState.sha256) {
+                        lastOpenRequest = materialized.request.copy(path = absolutePath)
+                        title = lastOpenRequest?.displayName ?: file.name
+                        documentSync.updateTargetMetadata(buildSyncTarget(lastOpenRequest ?: materialized.request, file))
+                        lastOpenOkAtMs = System.currentTimeMillis()
+                        lastOpenError = null
+                        return@runExclusiveExternalReload
+                    }
+
+                    val editorSha256 = currentEditorSha256()
+                    if (editorSha256 == fileContent.diskState.sha256) {
+                        lastOpenRequest = materialized.request.copy(path = absolutePath)
+                        title = lastOpenRequest?.displayName ?: file.name
+                        documentSync.bindDocument(
+                            buildSyncTarget(lastOpenRequest ?: materialized.request, file),
+                            binding.editor.text.toString()
+                        )
+                        updateBtnState()
+                        lastOpenOkAtMs = System.currentTimeMillis()
+                        lastOpenError = null
+                        lastKnownDiskSha256 = fileContent.diskState.sha256
+                        invalidateOptionsMenu()
+                        return@runExclusiveExternalReload
+                    }
+
+                    suppressContentChangeCallbacks = true
+                    binding.editor.setText(fileContent.content, null)
+                    lastOpenRequest = materialized.request.copy(path = absolutePath)
+                    title = lastOpenRequest?.displayName ?: file.name
+                    documentSync.bindDocument(
+                        buildSyncTarget(lastOpenRequest ?: materialized.request, file),
+                        binding.editor.text.toString()
+                    )
+                    updateBtnState()
+                    lastOpenOkAtMs = System.currentTimeMillis()
+                    lastOpenError = null
+                    lastKnownDiskSha256 = fileContent.diskState.sha256
+                    invalidateOptionsMenu()
+                    binding.editor.post {
+                        suppressContentChangeCallbacks = false
+                        vscode.maybeAutoApplyVSCodeSyntaxByFileName(absolutePath)
+                    }
+                    toast("已刷新最新内容")
+                }
+            }
+
+            val failure = result.exceptionOrNull()
+            if (failure != null) {
+                if (refreshToken == openGeneration.get()) {
+                    toast("刷新失败：${failure.message ?: failure::class.java.name}")
+                    invalidateOptionsMenu()
+                }
+                return@launch
             }
         }
     }
@@ -732,7 +933,10 @@ class MainActivity : AppCompatActivity() {
             originPath = request.originPath,
             originDisplayPath = request.originDisplayPath,
             originModifiedMs = request.originModifiedMs,
-            originSize = request.originSize
+            originSize = request.originSize,
+            originSha256 = request.originSha256,
+            originFingerprintLevel = request.originFingerprintLevel,
+            originFingerprintMethod = request.originFingerprintMethod
         )
     }
 
@@ -844,7 +1048,7 @@ class MainActivity : AppCompatActivity() {
         redo = menu.findItem(R.id.text_redo)
         menu.findItem(R.id.auto_save_enabled)?.isChecked = documentSync.isAutoSaveEnabled()
         menu.findItem(R.id.save_file)?.isEnabled = documentSync.state.value.canSave
-        saveStatusUi.bind(menu)
+        saveStatusUi.bind(menu, onClick = ::refreshCurrentEditorFromSource)
         saveStatusUi.render(documentSync.state.value)
         return super.onCreateOptionsMenu(menu)
     }

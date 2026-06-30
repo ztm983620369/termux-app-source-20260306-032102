@@ -1,0 +1,51 @@
+{
+  "$schema": "../../schema.json",
+  "options": {
+    "disable_provider_auto_update": true,
+    "disable_default_providers": true,
+    "data_directory": ".crush-native-e2e",
+    "progress": false
+  },
+  "providers": {
+    "native-e2e": {
+      "name": "Native E2E",
+      "type": "openai",
+      "base_url": "http://127.0.0.1:18080/v1",
+      "api_key": "crush-native-e2e-key",
+      "models": [
+        {
+          "id": "gpt-5.1-crush-native-e2e",
+          "name": "Native E2E",
+          "context_window": 200000,
+          "default_max_tokens": 4096,
+          "can_reason": true
+        }
+      ]
+    }
+  },
+  "models": {
+    "large": {
+      "provider": "native-e2e",
+      "model": "gpt-5.1-crush-native-e2e"
+    },
+    "small": {
+      "provider": "native-e2e",
+      "model": "gpt-5.1-crush-native-e2e"
+    }
+  },
+  "permissions": {
+    "allowed_tools": [
+      "set_session_title",
+      "get_session_title",
+      "view",
+      "write",
+      "edit",
+      "multiedit",
+      "bash",
+      "glob",
+      "grep",
+      "ls",
+      "todos"
+    ]
+  }
+}

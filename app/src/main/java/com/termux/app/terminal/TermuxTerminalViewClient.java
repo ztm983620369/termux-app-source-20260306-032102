@@ -75,6 +75,8 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     @Nullable private Boolean mResumeSoftKeyboardVisibleOverride;
     private boolean mResumeSoftKeyboardRequestTerminalFocus = true;
     private boolean mProgrammaticTerminalFocusAllowed = true;
+    private int mTerminalImeStartRow = -1;
+    private int mTerminalImeEndRow = -1;
 
     private boolean mTerminalCursorBlinkerStateAlreadySet;
 
@@ -292,6 +294,58 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             } else
                 Logger.logVerbose(LOG_TAG, "Not showing soft keyboard onSingleTapUp since its disabled");
         }
+    }
+
+    @Override
+    public void onTextInputTap(MotionEvent e) {
+        if (e.isFromSource(InputDevice.SOURCE_MOUSE)) return;
+        if (!isTerminalImeRectSet()) return;
+
+        TerminalView terminalView = mActivity.getTerminalView();
+        if (terminalView == null) return;
+        int[] columnAndRow = terminalView.getColumnAndRow(e, false);
+        int row = columnAndRow[1];
+        if (row < mTerminalImeStartRow || row > mTerminalImeEndRow) return;
+
+        showSoftKeyboardForTerminal();
+    }
+
+    private boolean isTerminalImeRectSet() {
+        return mTerminalImeStartRow >= 0 && mTerminalImeEndRow >= mTerminalImeStartRow;
+    }
+
+    public void setTerminalImeRect(@Nullable String argument) {
+        if (argument == null || argument.trim().isEmpty() || "clear".equalsIgnoreCase(argument.trim())) {
+            clearTerminalImeRect();
+            return;
+        }
+
+        String[] parts = argument.split(",", 2);
+        if (parts.length != 2) {
+            Logger.logWarn(LOG_TAG, "Invalid terminal IME rect argument: " + argument);
+            clearTerminalImeRect();
+            return;
+        }
+
+        try {
+            int start = Integer.parseInt(parts[0].trim());
+            int end = Integer.parseInt(parts[1].trim());
+            if (start < 0 || end < start) {
+                Logger.logWarn(LOG_TAG, "Invalid terminal IME rect rows: " + argument);
+                clearTerminalImeRect();
+                return;
+            }
+            mTerminalImeStartRow = start;
+            mTerminalImeEndRow = end;
+        } catch (NumberFormatException e) {
+            Logger.logWarn(LOG_TAG, "Invalid terminal IME rect number: " + argument);
+            clearTerminalImeRect();
+        }
+    }
+
+    public void clearTerminalImeRect() {
+        mTerminalImeStartRow = -1;
+        mTerminalImeEndRow = -1;
     }
 
     @Override

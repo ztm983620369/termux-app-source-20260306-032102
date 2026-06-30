@@ -2,6 +2,7 @@ package org.fossify.filemanager.controllers
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
 import android.graphics.Color
@@ -23,6 +24,9 @@ import android.widget.TextView
 import androidx.appcompat.widget.PopupMenu
 import androidx.viewpager.widget.ViewPager
 import com.stericson.RootTools.RootTools
+import com.termux.ecjbridge.EcjBridgeContract
+import com.termux.ecjbridge.EcjProjectDetector
+import com.termux.ecjbridge.EcjProjectLauncher
 import com.termux.sessionsync.SavedSshProfileStore
 import com.termux.sessionsync.SessionFileCoordinator
 import com.termux.sessionsync.SessionFileMode
@@ -124,7 +128,6 @@ class FileManagerController(
     private var mTabsToShow = ArrayList<Int>()
     private var mainFabMenu: PopupWindow? = null
     private val termuxRootPath: String by lazy { TermuxPathScope.termuxRootPath(activity) }
-    private val termuxHomePath: String by lazy { TermuxPathScope.termuxHomePath(activity) }
 
     private var mStoredFontSize = 0
     private var mStoredDateFormat = ""
@@ -134,6 +137,7 @@ class FileManagerController(
     private var mSelectedSessionId: String? = null
     private var mInitialSessionApplied = false
     private var mSwitchingSession = false
+    private var observedFilesFragment: WorkspaceFilesFragment? = null
     private val fileManagerDependencies by lazy {
         FileManagerDependencies(
             environment = this,
@@ -164,7 +168,7 @@ class FileManagerController(
         applyContainerColors()
         syncWorkspaceChrome()
         refreshMenuItems()
-        val scopedHome = clampToVisibleTermuxPath(activity.config.homeFolder, termuxHomePath)
+        val scopedHome = TermuxPathScope.preferredTermuxWorkPath(activity, activity.config.homeFolder)
         if (activity.config.homeFolder != scopedHome) {
             activity.config.homeFolder = scopedHome
         }
@@ -183,7 +187,7 @@ class FileManagerController(
         if (enableEdgeToEdge) {
             activity.setupEdgeToEdge(
                 padBottomSystem = listOf(binding.mainViewPager),
-                moveBottomSystem = listOf(binding.mainFab, binding.mainMoreFab)
+                moveBottomSystem = listOf(binding.mainFab, binding.mainMoreFab, binding.mainEcjRunFab)
             )
         }
 
@@ -406,6 +410,22 @@ class FileManagerController(
         }
     }
 
+    override fun runEcjProject(path: String) {
+        val projectRoot = EcjProjectDetector.findNearestProjectRoot(path)
+        if (projectRoot == null) {
+            activity.toast("当前路径不属于 ECJ 项目")
+            return
+        }
+
+        try {
+            EcjProjectLauncher.launchProject(activity, projectRoot)
+        } catch (_: ActivityNotFoundException) {
+            activity.toast("未找到 ECJ App：${EcjBridgeContract.ECJ_APP_PACKAGE}")
+        } catch (t: Throwable) {
+            activity.toast(t.message ?: t.toString())
+        }
+    }
+
     override fun openPathAndHighlight(targetPath: String, highlightPaths: ArrayList<String>) {
         val filesIndex = getPageTabs().indexOf(TAB_FILES)
         if (filesIndex != -1 && binding.mainViewPager.currentItem != filesIndex) {
@@ -459,7 +479,11 @@ class FileManagerController(
     }
 
     override fun refreshMenuItems() {
-        val currentFragment = getCurrentFragment() ?: return
+        val currentFragment = getCurrentFragment()
+        if (currentFragment == null) {
+            refreshEcjRunFab()
+            return
+        }
         val isCreateDocumentIntent = intentProvider().action == Intent.ACTION_CREATE_DOCUMENT
         val currentItems = activeItemsFragment()
         val currentPath = currentItems?.currentPath ?: currentFragment.currentPath
@@ -502,6 +526,7 @@ class FileManagerController(
             findItem(R.id.settings).isVisible = !isCreateDocumentIntent
             findItem(R.id.about).isVisible = !isCreateDocumentIntent
         }
+        refreshEcjRunFab()
     }
 
     override fun updateFragmentColumnCounts() {
@@ -563,7 +588,7 @@ class FileManagerController(
     }
 
     private fun getPreferredStartPath(): String {
-        return clampToVisibleTermuxPath(activity.config.homeFolder, termuxHomePath)
+        return TermuxPathScope.preferredTermuxWorkPath(activity, activity.config.homeFolder)
     }
 
     private fun isInTermuxStorage(path: String): Boolean {
@@ -595,7 +620,10 @@ class FileManagerController(
         getAllFragments().forEach { fragment ->
             fragment?.setBackgroundColor(backgroundColor)
         }
-        binding.mainMoreFab.backgroundTintList = android.content.res.ColorStateList.valueOf(activity.getProperPrimaryColor())
+        val primaryColor = activity.getProperPrimaryColor()
+        binding.mainMoreFab.backgroundTintList = android.content.res.ColorStateList.valueOf(primaryColor)
+        binding.mainEcjRunFab.backgroundTintList = android.content.res.ColorStateList.valueOf(primaryColor)
+        updateEcjRunFabIcon()
     }
 
     private fun storeStateVariables() {
@@ -755,13 +783,62 @@ class FileManagerController(
         binding.mainMoreFab.setOnClickListener {
             showBottomOverflowMenu()
         }
+        binding.mainEcjRunFab.setOnClickListener {
+            runActiveEcjProject()
+        }
         binding.mainSearchFab.visibility = View.GONE
+        binding.mainEcjRunFab.visibility = View.GONE
+        updateEcjRunFabIcon()
     }
 
     private fun updateMainFabIcon(isCreateDocumentIntent: Boolean) {
         val iconId = if (isCreateDocumentIntent) R.drawable.ic_check_vector else R.drawable.ic_plus_vector
         val icon = activity.resources.getColoredDrawableWithColor(iconId, activity.getProperPrimaryColor().getContrastColor())
         binding.mainFab.setImageDrawable(icon)
+    }
+
+    private fun updateEcjRunFabIcon() {
+        val icon = activity.resources.getColoredDrawableWithColor(
+            R.drawable.ic_play_vector,
+            activity.getProperPrimaryColor().getContrastColor()
+        )
+        binding.mainEcjRunFab.setImageDrawable(icon)
+    }
+
+    private fun refreshEcjRunFab() {
+        binding.mainEcjRunFab.visibility = View.GONE
+    }
+
+    private fun activeEcjProjectRoot(): File? {
+        if (intentProvider().action == Intent.ACTION_CREATE_DOCUMENT) return null
+        val filesFragment = getFilesFragment() ?: return null
+        if (getCurrentFragment() !is WorkspaceFilesFragment) return null
+        if (filesFragment.isActiveTabShowingFolderRecents()) return null
+
+        val currentPath = filesFragment.activeWorkspacePathForMenu().trim()
+        if (currentPath.isBlank()) return null
+        if (NavigatorFolderHelper.isNavigatorPath(activity, currentPath)) return null
+        if (mSessionFileCoordinator.isVirtualPath(activity, currentPath)) return null
+        if (mSessionFileCoordinator.isStaleVirtualPath(activity, currentPath)) return null
+
+        return EcjProjectDetector.findNearestProjectRoot(currentPath)
+    }
+
+    private fun runActiveEcjProject() {
+        val projectRoot = activeEcjProjectRoot()
+        if (projectRoot == null) {
+            activity.toast("当前路径不属于 ECJ 项目")
+            refreshEcjRunFab()
+            return
+        }
+
+        try {
+            EcjProjectLauncher.launchProject(activity, projectRoot)
+        } catch (_: ActivityNotFoundException) {
+            activity.toast("未找到 ECJ App：${EcjBridgeContract.ECJ_APP_PACKAGE}")
+        } catch (t: Throwable) {
+            activity.toast(t.message ?: t.toString())
+        }
     }
 
     private fun openWorkspaceSearch() {
@@ -1041,7 +1118,7 @@ class FileManagerController(
 
     private fun setAsHome() {
         val path = activeFilePath().ifBlank { return }
-        activity.config.homeFolder = clampToVisibleTermuxPath(path, termuxHomePath)
+        activity.config.homeFolder = TermuxPathScope.preferredTermuxWorkPath(activity, path)
         activity.toast(R.string.home_folder_updated)
     }
 
@@ -1329,9 +1406,23 @@ class FileManagerController(
 
     private fun getFilesFragment(): WorkspaceFilesFragment? {
         val fragment = activity.findViewById<WorkspaceFilesFragment>(R.id.workspace_files_fragment)
-        fragment?.workspaceStateChangedListener = {
-            syncWorkspaceChrome()
-            refreshMenuItems()
+        if (fragment == null) {
+            observedFilesFragment?.workspaceStateChangedListener = null
+            observedFilesFragment?.workspaceTabPreviewListener = null
+            observedFilesFragment = null
+            return null
+        }
+        if (observedFilesFragment !== fragment) {
+            observedFilesFragment?.workspaceStateChangedListener = null
+            observedFilesFragment?.workspaceTabPreviewListener = null
+            observedFilesFragment = fragment
+            fragment.workspaceStateChangedListener = {
+                syncWorkspaceChrome()
+                refreshMenuItems()
+            }
+            fragment.workspaceTabPreviewListener = { tabId ->
+                binding.workspaceChrome.tabsView().setPreviewSelectedTab(tabId)
+            }
         }
         return fragment
     }
@@ -1405,6 +1496,7 @@ class FileManagerController(
         binding.workspaceChrome.tabsView().visibility = if (isFilesSelected) View.VISIBLE else View.GONE
         binding.mainSearchFab.visibility = View.GONE
         binding.mainMoreFab.visibility = if (currentFragment == null) View.GONE else View.VISIBLE
+        refreshEcjRunFab()
 
         if (isFilesSelected) {
             val filesFragment = getFilesFragment() ?: return

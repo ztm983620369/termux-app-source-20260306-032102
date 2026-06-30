@@ -67,4 +67,21 @@ class EditorSyncStateMachineTest {
         assertTrue(snapshot.hasUnsavedChanges)
         assertEquals("network down", snapshot.lastError)
     }
+
+    @Test
+    fun `manual refresh spins even when autosave disabled`() {
+        val machine = EditorSyncStateMachine()
+        val target = EditorSyncTarget(localPath = "/tmp/demo.txt")
+
+        machine.bindDocument(target, autoSaveEnabled = false)
+        var snapshot = machine.onExternalReloadStarted()
+
+        assertEquals(EditorSyncIndicatorState.SPINNING, snapshot.indicatorState)
+        assertTrue(snapshot.externalReloadInProgress)
+
+        snapshot = machine.onExternalReloadFinished()
+
+        assertEquals(EditorSyncIndicatorState.HIDDEN, snapshot.indicatorState)
+        assertFalse(snapshot.externalReloadInProgress)
+    }
 }

@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Crush 使用统计</title>
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      {{.CSS}}
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header-wrapper">
+        <a href="https://charm.land/crush" class="header-link">
+          <div class="header-content">
+            <div class="header-svg">{{.Header}}</div>
+            <div class="heartbit-svg">{{.Heartbit}}</div>
+          </div>
+        </a>
+      </div>
+
+      <div class="header-info">
+        {{.Username}} 于 {{.GeneratedAt}} 为 {{.ProjectName}} 生成。
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <h3>会话总数</h3>
+          <div class="value" id="total-sessions"></div>
+        </div>
+        <div class="stat-card">
+          <h3>消息总数</h3>
+          <div class="value" id="total-messages"></div>
+        </div>
+        <div class="stat-card">
+          <h3>Token 总数</h3>
+          <div class="value" id="total-tokens"></div>
+        </div>
+        <div class="stat-card">
+          <h3>总费用</h3>
+          <div class="value cost" id="total-cost"></div>
+        </div>
+        <div class="stat-card">
+          <h3>每会话 Token</h3>
+          <div class="value" id="avg-tokens"></div>
+        </div>
+        <div class="stat-card">
+          <h3>响应时间</h3>
+          <div class="value" id="avg-response"></div>
+        </div>
+      </div>
+
+      <div class="charts-grid">
+        <div class="chart-card full-width">
+          <h2>活动热力图</h2>
+          <div class="chart-container tall">
+            <canvas id="heatmapChart"></canvas>
+          </div>
+        </div>
+
+        <div class="chart-card full-width">
+          <h2>最近 30 天活动</h2>
+          <div class="chart-container tall">
+            <canvas id="recentActivityChart"></canvas>
+          </div>
+        </div>
+
+        <div class="chart-card full-width">
+          <h2>工具使用</h2>
+          <div class="chart-container tall">
+            <canvas id="toolChart"></canvas>
+          </div>
+        </div>
+
+        <div class="chart-row">
+          <div class="chart-card">
+            <h2>按服务商统计消息</h2>
+            <div class="chart-container">
+              <canvas id="providerPieChart"></canvas>
+            </div>
+          </div>
+
+          <div class="chart-card">
+            <h2>Token 分布</h2>
+            <div class="chart-container">
+              <canvas id="tokenPieChart"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <div class="chart-card full-width">
+          <h2>按模型统计用量</h2>
+          <div class="chart-container tall">
+            <canvas id="modelChart"></canvas>
+          </div>
+        </div>
+
+        <div class="chart-card full-width">
+          <h2>每日用量历史</h2>
+          <div style="overflow-x: auto">
+            <table id="daily-table">
+              <thead>
+                <tr>
+                  <th>日期</th>
+                  <th>会话</th>
+                  <th>提示 Token</th>
+                  <th>补全 Token</th>
+                  <th>Token 总数</th>
+                  <th>费用</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-container">
+      <div class="footer">{{.Footer}}</div>
+    </div>
+
+    <script>
+      const stats = {{.StatsJSON}};
+      {{.JS}}
+    </script>
+  </body>
+</html>

@@ -47,7 +47,8 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
 
     private data class WorkspaceSurface(
         val tabId: String,
-        val fragment: ItemsFragment
+        val fragment: ItemsFragment,
+        var appliedTextColor: Int? = null
     )
 
     private lateinit var binding: WorkspaceFilesFragmentBinding
@@ -58,7 +59,11 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
     private var pendingRestoreState: Bundle? = null
     private var pagerSelectionInProgress = false
     private var pagerStructureDirty = false
+    private var workspacePagerScrollState = ViewPager.SCROLL_STATE_IDLE
+    private var pendingPagerSelectedTabId: String? = null
+    private var previewPagerSelectedTabId: String? = null
     var workspaceStateChangedListener: ((WorkspaceShellState) -> Unit)? = null
+    var workspaceTabPreviewListener: ((String?) -> Unit)? = null
 
     private val workspacePagerAdapter = object : PagerAdapter() {
         override fun getCount(): Int = shellState?.tabs?.size ?: 0
@@ -118,7 +123,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
 
     override fun onResume(textColor: Int) {
         surfaces.values.forEach { surface ->
-            surface.fragment.onResume(textColor)
+            applySurfaceVisualState(surface, textColor, force = true)
         }
     }
 
@@ -258,6 +263,7 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
     }
 
     fun selectWorkspaceTab(tabId: String) {
+        pendingPagerSelectedTabId = null
         dispatch(WorkspaceShellAction.SelectTab(tabId))
         showActiveSurface(forceRefresh = false)
         notifyWorkspaceStateChanged()
@@ -396,17 +402,20 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         notifyWorkspaceStateChanged()
     }
 
-    private fun showActiveSurface(forceRefresh: Boolean) {
+    private fun showActiveSurface(forceRefresh: Boolean, syncPager: Boolean = true) {
         val state = shellState ?: return
         val activeTab = state.activeTab ?: return
         ensureSurface(activeTab, forceRefresh = forceRefresh)
-        val activeFragment = surfaces[activeTab.id]?.fragment
+        val activeSurface = surfaces[activeTab.id]
+        val activeFragment = activeSurface?.fragment
         if (activeFragment != null) {
             currentPath = activeFragment.currentPath
-            activeFragment.onResume(activity?.getProperTextColor() ?: return)
+            activeSurface?.let { applySurfaceVisualState(it) }
             activeFragment.searchQueryChanged(state.queryFor(activeTab.id))
         }
-        syncPagerToActiveTab()
+        if (syncPager) {
+            syncPagerToActiveTab()
+        }
         fileManagerControllerCommands.refreshMenuItems()
     }
 
@@ -461,7 +470,9 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
             }
             notifyWorkspaceStateChanged()
         }
-        surfaces[tab.id] = WorkspaceSurface(tab.id, fragment)
+        val surface = WorkspaceSurface(tab.id, fragment)
+        surfaces[tab.id] = surface
+        applySurfaceVisualState(surface)
         fragment.openPath(tab.currentRoute, forceRefresh)
     }
 
@@ -759,19 +770,70 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         binding.workspaceFilesPager.adapter = workspacePagerAdapter
         binding.workspaceFilesPager.offscreenPageLimit = 2
         binding.workspaceFilesPager.addOnPageChangeListener(object : ViewPager.OnPageChangeListener {
-            override fun onPageScrolled(position: Int, positionOffset: Float, positionOffsetPixels: Int) = Unit
+            override fun onPageScrolled(position: Int, positionOffset: Float, positionOffsetPixels: Int) {
+                if (pagerSelectionInProgress || workspacePagerScrollState == ViewPager.SCROLL_STATE_IDLE) return
+                val state = shellState ?: return
+                if (state.tabs.isEmpty()) return
 
-            override fun onPageScrollStateChanged(state: Int) = Unit
+                val activeIndex = state.tabs.indexOfFirst { it.id == state.activeTabId }
+                val targetIndex = when {
+                    positionOffsetPixels == 0 -> binding.workspaceFilesPager.currentItem
+                    activeIndex >= 0 && position >= activeIndex -> position + 1
+                    else -> position
+                }
+                val targetTabId = state.tabs.getOrNull(targetIndex.coerceIn(0, state.tabs.lastIndex))?.id
+                pendingPagerSelectedTabId = targetTabId
+                previewWorkspaceTabFromPager(targetTabId)
+            }
+
+            override fun onPageScrollStateChanged(state: Int) {
+                workspacePagerScrollState = state
+                if (state == ViewPager.SCROLL_STATE_IDLE) {
+                    consumePendingPagerSelection()
+                }
+            }
 
             override fun onPageSelected(position: Int) {
                 if (pagerSelectionInProgress) return
                 val tab = shellState?.tabs?.getOrNull(position) ?: return
-                if (tab.id == shellState?.activeTabId) return
-                dispatch(WorkspaceShellAction.SelectTab(tab.id))
-                showActiveSurface(forceRefresh = false)
-                notifyWorkspaceStateChanged()
+                if (workspacePagerScrollState == ViewPager.SCROLL_STATE_IDLE) {
+                    pendingPagerSelectedTabId = null
+                    selectWorkspaceTabFromPager(tab.id)
+                    clearWorkspaceTabPreview()
+                } else {
+                    pendingPagerSelectedTabId = tab.id
+                    previewWorkspaceTabFromPager(tab.id)
+                }
             }
         })
+    }
+
+    private fun consumePendingPagerSelection() {
+        val state = shellState ?: return
+        val settledTabId = state.tabs.getOrNull(binding.workspaceFilesPager.currentItem)?.id
+        val tabId = settledTabId ?: pendingPagerSelectedTabId ?: return
+        pendingPagerSelectedTabId = null
+        selectWorkspaceTabFromPager(tabId)
+        clearWorkspaceTabPreview()
+    }
+
+    private fun previewWorkspaceTabFromPager(tabId: String?) {
+        if (previewPagerSelectedTabId == tabId) return
+        previewPagerSelectedTabId = tabId
+        workspaceTabPreviewListener?.invoke(tabId)
+    }
+
+    private fun clearWorkspaceTabPreview() {
+        if (previewPagerSelectedTabId == null) return
+        previewPagerSelectedTabId = null
+        workspaceTabPreviewListener?.invoke(null)
+    }
+
+    private fun selectWorkspaceTabFromPager(tabId: String) {
+        if (tabId == shellState?.activeTabId) return
+        dispatch(WorkspaceShellAction.SelectTab(tabId))
+        showActiveSurface(forceRefresh = false, syncPager = false)
+        notifyWorkspaceStateChanged()
     }
 
     private fun notifyPagerDataChanged() {
@@ -788,13 +850,36 @@ class WorkspaceFilesFragment(context: Context, attributeSet: AttributeSet) :
         val targetIndex = state.tabs.indexOfFirst { it.id == state.activeTabId }
         if (targetIndex == -1) return
         if (!pagerStructureDirty && binding.workspaceFilesPager.currentItem == targetIndex) return
+        if (workspacePagerScrollState != ViewPager.SCROLL_STATE_IDLE) return
 
         pagerSelectionInProgress = true
+        pendingPagerSelectedTabId = null
+        clearWorkspaceTabPreview()
         binding.workspaceFilesPager.post {
-            pagerStructureDirty = false
-            binding.workspaceFilesPager.setCurrentItem(targetIndex, false)
-            pagerSelectionInProgress = false
+            try {
+                val latestState = shellState ?: return@post
+                val latestTargetIndex = latestState.tabs.indexOfFirst { it.id == latestState.activeTabId }
+                val adapterCount = binding.workspaceFilesPager.adapter?.count ?: 0
+                if (latestTargetIndex !in 0 until adapterCount) return@post
+                if (!pagerStructureDirty && binding.workspaceFilesPager.currentItem == latestTargetIndex) return@post
+
+                pagerStructureDirty = false
+                binding.workspaceFilesPager.setCurrentItem(latestTargetIndex, false)
+            } finally {
+                pagerSelectionInProgress = false
+            }
         }
+    }
+
+    private fun applySurfaceVisualState(
+        surface: WorkspaceSurface,
+        textColor: Int? = null,
+        force: Boolean = false
+    ) {
+        val resolvedTextColor = textColor ?: activity?.getProperTextColor() ?: return
+        if (!force && surface.appliedTextColor == resolvedTextColor) return
+        surface.fragment.onResume(resolvedTextColor)
+        surface.appliedTextColor = resolvedTextColor
     }
 
     class WorkspaceFilesInnerBinding : InnerBinding {

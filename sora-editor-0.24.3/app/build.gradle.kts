@@ -96,6 +96,7 @@ dependencies {
 
     implementation(project(":file-bridge"))
     implementation(project(":editor-sync-core"))
+    implementation(project(":session-sync-core"))
     implementation(project(":termux-shared"))
 
     // Lua language server

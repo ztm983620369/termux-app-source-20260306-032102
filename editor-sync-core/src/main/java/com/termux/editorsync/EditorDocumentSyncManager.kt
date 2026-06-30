@@ -28,7 +28,8 @@ class EditorDocumentSyncManager(
     private val scope: CoroutineScope,
     private val textSnapshotProvider: () -> String,
     private val sessionFileCoordinator: SessionFileCoordinator = SessionFileCoordinator.getInstance(),
-    private val beforeSaveGuard: ((EditorSyncTarget, EditorSaveTrigger, ByteArray) -> String?)? = null
+    private val beforeSaveGuard: ((EditorSyncTarget, EditorSaveTrigger, ByteArray) -> String?)? = null,
+    private val afterLocalPersist: ((EditorSyncTarget, EditorSaveTrigger, ByteArray) -> Unit)? = null
 ) {
 
     companion object {
@@ -108,6 +109,30 @@ class EditorDocumentSyncManager(
     fun hasUnsavedChanges(): Boolean = stateFlow.value.hasUnsavedChanges
 
     fun canSave(): Boolean = stateFlow.value.canSave
+
+    fun updateTargetMetadata(target: EditorSyncTarget) {
+        val active = currentTarget ?: return
+        if (active.localPath != target.localPath) return
+        currentTarget = target
+    }
+
+    suspend fun <T> runExclusiveExternalReload(block: suspend () -> T): T {
+        cancelQueuedSaves("document reloaded from disk")
+        publish(stateMachine.onExternalReloadStarted())
+        return try {
+            val result = saveMutex.withLock {
+                block()
+            }
+            publish(stateMachine.onExternalReloadFinished())
+            result
+        } catch (throwable: Throwable) {
+            publish(stateMachine.onExternalReloadFinished("${throwable::class.java.name}:${throwable.message ?: ""}"))
+            if (isAutoSaveEnabled() && stateFlow.value.hasUnsavedChanges) {
+                scheduleAutoSave()
+            }
+            throw throwable
+        }
+    }
 
     suspend fun saveNow(trigger: EditorSaveTrigger): EditorSaveResult {
         val deferred = CompletableDeferred<EditorSaveResult>()
@@ -208,6 +233,30 @@ class EditorDocumentSyncManager(
         debounceJob = scope.launch(Dispatchers.IO) {
             delay(DEFAULT_DEBOUNCE_MS)
             requestSave(EditorSaveTrigger.AUTO)
+        }
+    }
+
+    private fun cancelQueuedSaves(error: String) {
+        debounceJob?.cancel()
+        debounceJob = null
+        val targetPath = currentTarget?.localPath
+        synchronized(queueLock) {
+            pendingTrigger = null
+            val waiters = ArrayList(pendingWaiters)
+            pendingWaiters.clear()
+            for (waiter in waiters) {
+                waiter.complete(
+                    EditorSaveResult(
+                        ok = false,
+                        targetPath = targetPath,
+                        bytes = 0,
+                        elapsedMs = 0L,
+                        error = error,
+                        trigger = EditorSaveTrigger.MANUAL,
+                        remoteSynced = false
+                    )
+                )
+            }
         }
     }
 
@@ -358,6 +407,9 @@ class EditorDocumentSyncManager(
     private fun persist(target: EditorSyncTarget, payload: ByteArray, trigger: EditorSaveTrigger) {
         val shouldSyncDisk = trigger != EditorSaveTrigger.AUTO || !target.supportsRemoteSync()
         writeAtomic(File(target.localPath), payload, shouldSyncDisk)
+        runCatching {
+            afterLocalPersist?.invoke(target, trigger, payload)
+        }
         if (target.supportsRemoteSync()) {
             syncRemoteTarget(target, trigger)
         }

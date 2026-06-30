@@ -26,13 +26,15 @@ class WorkspaceTabTouchStateMachine(
         state = State.PRESSED
     }
 
-    fun onMove(x: Float, y: Float) {
-        if (state != State.PRESSED) return
+    fun onMove(x: Float, y: Float): Boolean {
+        if (state != State.PRESSED) return false
         val dx = x - downX
         val dy = y - downY
         if ((dx * dx) + (dy * dy) > moveThresholdPx * moveThresholdPx) {
             state = State.MOVED
+            return true
         }
+        return false
     }
 
     fun onLongPress(): Boolean {

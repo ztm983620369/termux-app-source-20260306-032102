@@ -39,6 +39,7 @@ dependencies {
     implementation(project(":workspace-shell"))
     implementation(project(":fossify-commons"))
     implementation(project(":file-bridge"))
+    implementation(project(":ecj-bridge-core"))
     implementation(project(":editor-sync-core"))
     implementation(project(":session-sync-core"))
     implementation("androidx.documentfile:documentfile:1.1.0")

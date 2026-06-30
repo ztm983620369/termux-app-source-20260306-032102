@@ -135,7 +135,8 @@ class DecompressActivity : SimpleActivity() {
             showHidden = config.showHidden,
             showFAB = true,
             canAddShowHiddenButton = true,
-            showFavoritesButton = true
+            showFavoritesButton = true,
+            startAtCurrentPath = true
         ) { destination ->
             handleSAFDialog(destination) {
                 if (it) {

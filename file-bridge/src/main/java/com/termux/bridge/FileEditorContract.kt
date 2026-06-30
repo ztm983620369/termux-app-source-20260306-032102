@@ -14,7 +14,10 @@ data class FileOpenRequest(
     val originPath: String? = null,
     val originDisplayPath: String? = null,
     val originModifiedMs: Long? = null,
-    val originSize: Long? = null
+    val originSize: Long? = null,
+    val originSha256: String? = null,
+    val originFingerprintLevel: String? = null,
+    val originFingerprintMethod: String? = null
 ) {
     companion object {
         const val ORIGIN_LOCAL = "local"
@@ -35,6 +38,9 @@ object FileEditorContract {
     private const val EXTRA_ORIGIN_DISPLAY_PATH = "com.termux.bridge.extra.ORIGIN_DISPLAY_PATH"
     private const val EXTRA_ORIGIN_MODIFIED_MS = "com.termux.bridge.extra.ORIGIN_MODIFIED_MS"
     private const val EXTRA_ORIGIN_SIZE = "com.termux.bridge.extra.ORIGIN_SIZE"
+    private const val EXTRA_ORIGIN_SHA256 = "com.termux.bridge.extra.ORIGIN_SHA256"
+    private const val EXTRA_ORIGIN_FINGERPRINT_LEVEL = "com.termux.bridge.extra.ORIGIN_FINGERPRINT_LEVEL"
+    private const val EXTRA_ORIGIN_FINGERPRINT_METHOD = "com.termux.bridge.extra.ORIGIN_FINGERPRINT_METHOD"
     private const val NULL_LONG_SENTINEL = Long.MIN_VALUE
 
     @JvmStatic
@@ -57,6 +63,9 @@ object FileEditorContract {
             putString(EXTRA_ORIGIN_DISPLAY_PATH, request.originDisplayPath)
             putLong(EXTRA_ORIGIN_MODIFIED_MS, request.originModifiedMs ?: NULL_LONG_SENTINEL)
             putLong(EXTRA_ORIGIN_SIZE, request.originSize ?: NULL_LONG_SENTINEL)
+            putString(EXTRA_ORIGIN_SHA256, request.originSha256)
+            putString(EXTRA_ORIGIN_FINGERPRINT_LEVEL, request.originFingerprintLevel)
+            putString(EXTRA_ORIGIN_FINGERPRINT_METHOD, request.originFingerprintMethod)
         }
     }
 
@@ -75,6 +84,9 @@ object FileEditorContract {
             .takeUnless { it == NULL_LONG_SENTINEL }
         val originSize = i.getLongExtra(EXTRA_ORIGIN_SIZE, NULL_LONG_SENTINEL)
             .takeUnless { it == NULL_LONG_SENTINEL }
+        val originSha256 = i.getStringExtra(EXTRA_ORIGIN_SHA256)
+        val originFingerprintLevel = i.getStringExtra(EXTRA_ORIGIN_FINGERPRINT_LEVEL)
+        val originFingerprintMethod = i.getStringExtra(EXTRA_ORIGIN_FINGERPRINT_METHOD)
         return FileOpenRequest(
             path = path,
             displayName = displayName,
@@ -85,7 +97,10 @@ object FileEditorContract {
             originPath = originPath,
             originDisplayPath = originDisplayPath,
             originModifiedMs = originModifiedMs,
-            originSize = originSize
+            originSize = originSize,
+            originSha256 = originSha256,
+            originFingerprintLevel = originFingerprintLevel,
+            originFingerprintMethod = originFingerprintMethod
         )
     }
 }

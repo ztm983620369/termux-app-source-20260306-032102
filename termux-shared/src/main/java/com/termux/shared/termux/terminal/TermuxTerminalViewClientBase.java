@@ -22,6 +22,10 @@ public class TermuxTerminalViewClientBase implements TerminalViewClient {
     }
 
     @Override
+    public void onTextInputTap(MotionEvent e) {
+    }
+
+    @Override
     public boolean shouldTerminalViewRequestFocusOnTap() {
         return true;
     }

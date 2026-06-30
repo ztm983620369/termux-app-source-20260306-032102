@@ -8,6 +8,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.jcraft.jsch.Channel;
+import com.jcraft.jsch.ChannelExec;
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.SftpATTRS;
@@ -16,6 +17,7 @@ import com.jcraft.jsch.SftpProgressMonitor;
 import com.termux.sshconnectioncore.ResolvedSshEndpoint;
 
 import java.io.File;
+import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -27,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -149,6 +152,193 @@ public final class SftpProtocolManager {
         VirtualTarget target = resolveVirtualTarget(context, path);
         if (target == null) return path == null ? "" : path;
         return "sftp://" + target.entry.displayName + target.remotePath;
+    }
+
+    @NonNull
+    public VirtualPathInfo describeVirtualPath(@NonNull Context context, @Nullable String path) {
+        VirtualTarget target = resolveVirtualTarget(context, path);
+        if (target == null) {
+            return VirtualPathInfo.fail("\u8def\u5f84\u4e0d\u662f\u6709\u6548\u7684 SFTP \u865a\u62df\u8def\u5f84\u3002");
+        }
+        return VirtualPathInfo.ok(
+            target.virtualRoot,
+            target.remotePath,
+            target.entry.displayName,
+            buildRemoteAuthorityLabel(target.entry)
+        );
+    }
+
+    public void invalidateVirtualDirectoryCache(@NonNull Context context, @Nullable String path) {
+        VirtualTarget target = resolveVirtualTarget(context, path);
+        if (target == null) return;
+        synchronized (mLock) {
+            clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(target.entry));
+        }
+    }
+
+    @NonNull
+    public LocalRealizationResult findReusableLocalForVirtualFile(@NonNull Context context, @Nullable String virtualFilePath) {
+        VirtualTarget target = resolveVirtualTarget(context, virtualFilePath);
+        if (target == null) {
+            return LocalRealizationResult.fail("不是有效的 SFTP 文件路径。");
+        }
+        VirtualLocalFileRegistry.Entry entry = VirtualLocalFileRegistry.read(
+            context,
+            target.virtualRoot + ("/".equals(target.remotePath) ? "" : target.remotePath),
+            VirtualLocalFileRegistry.KIND_DURABLE_DOWNLOAD
+        );
+        if (entry == null) {
+            return LocalRealizationResult.missing("没有可复用的本地文件。");
+        }
+        File registeredLocal = new File(entry.localPath);
+        if (!registeredLocal.exists() || !registeredLocal.isFile()) {
+            VirtualLocalFileRegistry.clear(context, entry.virtualPath, entry.kind);
+            return LocalRealizationResult.missing("本地文件已不存在，需要重新下载。");
+        }
+
+        try {
+            return withReconnectRetry(context, target.entry, channel -> {
+                SftpATTRS attrs = channel.stat(target.remotePath);
+                if (attrs == null || attrs.isDir()) {
+                    VirtualLocalFileRegistry.clear(context, entry.virtualPath, entry.kind);
+                    return LocalRealizationResult.stale("远程文件不可用或已变为目录。");
+                }
+                long remoteModifiedMs = attrsModifiedMs(attrs);
+                long remoteSize = Math.max(0L, attrs.getSize());
+                if (!VirtualLocalFileRegistry.isReusable(entry, remoteModifiedMs, remoteSize)) {
+                    return LocalRealizationResult.stale("远程文件已更新，需要重新下载。", remoteModifiedMs, remoteSize);
+                }
+                String remoteSha256 = computeRemoteSha256PreferNative(context, target.entry, channel, target.remotePath, null);
+                String localSha256 = computeLocalSha256(registeredLocal, null);
+                if (VirtualLocalFileRegistry.strongContentMatches(entry, remoteSha256, localSha256)) {
+                    return LocalRealizationResult.reusable(
+                        entry.localPath,
+                        remoteModifiedMs,
+                        remoteSize,
+                        remoteSha256,
+                        localSha256,
+                        VirtualLocalFileRegistry.LEVEL_STRONG_CONTENT,
+                        "remote-native-or-sftp-sha256"
+                    );
+                }
+                if (TextUtils.equals(remoteSha256, localSha256)) {
+                    VirtualLocalFileRegistry.register(
+                        context,
+                        entry.virtualPath,
+                        entry.localPath,
+                        entry.kind,
+                        entry.authorityKey,
+                        entry.remotePath,
+                        remoteModifiedMs,
+                        remoteSize,
+                        remoteSha256,
+                        "remote-native-or-sftp-sha256",
+                        VirtualLocalFileRegistry.LEVEL_STRONG_CONTENT,
+                        localSha256,
+                        VirtualLocalFileRegistry.METHOD_LOCAL_SHA256,
+                        VirtualLocalFileRegistry.LEVEL_STRONG_CONTENT
+                    );
+                    return LocalRealizationResult.reusable(
+                        entry.localPath,
+                        remoteModifiedMs,
+                        remoteSize,
+                        remoteSha256,
+                        localSha256,
+                        VirtualLocalFileRegistry.LEVEL_STRONG_CONTENT,
+                        "remote-native-or-sftp-sha256"
+                    );
+                }
+                return LocalRealizationResult.stale("远端或本地文件内容已变化，需要重新下载。", remoteModifiedMs, remoteSize);
+            });
+        } catch (Exception e) {
+            return LocalRealizationResult.fail("检查本地文件状态失败：" + classifyExceptionMessage(e));
+        }
+    }
+
+    @NonNull
+    public LocalRealizationResult registerDownloadedLocalForVirtualFile(@NonNull Context context,
+                                                                        @Nullable String virtualFilePath,
+                                                                        @Nullable String localPath) {
+        VirtualTarget target = resolveVirtualTarget(context, virtualFilePath);
+        if (target == null) {
+            return LocalRealizationResult.fail("不是有效的 SFTP 文件路径。");
+        }
+        if (TextUtils.isEmpty(localPath)) {
+            return LocalRealizationResult.fail("本地文件路径为空。");
+        }
+        File localFile = new File(localPath);
+        if (!localFile.exists() || !localFile.isFile()) {
+            return LocalRealizationResult.stale("本地文件不存在，无法登记。");
+        }
+
+        try {
+            return withReconnectRetry(context, target.entry, channel -> {
+                SftpATTRS attrs = channel.stat(target.remotePath);
+                if (attrs == null || attrs.isDir()) {
+                    return LocalRealizationResult.fail("远程文件不可用，无法登记本地副本。");
+                }
+                long remoteModifiedMs = attrsModifiedMs(attrs);
+                long remoteSize = Math.max(0L, attrs.getSize());
+                StrongFingerprint fingerprint = computeStrongFingerprint(context, target.entry, channel, target.remotePath, localFile);
+                VirtualLocalFileRegistry.Entry entry = VirtualLocalFileRegistry.register(
+                    context,
+                    target.virtualRoot + ("/".equals(target.remotePath) ? "" : target.remotePath),
+                    localFile.getAbsolutePath(),
+                    VirtualLocalFileRegistry.KIND_DURABLE_DOWNLOAD,
+                    FileRootResolver.sessionPathKey(target.entry),
+                    target.remotePath,
+                    remoteModifiedMs,
+                    remoteSize,
+                    fingerprint.remoteSha256,
+                    fingerprint.method,
+                    fingerprint.level,
+                    fingerprint.localSha256,
+                    VirtualLocalFileRegistry.METHOD_LOCAL_SHA256,
+                    fingerprint.level
+                );
+                return LocalRealizationResult.reusable(
+                    entry.localPath,
+                    remoteModifiedMs,
+                    remoteSize,
+                    fingerprint.remoteSha256,
+                    fingerprint.localSha256,
+                    fingerprint.level,
+                    fingerprint.method
+                );
+            });
+        } catch (Exception e) {
+            return LocalRealizationResult.fail("登记本地文件失败：" + classifyExceptionMessage(e));
+        }
+    }
+
+    @NonNull
+    public RemoteCommandResult executeRemoteCommand(@NonNull Context context,
+                                                    @Nullable String virtualAnchorPath,
+                                                    @NonNull String shellCommand,
+                                                    @Nullable RemoteCommandControl control) {
+        VirtualTarget target = resolveVirtualTarget(context, virtualAnchorPath);
+        if (target == null) {
+            return RemoteCommandResult.fail("\u8fdc\u7a0b\u6267\u884c\u5931\u8d25\uff1a\u76ee\u6807\u4e0d\u662f\u6709\u6548\u7684 SFTP \u8def\u5f84\u3002");
+        }
+        if (TextUtils.isEmpty(shellCommand)) {
+            return RemoteCommandResult.fail("\u8fdc\u7a0b\u6267\u884c\u5931\u8d25\uff1a\u547d\u4ee4\u4e3a\u7a7a\u3002");
+        }
+
+        try {
+            RemoteCommandResult result = withExecReconnectRetry(context, target.entry, shellCommand, control);
+            if (!result.success) {
+                return result;
+            }
+            synchronized (mLock) {
+                clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(target.entry));
+            }
+            return result;
+        } catch (OperationCanceledException e) {
+            return RemoteCommandResult.cancelled();
+        } catch (Exception e) {
+            clearSessionByEntry(target.entry);
+            return RemoteCommandResult.fail("\u8fdc\u7a0b\u6267\u884c\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
+        }
     }
 
     public void requestPrewarmSession(@NonNull Context context, @NonNull SessionEntry entry) {
@@ -275,13 +465,102 @@ public final class SftpProtocolManager {
                     throw new IllegalStateException("\u5f53\u524d\u8def\u5f84\u662f\u76ee\u5f55\uff0c\u65e0\u6cd5\u76f4\u63a5\u6253\u5f00\u4e3a\u6587\u4ef6\u3002");
                 }
 
-                try (OutputStream outputStream = new FileOutputStream(targetFile, false)) {
+                long remoteModifiedMs = attrsModifiedMs(attrs);
+                long remoteSize = Math.max(0L, attrs.getSize());
+                String virtualPath = target.virtualRoot + ("/".equals(target.remotePath) ? "" : target.remotePath);
+                VirtualLocalFileRegistry.Entry cached = VirtualLocalFileRegistry.read(
+                    context,
+                    virtualPath,
+                    VirtualLocalFileRegistry.KIND_MATERIALIZED_CACHE
+                );
+                if (VirtualLocalFileRegistry.isReusable(cached, remoteModifiedMs, remoteSize)) {
+                    File cachedFile = new File(cached.localPath);
+                    if (cachedFile.exists() && cachedFile.isFile()) {
+                        String remoteSha256 = computeRemoteSha256PreferNative(context, target.entry, channel, target.remotePath, null);
+                        String localSha256 = computeLocalSha256(cachedFile, null);
+                        if (VirtualLocalFileRegistry.strongContentMatches(cached, remoteSha256, localSha256)) {
+                            return MaterializeResult.ok(
+                                cached.localPath,
+                                remoteModifiedMs,
+                                remoteSize,
+                                remoteSha256,
+                                localSha256,
+                                true
+                            );
+                        }
+                        if (TextUtils.equals(remoteSha256, localSha256)) {
+                            VirtualLocalFileRegistry.register(
+                                context,
+                                virtualPath,
+                                cached.localPath,
+                                VirtualLocalFileRegistry.KIND_MATERIALIZED_CACHE,
+                                FileRootResolver.sessionPathKey(target.entry),
+                                target.remotePath,
+                                remoteModifiedMs,
+                                remoteSize,
+                                remoteSha256,
+                                "remote-native-or-sftp-sha256",
+                                VirtualLocalFileRegistry.LEVEL_STRONG_CONTENT,
+                                localSha256,
+                                VirtualLocalFileRegistry.METHOD_LOCAL_SHA256,
+                                VirtualLocalFileRegistry.LEVEL_STRONG_CONTENT
+                            );
+                            return MaterializeResult.ok(
+                                cached.localPath,
+                                remoteModifiedMs,
+                                remoteSize,
+                                remoteSha256,
+                                localSha256,
+                                true
+                            );
+                        }
+                    }
+                }
+
+                File tempFile = new File(targetFile.getAbsolutePath() + ".download-" + System.currentTimeMillis() + ".tmp");
+                try (OutputStream outputStream = new FileOutputStream(tempFile, false)) {
                     channel.get(target.remotePath, outputStream);
                 }
+                if (targetFile.exists() && !targetFile.delete()) {
+                    throw new IllegalStateException("\u65e0\u6cd5\u66ff\u6362\u65e7\u7684\u672c\u5730\u7f13\u5b58\u6587\u4ef6\u3002");
+                }
+                if (!tempFile.renameTo(targetFile)) {
+                    try (InputStream inputStream = new FileInputStream(tempFile);
+                         OutputStream outputStream = new FileOutputStream(targetFile, false)) {
+                        byte[] buffer = new byte[32 * 1024];
+                        int read;
+                        while ((read = inputStream.read(buffer)) != -1) {
+                            outputStream.write(buffer, 0, read);
+                        }
+                    } finally {
+                        //noinspection ResultOfMethodCallIgnored
+                        tempFile.delete();
+                    }
+                }
+                StrongFingerprint fingerprint = computeStrongFingerprint(context, target.entry, channel, target.remotePath, targetFile);
+                VirtualLocalFileRegistry.register(
+                    context,
+                    virtualPath,
+                    targetFile.getAbsolutePath(),
+                    VirtualLocalFileRegistry.KIND_MATERIALIZED_CACHE,
+                    FileRootResolver.sessionPathKey(target.entry),
+                    target.remotePath,
+                    remoteModifiedMs,
+                    remoteSize,
+                    fingerprint.remoteSha256,
+                    fingerprint.method,
+                    fingerprint.level,
+                    fingerprint.localSha256,
+                    VirtualLocalFileRegistry.METHOD_LOCAL_SHA256,
+                    fingerprint.level
+                );
                 return MaterializeResult.ok(
                     targetFile.getAbsolutePath(),
-                    attrsModifiedMs(attrs),
-                    Math.max(0L, attrs.getSize())
+                    remoteModifiedMs,
+                    remoteSize,
+                    fingerprint.remoteSha256,
+                    fingerprint.localSha256,
+                    false
                 );
             });
             if (materialized == null || TextUtils.isEmpty(materialized.localPath)) {
@@ -382,6 +661,370 @@ public final class SftpProtocolManager {
             clearSessionByEntry(target.entry);
             return DeleteResult.fail("\u5220\u9664\u5931\u8d25\uff1a" + classifyExceptionMessage(e));
         }
+    }
+
+    @NonNull
+    public RemoteDeleteResult deleteVirtualPaths(@NonNull Context context,
+                                                 @NonNull List<String> virtualPaths,
+                                                 @Nullable RemoteDeleteProgressListener listener,
+                                                 @Nullable RemoteDeleteControl control) {
+        long startedAt = System.currentTimeMillis();
+        int totalItems = virtualPaths.size();
+        ArrayList<RemoteDeleteItemResult> itemResults = new ArrayList<>();
+        LinkedHashMap<String, ArrayList<VirtualTarget>> groups = new LinkedHashMap<>();
+
+        emitRemoteDeleteProgress(listener, "planning", "\u6b63\u5728\u89c4\u5212", totalItems, itemResults, "", "", startedAt, "\u6b63\u5728\u89e3\u6790\u8fdc\u7aef\u8def\u5f84...");
+        for (String virtualPath : virtualPaths) {
+            if (isRemoteDeleteCancelled(control)) {
+                return RemoteDeleteResult.fromItems(totalItems, true, System.currentTimeMillis() - startedAt, itemResults);
+            }
+            VirtualTarget target = resolveVirtualTarget(context, virtualPath);
+            if (target == null) {
+                itemResults.add(RemoteDeleteItemResult.fail(
+                    virtualPath == null ? "" : virtualPath,
+                    "",
+                    displayNameForPath(virtualPath),
+                    false,
+                    false,
+                    false,
+                    "\u76ee\u6807\u4e0d\u662f\u6709\u6548\u7684 SFTP \u8def\u5f84"
+                ));
+                continue;
+            }
+            String clientKey = clientKeyForEntry(target.entry);
+            ArrayList<VirtualTarget> group = groups.get(clientKey);
+            if (group == null) {
+                group = new ArrayList<>();
+                groups.put(clientKey, group);
+            }
+            group.add(target);
+        }
+
+        try {
+            for (ArrayList<VirtualTarget> group : groups.values()) {
+                if (group == null || group.isEmpty()) continue;
+                if (isRemoteDeleteCancelled(control)) {
+                    return RemoteDeleteResult.fromItems(totalItems, true, System.currentTimeMillis() - startedAt, itemResults);
+                }
+                deleteVirtualTargetGroup(context, group, totalItems, itemResults, listener, control, startedAt);
+            }
+        } catch (OperationCanceledException e) {
+            return RemoteDeleteResult.fromItems(totalItems, true, System.currentTimeMillis() - startedAt, itemResults);
+        }
+
+        return RemoteDeleteResult.fromItems(totalItems, false, System.currentTimeMillis() - startedAt, itemResults);
+    }
+
+    private void deleteVirtualTargetGroup(@NonNull Context context,
+                                          @NonNull ArrayList<VirtualTarget> targets,
+                                          int totalItems,
+                                          @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                          @Nullable RemoteDeleteProgressListener listener,
+                                          @Nullable RemoteDeleteControl control,
+                                          long startedAt) {
+        SessionEntry entry = targets.get(0).entry;
+        ArrayList<RemoteDeletePlanner.ResolvedDeleteTarget> existingTargets = new ArrayList<>();
+        Map<String, VirtualTarget> targetByRemotePath = new HashMap<>();
+
+        for (VirtualTarget target : targets) {
+            if (isRemoteDeleteCancelled(control)) {
+                throw new OperationCanceledException();
+            }
+            String virtualPath = target.virtualRoot + ("/".equals(target.remotePath) ? "" : target.remotePath);
+            String displayName = topLevelNameForTarget(target);
+            String normalized = RemoteDeletePlanner.normalizeStrict(target.remotePath);
+            String rejectReason = RemoteDeletePlanner.rejectionReason(normalized, target.remotePath);
+            if (!TextUtils.isEmpty(rejectReason)) {
+                itemResults.add(RemoteDeleteItemResult.fail(virtualPath, normalized, displayName, false, false, false, rejectReason));
+                continue;
+            }
+            emitRemoteDeleteProgress(listener, "planning", "正在规划", totalItems, itemResults,
+                virtualPath, target.remotePath, startedAt, "正在检查 " + displayName);
+            try {
+                SftpATTRS attrs = withReconnectRetry(context, entry, channel -> channel.stat(target.remotePath));
+                boolean directory = attrs != null && attrs.isDir();
+                existingTargets.add(new RemoteDeletePlanner.ResolvedDeleteTarget(virtualPath, target.remotePath, displayName, directory));
+                targetByRemotePath.put(target.remotePath, target);
+            } catch (SftpException e) {
+                if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                    itemResults.add(RemoteDeleteItemResult.success(virtualPath, target.remotePath, displayName, false, true, false, false, "远端路径已不存在"));
+                } else {
+                    itemResults.add(RemoteDeleteItemResult.fail(virtualPath, target.remotePath, displayName, false, false, false,
+                        "检查远端路径失败：" + classifyExceptionMessage(e)));
+                }
+            } catch (Exception e) {
+                clearSessionByEntry(entry);
+                itemResults.add(RemoteDeleteItemResult.fail(virtualPath, target.remotePath, displayName, false, false, false,
+                    "检查远端路径失败：" + classifyExceptionMessage(e)));
+            }
+        }
+
+        RemoteDeletePlanner.DeletePlan plan = RemoteDeletePlanner.build(existingTargets);
+        for (RemoteDeletePlanner.DeletePlanItem item : plan.rejectedItems) {
+            itemResults.add(RemoteDeleteItemResult.fail(item.virtualPath, item.remotePath, item.displayName, item.directory, false, false, item.messageCn));
+        }
+        for (RemoteDeletePlanner.DeletePlanItem item : plan.skippedItems) {
+            itemResults.add(RemoteDeleteItemResult.skipped(item.virtualPath, item.remotePath, item.displayName, item.directory, item.messageCn));
+        }
+        if (plan.executableItems.isEmpty()) {
+            return;
+        }
+
+        if (plan.preferExec) {
+            deletePlanPreferExec(context, entry, plan.executableItems, targetByRemotePath, totalItems, itemResults, listener, control, startedAt);
+        } else {
+            deletePlanViaSftp(context, entry, plan.executableItems, targetByRemotePath, totalItems, itemResults, listener, control, startedAt, "deleting", "正在删除");
+        }
+    }
+
+    private void deletePlanPreferExec(@NonNull Context context,
+                                      @NonNull SessionEntry entry,
+                                      @NonNull ArrayList<RemoteDeletePlanner.DeletePlanItem> items,
+                                      @NonNull Map<String, VirtualTarget> targetByRemotePath,
+                                      int totalItems,
+                                      @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                      @Nullable RemoteDeleteProgressListener listener,
+                                      @Nullable RemoteDeleteControl control,
+                                      long startedAt) {
+        boolean execFailed = false;
+        ArrayList<String> commands = new ArrayList<>();
+        commands.addAll(RemoteDeletePlanner.buildRmCommands(items, false));
+        for (String command : commands) {
+            if (isRemoteDeleteCancelled(control)) {
+                throw new OperationCanceledException();
+            }
+            emitRemoteDeleteProgress(listener, "deleting", "正在删除", totalItems, itemResults,
+                "", "", startedAt, "正在通过远端原生命令删除文件...");
+            try {
+                RemoteCommandResult result = withExecReconnectRetry(context, entry, command, control == null ? null : control::isCancelled);
+                if (!result.success) {
+                    execFailed = true;
+                    break;
+                }
+            } catch (OperationCanceledException e) {
+                throw e;
+            } catch (Exception e) {
+                execFailed = true;
+                clearSessionByEntry(entry);
+                break;
+            }
+        }
+
+        for (RemoteDeletePlanner.DeletePlanItem item : items) {
+            if (!item.directory) continue;
+            if (isRemoteDeleteCancelled(control)) {
+                throw new OperationCanceledException();
+            }
+            emitRemoteDeleteProgress(listener, "deleting", "正在删除", totalItems, itemResults,
+                item.virtualPath, item.remotePath, startedAt, "正在实时删除目录：" + item.displayName);
+            try {
+                RemoteCommandResult result = deleteDirectoryViaFindWithProgress(context, entry, item, totalItems, itemResults, listener, control, startedAt);
+                if (!result.success) {
+                    execFailed = true;
+                }
+            } catch (OperationCanceledException e) {
+                throw e;
+            } catch (Exception e) {
+                execFailed = true;
+                clearSessionByEntry(entry);
+            }
+        }
+
+        ArrayList<RemoteDeletePlanner.DeletePlanItem> remaining = new ArrayList<>();
+        for (RemoteDeletePlanner.DeletePlanItem item : items) {
+            if (isRemoteDeleteCancelled(control)) {
+                throw new OperationCanceledException();
+            }
+            emitRemoteDeleteProgress(listener, "verifying", "正在校验", totalItems, itemResults,
+                item.virtualPath, item.remotePath, startedAt, "正在确认删除结果：" + item.displayName);
+            try {
+                boolean missing = withReconnectRetry(context, entry, channel -> !remotePathExists(channel, item.remotePath));
+                if (missing) {
+                    markRemoteDeleteSuccess(context, item, targetByRemotePath, itemResults, true, false, "删除完成");
+                } else {
+                    remaining.add(item);
+                }
+            } catch (Exception e) {
+                remaining.add(item);
+            }
+        }
+
+        if (execFailed || !remaining.isEmpty()) {
+            deletePlanViaSftp(context, entry, remaining, targetByRemotePath, totalItems, itemResults, listener, control, startedAt, "fallback", "正在回退");
+        }
+    }
+
+    @NonNull
+    private RemoteCommandResult deleteDirectoryViaFindWithProgress(@NonNull Context context,
+                                                                   @NonNull SessionEntry entry,
+                                                                   @NonNull RemoteDeletePlanner.DeletePlanItem item,
+                                                                   int totalItems,
+                                                                   @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                                                   @Nullable RemoteDeleteProgressListener listener,
+                                                                   @Nullable RemoteDeleteControl control,
+                                                                   long startedAt) throws Exception {
+        String quotedPath = RemoteDeletePlanner.shellQuoteSingle(item.remotePath);
+        String command = "p=" + quotedPath + "; "
+            + "printf '__FM_DELETE_TOTAL:0\\n'; "
+            + "find \"$p\" -depth -print 2>/dev/null | ("
+            + "n=0; "
+            + "while IFS= read -r x; do "
+            + "rm -rf -- \"$x\" || exit 23; "
+            + "n=$((n+1)); "
+            + "if [ $((n % 25)) -eq 0 ]; then printf '__FM_DELETE_PROGRESS:%s/0\\n' \"$n\"; fi; "
+            + "done; "
+            + "printf '__FM_DELETE_PROGRESS:%s/0\\n' \"$n\"; "
+            + "exit 0)";
+        final long[] entryTotal = new long[] {0L};
+        final long[] entryDone = new long[] {0L};
+        return withExecStreamingReconnectRetry(context, entry, command, control == null ? null : control::isCancelled, line -> {
+            if (line.startsWith("__FM_DELETE_TOTAL:")) {
+                entryTotal[0] = parseLongSafely(line.substring("__FM_DELETE_TOTAL:".length()), 0L);
+                emitRemoteDeleteProgress(listener, "deleting", "正在删除", totalItems, itemResults,
+                    item.virtualPath, item.remotePath, startedAt,
+                    "正在扫描目录：" + item.displayName + "，共 " + entryTotal[0] + " 项",
+                    entryDone[0], entryTotal[0]);
+            } else if (line.startsWith("__FM_DELETE_PROGRESS:")) {
+                String raw = line.substring("__FM_DELETE_PROGRESS:".length());
+                int slash = raw.indexOf('/');
+                long done = slash >= 0 ? parseLongSafely(raw.substring(0, slash), entryDone[0]) : parseLongSafely(raw, entryDone[0]);
+                long total = slash >= 0 ? parseLongSafely(raw.substring(slash + 1), entryTotal[0]) : entryTotal[0];
+                entryDone[0] = Math.max(entryDone[0], done);
+                entryTotal[0] = Math.max(entryTotal[0], total);
+                String countText = entryTotal[0] > 0L ? entryDone[0] + "/" + entryTotal[0] : entryDone[0] + " 项";
+                emitRemoteDeleteProgress(listener, "deleting", "正在删除", totalItems, itemResults,
+                    item.virtualPath, item.remotePath, startedAt,
+                    "正在删除目录条目：" + countText + "（" + item.displayName + "）",
+                    entryDone[0], entryTotal[0]);
+            }
+        });
+    }
+
+    private void deletePlanViaSftp(@NonNull Context context,
+                                   @NonNull SessionEntry entry,
+                                   @NonNull ArrayList<RemoteDeletePlanner.DeletePlanItem> items,
+                                   @NonNull Map<String, VirtualTarget> targetByRemotePath,
+                                   int totalItems,
+                                   @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                   @Nullable RemoteDeleteProgressListener listener,
+                                   @Nullable RemoteDeleteControl control,
+                                   long startedAt,
+                                   @NonNull String stage,
+                                   @NonNull String stageLabelCn) {
+        for (RemoteDeletePlanner.DeletePlanItem item : items) {
+            if (isRemoteDeleteCancelled(control)) {
+                throw new OperationCanceledException();
+            }
+            emitRemoteDeleteProgress(listener, stage, stageLabelCn, totalItems, itemResults,
+                item.virtualPath, item.remotePath, startedAt, stageLabelCn + "：" + item.displayName);
+            try {
+                withReconnectRetry(context, entry, channel -> {
+                    deleteRemotePathRecursive(channel, item.remotePath, control);
+                    return null;
+                });
+                boolean missing = withReconnectRetry(context, entry, channel -> !remotePathExists(channel, item.remotePath));
+                if (missing) {
+                    markRemoteDeleteSuccess(context, item, targetByRemotePath, itemResults, false, true, "删除完成");
+                } else {
+                    itemResults.add(RemoteDeleteItemResult.fail(item.virtualPath, item.remotePath, item.displayName,
+                        item.directory, false, true, "删除后校验失败：远端路径仍存在"));
+                }
+            } catch (OperationCanceledException e) {
+                throw e;
+            } catch (Exception e) {
+                clearSessionByEntry(entry);
+                itemResults.add(RemoteDeleteItemResult.fail(item.virtualPath, item.remotePath, item.displayName,
+                    item.directory, false, true, "删除失败：" + classifyExceptionMessage(e)));
+            }
+        }
+    }
+
+    private void markRemoteDeleteSuccess(@NonNull Context context,
+                                         @NonNull RemoteDeletePlanner.DeletePlanItem item,
+                                         @NonNull Map<String, VirtualTarget> targetByRemotePath,
+                                         @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                         boolean usedExec,
+                                         boolean usedSftpFallback,
+                                         @NonNull String messageCn) {
+        VirtualTarget target = targetByRemotePath.get(item.remotePath);
+        if (target != null) {
+            synchronized (mLock) {
+                clearDirectoryCacheByClientKeyLocked(clientKeyForEntry(target.entry));
+            }
+            cleanupVirtualArtifacts(context, target);
+        }
+        itemResults.add(RemoteDeleteItemResult.success(item.virtualPath, item.remotePath, item.displayName,
+            item.directory, false, usedExec, usedSftpFallback, messageCn));
+    }
+
+    private static void emitRemoteDeleteProgress(@Nullable RemoteDeleteProgressListener listener,
+                                                 @NonNull String stage,
+                                                 @NonNull String stageLabelCn,
+                                                 int totalItems,
+                                                 @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                                 @Nullable String currentVirtualPath,
+                                                 @Nullable String currentRemotePath,
+                                                 long startedAt,
+                                                 @NonNull String messageCn) {
+        emitRemoteDeleteProgress(listener, stage, stageLabelCn, totalItems, itemResults,
+            currentVirtualPath, currentRemotePath, startedAt, messageCn, 0L, 0L);
+    }
+
+    private static void emitRemoteDeleteProgress(@Nullable RemoteDeleteProgressListener listener,
+                                                 @NonNull String stage,
+                                                 @NonNull String stageLabelCn,
+                                                 int totalItems,
+                                                 @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                                 @Nullable String currentVirtualPath,
+                                                 @Nullable String currentRemotePath,
+                                                 long startedAt,
+                                                 @NonNull String messageCn,
+                                                 long currentEntryDone,
+                                                 long currentEntryTotal) {
+        if (listener == null) return;
+        int success = 0;
+        int failed = 0;
+        int skipped = 0;
+        for (RemoteDeleteItemResult item : itemResults) {
+            if (item == null) continue;
+            if (item.skipped) skipped++;
+            else if (item.success) success++;
+            else failed++;
+        }
+        listener.onProgress(new RemoteDeleteProgress(
+            stage,
+            stageLabelCn,
+            Math.max(0, totalItems),
+            success + failed + skipped,
+            success,
+            failed,
+            skipped,
+            currentVirtualPath == null ? "" : currentVirtualPath,
+            currentRemotePath == null ? "" : currentRemotePath,
+            displayNameForPath(TextUtils.isEmpty(currentRemotePath) ? currentVirtualPath : currentRemotePath),
+            Math.max(0L, System.currentTimeMillis() - startedAt),
+            messageCn,
+            Math.max(0L, currentEntryDone),
+            Math.max(0L, currentEntryTotal)
+        ));
+    }
+
+    private static long parseLongSafely(@Nullable String raw, long fallback) {
+        if (TextUtils.isEmpty(raw)) return fallback;
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
+    @NonNull
+    private static String displayNameForPath(@Nullable String path) {
+        if (TextUtils.isEmpty(path)) return "";
+        String value = path.trim();
+        int slash = value.lastIndexOf('/');
+        String name = slash >= 0 ? value.substring(slash + 1) : value;
+        return TextUtils.isEmpty(name) ? value : name;
     }
 
     @NonNull
@@ -1006,12 +1649,30 @@ public final class SftpProtocolManager {
                                                      @NonNull String targetVirtualPath,
                                                      long expectedRemoteModifiedMs,
                                                      long expectedRemoteSize) {
+        return uploadLocalFileToVirtualPath(
+            context,
+            localFilePath,
+            targetVirtualPath,
+            expectedRemoteModifiedMs,
+            expectedRemoteSize,
+            ""
+        );
+    }
+
+    @NonNull
+    public UploadResult uploadLocalFileToVirtualPath(@NonNull Context context,
+                                                     @NonNull String localFilePath,
+                                                     @NonNull String targetVirtualPath,
+                                                     long expectedRemoteModifiedMs,
+                                                     long expectedRemoteSize,
+                                                     @Nullable String expectedRemoteSha256) {
         return uploadLocalFileToVirtualPathInternal(
             context,
             localFilePath,
             targetVirtualPath,
             expectedRemoteModifiedMs,
             expectedRemoteSize,
+            expectedRemoteSha256,
             true
         );
     }
@@ -1029,12 +1690,30 @@ public final class SftpProtocolManager {
                                                          @NonNull String targetVirtualPath,
                                                          long expectedRemoteModifiedMs,
                                                          long expectedRemoteSize) {
+        return uploadLocalFileToVirtualPathFast(
+            context,
+            localFilePath,
+            targetVirtualPath,
+            expectedRemoteModifiedMs,
+            expectedRemoteSize,
+            ""
+        );
+    }
+
+    @NonNull
+    public UploadResult uploadLocalFileToVirtualPathFast(@NonNull Context context,
+                                                         @NonNull String localFilePath,
+                                                         @NonNull String targetVirtualPath,
+                                                         long expectedRemoteModifiedMs,
+                                                         long expectedRemoteSize,
+                                                         @Nullable String expectedRemoteSha256) {
         return uploadLocalFileToVirtualPathInternal(
             context,
             localFilePath,
             targetVirtualPath,
             expectedRemoteModifiedMs,
             expectedRemoteSize,
+            expectedRemoteSha256,
             false
         );
     }
@@ -1045,6 +1724,7 @@ public final class SftpProtocolManager {
                                                               @NonNull String targetVirtualPath,
                                                               long expectedRemoteModifiedMs,
                                                               long expectedRemoteSize,
+                                                              @Nullable String expectedRemoteSha256,
                                                               boolean verifyDigest) {
         if (TextUtils.isEmpty(localFilePath)) {
             return UploadResult.fail("\u8986\u76d6\u5931\u8d25\uff1a\u672c\u5730\u6587\u4ef6\u8def\u5f84\u4e3a\u7a7a\u3002");
@@ -2318,6 +2998,13 @@ public final class SftpProtocolManager {
 
     private static void deleteRemotePathRecursive(@NonNull ChannelSftp channel,
                                                   @NonNull String remotePath) throws Exception {
+        deleteRemotePathRecursive(channel, remotePath, null);
+    }
+
+    private static void deleteRemotePathRecursive(@NonNull ChannelSftp channel,
+                                                  @NonNull String remotePath,
+                                                  @Nullable RemoteDeleteControl control) throws Exception {
+        if (isRemoteDeleteCancelled(control)) throw new OperationCanceledException();
         String normalized = normalizeRemotePath(remotePath);
         SftpATTRS attrs;
         try {
@@ -2330,6 +3017,7 @@ public final class SftpProtocolManager {
         }
         if (attrs == null) return;
 
+        if (isRemoteDeleteCancelled(control)) throw new OperationCanceledException();
         if (!attrs.isDir()) {
             deleteRemoteFileIfExists(channel, normalized);
             return;
@@ -2337,13 +3025,15 @@ public final class SftpProtocolManager {
 
         Vector<?> rows = channel.ls(normalized);
         for (Object row : rows) {
+            if (isRemoteDeleteCancelled(control)) throw new OperationCanceledException();
             if (!(row instanceof ChannelSftp.LsEntry)) continue;
             ChannelSftp.LsEntry item = (ChannelSftp.LsEntry) row;
             String name = item.getFilename();
             if (TextUtils.isEmpty(name) || ".".equals(name) || "..".equals(name)) continue;
-            deleteRemotePathRecursive(channel, joinRemotePath(normalized, name));
+            deleteRemotePathRecursive(channel, joinRemotePath(normalized, name), control);
         }
 
+        if (isRemoteDeleteCancelled(control)) throw new OperationCanceledException();
         try {
             channel.rmdir(normalized);
         } catch (SftpException e) {
@@ -2546,6 +3236,62 @@ public final class SftpProtocolManager {
     }
 
     @NonNull
+    private String computeRemoteSha256PreferNative(@NonNull Context context,
+                                                   @NonNull SessionEntry entry,
+                                                   @NonNull ChannelSftp channel,
+                                                   @NonNull String remotePath,
+                                                   @Nullable CancelProbe cancelProbe) throws Exception {
+        try {
+            String nativeDigest = computeRemoteSha256ViaNativeCommand(context, entry, remotePath, cancelProbe);
+            if (!TextUtils.isEmpty(nativeDigest)) {
+                return nativeDigest;
+            }
+        } catch (OperationCanceledException e) {
+            throw e;
+        } catch (Exception ignored) {
+        }
+        return computeRemoteSha256(channel, remotePath, cancelProbe);
+    }
+
+    @NonNull
+    private String computeRemoteSha256ViaNativeCommand(@NonNull Context context,
+                                                       @NonNull SessionEntry entry,
+                                                       @NonNull String remotePath,
+                                                       @Nullable CancelProbe cancelProbe) throws Exception {
+        String quoted = shellQuoteSingle(normalizeRemotePath(remotePath));
+        String[] commands = new String[] {
+            "sha256sum -- " + quoted,
+            "shasum -a 256 -- " + quoted,
+            "openssl dgst -sha256 -r -- " + quoted,
+            "openssl dgst -sha256 -- " + quoted
+        };
+        for (String command : commands) {
+            if (cancelProbe != null && cancelProbe.isCancelled()) {
+                throw new OperationCanceledException();
+            }
+            RemoteCommandResult result;
+            try {
+                result = withExecReconnectRetry(context, entry, command, cancelProbe == null ? null : cancelProbe::isCancelled);
+            } catch (OperationCanceledException e) {
+                throw e;
+            } catch (Exception ignored) {
+                continue;
+            }
+            if (result.exitCode == 126 || result.exitCode == 127) {
+                continue;
+            }
+            if (!result.success) {
+                continue;
+            }
+            String digest = extractSha256Hex(result.stdout);
+            if (!TextUtils.isEmpty(digest)) {
+                return digest;
+            }
+        }
+        return "";
+    }
+
+    @NonNull
     private static String computeRemoteSha256(@NonNull ChannelSftp channel,
                                               @NonNull String remotePath,
                                               @Nullable CancelProbe cancelProbe) throws Exception {
@@ -2563,6 +3309,55 @@ public final class SftpProtocolManager {
             }
         }
         return toHex(digest.digest());
+    }
+
+    @NonNull
+    private StrongFingerprint computeStrongFingerprint(@NonNull Context context,
+                                                       @NonNull SessionEntry entry,
+                                                       @NonNull ChannelSftp channel,
+                                                       @NonNull String remotePath,
+                                                       @NonNull File localFile) throws Exception {
+        String remoteSha256 = computeRemoteSha256PreferNative(context, entry, channel, remotePath, null);
+        String localSha256 = computeLocalSha256(localFile, null);
+        if (TextUtils.isEmpty(remoteSha256) || TextUtils.isEmpty(localSha256)) {
+            throw new IllegalStateException("无法计算文件 SHA-256 指纹。");
+        }
+        if (!TextUtils.equals(remoteSha256, localSha256)) {
+            throw new IllegalStateException("远端和本地 SHA-256 不一致。");
+        }
+        return new StrongFingerprint(
+            remoteSha256,
+            localSha256,
+            VirtualLocalFileRegistry.LEVEL_STRONG_CONTENT,
+            "remote-native-or-sftp-sha256"
+        );
+    }
+
+    @NonNull
+    private static String extractSha256Hex(@Nullable String raw) {
+        if (TextUtils.isEmpty(raw)) return "";
+        String value = raw.trim().toLowerCase(Locale.US);
+        int length = value.length();
+        for (int start = 0; start + 64 <= length; start++) {
+            boolean ok = true;
+            for (int i = 0; i < 64; i++) {
+                char ch = value.charAt(start + i);
+                boolean hex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+                if (!hex) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                return value.substring(start, start + 64);
+            }
+        }
+        return "";
+    }
+
+    @NonNull
+    private static String shellQuoteSingle(@NonNull String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
     }
 
     @NonNull
@@ -2724,6 +3519,24 @@ public final class SftpProtocolManager {
     }
 
     private static boolean isCancelled(@Nullable RemoteTransferControl control) {
+        if (control == null) return false;
+        try {
+            return control.isCancelled();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isRemoteCommandCancelled(@Nullable RemoteCommandControl control) {
+        if (control == null) return false;
+        try {
+            return control.isCancelled();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isRemoteDeleteCancelled(@Nullable RemoteDeleteControl control) {
         if (control == null) return false;
         try {
             return control.isCancelled();
@@ -3210,6 +4023,250 @@ public final class SftpProtocolManager {
         throw lastError == null ? new IllegalStateException("SFTP operation failed") : lastError;
     }
 
+    @NonNull
+    private RemoteCommandResult withExecReconnectRetry(@NonNull Context context,
+                                                       @NonNull SessionEntry entry,
+                                                       @NonNull String shellCommand,
+                                                       @Nullable RemoteCommandControl control) throws Exception {
+        Exception lastError = null;
+        int maxAttempts = RECOVERABLE_RETRY_COUNT + 1;
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            if (isRemoteCommandCancelled(control)) {
+                throw new OperationCanceledException();
+            }
+            ClientHolder holder = ensureClient(context, entry);
+            ChannelExec channel = null;
+            boolean channelBroken = false;
+            try {
+                channel = holder.openExecChannel(shellCommand);
+                RemoteCommandResult result = readExecChannel(channel, control);
+                if (result.exitCode == 127 || result.exitCode == 126) {
+                    return result;
+                }
+                if (!result.success && attempt < maxAttempts - 1 && isRecoverableRemoteCommandResult(result)) {
+                    channelBroken = true;
+                    clearSessionByEntry(entry);
+                    sleepQuietly(120L * (attempt + 1));
+                    continue;
+                }
+                return result;
+            } catch (Exception e) {
+                lastError = e;
+                channelBroken = true;
+                if (e instanceof OperationCanceledException) {
+                    throw e;
+                }
+                if (attempt >= maxAttempts - 1 || !isRecoverableTransportException(e)) {
+                    throw e;
+                }
+                clearSessionByEntry(entry);
+                sleepQuietly(120L * (attempt + 1));
+            } finally {
+                holder.closeExecChannel(channel, channelBroken);
+            }
+        }
+        throw lastError == null ? new IllegalStateException("SSH exec operation failed") : lastError;
+    }
+
+    @NonNull
+    private RemoteCommandResult withExecStreamingReconnectRetry(@NonNull Context context,
+                                                                @NonNull SessionEntry entry,
+                                                                @NonNull String shellCommand,
+                                                                @Nullable RemoteCommandControl control,
+                                                                @Nullable ExecOutputLineListener lineListener) throws Exception {
+        Exception lastError = null;
+        int maxAttempts = RECOVERABLE_RETRY_COUNT + 1;
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            if (isRemoteCommandCancelled(control)) {
+                throw new OperationCanceledException();
+            }
+            ClientHolder holder = ensureClient(context, entry);
+            ChannelExec channel = null;
+            boolean channelBroken = false;
+            try {
+                channel = holder.openExecChannel(shellCommand);
+                RemoteCommandResult result = readExecChannel(channel, control, lineListener);
+                if (result.exitCode == 127 || result.exitCode == 126) {
+                    return result;
+                }
+                if (!result.success && attempt < maxAttempts - 1 && isRecoverableRemoteCommandResult(result)) {
+                    channelBroken = true;
+                    clearSessionByEntry(entry);
+                    sleepQuietly(120L * (attempt + 1));
+                    continue;
+                }
+                return result;
+            } catch (Exception e) {
+                lastError = e;
+                channelBroken = true;
+                if (e instanceof OperationCanceledException) {
+                    throw e;
+                }
+                if (attempt >= maxAttempts - 1 || !isRecoverableTransportException(e)) {
+                    throw e;
+                }
+                clearSessionByEntry(entry);
+                sleepQuietly(120L * (attempt + 1));
+            } finally {
+                holder.closeExecChannel(channel, channelBroken);
+            }
+        }
+        throw lastError == null ? new IllegalStateException("SSH exec operation failed") : lastError;
+    }
+
+    @NonNull
+    private static RemoteCommandResult readExecChannel(@NonNull ChannelExec channel,
+                                                       @Nullable RemoteCommandControl control) throws Exception {
+        return readExecChannel(channel, control, null);
+    }
+
+    @NonNull
+    private static RemoteCommandResult readExecChannel(@NonNull ChannelExec channel,
+                                                       @Nullable RemoteCommandControl control,
+                                                       @Nullable ExecOutputLineListener lineListener) throws Exception {
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        byte[] outBuffer = new byte[16 * 1024];
+        byte[] errBuffer = new byte[16 * 1024];
+        InputStream out = channel.getInputStream();
+        InputStream err = channel.getErrStream();
+        StringBuilder stdoutLineBuffer = new StringBuilder();
+
+        while (true) {
+            if (isRemoteCommandCancelled(control)) {
+                try {
+                    channel.disconnect();
+                } catch (Throwable ignored) {
+                }
+                throw new OperationCanceledException();
+            }
+
+            boolean readAny = false;
+            while (out.available() > 0) {
+                int read = out.read(outBuffer, 0, Math.min(out.available(), outBuffer.length));
+                if (read < 0) break;
+                if (read > 0) {
+                    stdout.write(outBuffer, 0, read);
+                    dispatchExecOutputLines(outBuffer, read, stdoutLineBuffer, lineListener);
+                    readAny = true;
+                }
+            }
+            while (err.available() > 0) {
+                int read = err.read(errBuffer, 0, Math.min(err.available(), errBuffer.length));
+                if (read < 0) break;
+                if (read > 0) {
+                    stderr.write(errBuffer, 0, read);
+                    readAny = true;
+                }
+            }
+
+            if (channel.isClosed()) {
+                drainAvailable(out, stdout, outBuffer, stdoutLineBuffer, lineListener);
+                drainAvailable(err, stderr, errBuffer);
+                int exitCode = channel.getExitStatus();
+                flushExecOutputLine(stdoutLineBuffer, lineListener);
+                String stdoutText = stdout.toString(StandardCharsets.UTF_8.name());
+                String stderrText = stderr.toString(StandardCharsets.UTF_8.name());
+                if (exitCode == 0) {
+                    return RemoteCommandResult.ok(exitCode, stdoutText, stderrText);
+                }
+                return RemoteCommandResult.fail(exitCode, stdoutText, stderrText,
+                    buildRemoteCommandFailureMessage(exitCode, stdoutText, stderrText));
+            }
+
+            if (!readAny) {
+                try {
+                    Thread.sleep(80L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new OperationCanceledException();
+                }
+            }
+        }
+    }
+
+    private static void drainAvailable(@NonNull InputStream input,
+                                       @NonNull ByteArrayOutputStream output,
+                                       @NonNull byte[] buffer) throws Exception {
+        drainAvailable(input, output, buffer, null, null);
+    }
+
+    private static void drainAvailable(@NonNull InputStream input,
+                                       @NonNull ByteArrayOutputStream output,
+                                       @NonNull byte[] buffer,
+                                       @Nullable StringBuilder lineBuffer,
+                                       @Nullable ExecOutputLineListener lineListener) throws Exception {
+        while (input.available() > 0) {
+            int read = input.read(buffer, 0, Math.min(input.available(), buffer.length));
+            if (read < 0) return;
+            if (read > 0) {
+                output.write(buffer, 0, read);
+                dispatchExecOutputLines(buffer, read, lineBuffer, lineListener);
+            }
+        }
+    }
+
+    private static void dispatchExecOutputLines(@NonNull byte[] buffer,
+                                                int length,
+                                                @Nullable StringBuilder lineBuffer,
+                                                @Nullable ExecOutputLineListener lineListener) {
+        if (lineBuffer == null || lineListener == null || length <= 0) return;
+        String chunk = new String(buffer, 0, length, StandardCharsets.UTF_8);
+        for (int i = 0; i < chunk.length(); i++) {
+            char ch = chunk.charAt(i);
+            if (ch == '\n') {
+                String line = lineBuffer.toString().trim();
+                lineBuffer.setLength(0);
+                if (!TextUtils.isEmpty(line)) lineListener.onLine(line);
+            } else if (ch != '\r') {
+                lineBuffer.append(ch);
+            }
+        }
+    }
+
+    private static void flushExecOutputLine(@Nullable StringBuilder lineBuffer,
+                                            @Nullable ExecOutputLineListener lineListener) {
+        if (lineBuffer == null || lineListener == null || lineBuffer.length() == 0) return;
+        String line = lineBuffer.toString().trim();
+        lineBuffer.setLength(0);
+        if (!TextUtils.isEmpty(line)) lineListener.onLine(line);
+    }
+
+    @NonNull
+    private static String buildRemoteCommandFailureMessage(int exitCode,
+                                                           @Nullable String stdout,
+                                                           @Nullable String stderr) {
+        String details = stderr == null ? "" : stderr.trim();
+        if (TextUtils.isEmpty(details)) {
+            details = stdout == null ? "" : stdout.trim();
+        }
+        if (TextUtils.isEmpty(details)) {
+            details = "\u8fdc\u7a0b\u547d\u4ee4\u9000\u51fa\u7801 " + exitCode;
+        }
+        if (details.length() > 800) {
+            details = details.substring(0, 800).trim();
+        }
+        return "\u8fdc\u7a0b\u6267\u884c\u5931\u8d25\uff1a" + details;
+    }
+
+    private static boolean isRecoverableRemoteCommandResult(@NonNull RemoteCommandResult result) {
+        String message = (result.stderr + "\n" + result.stdout + "\n" + result.messageCn).toLowerCase(Locale.ROOT);
+        return message.contains("connection reset")
+            || message.contains("broken pipe")
+            || message.contains("connection closed")
+            || message.contains("session is down")
+            || message.contains("channel is not opened")
+            || message.contains("socket");
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(Math.max(0L, millis));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private void cleanupPendingRemoteTempPaths(@NonNull Context context,
                                                @NonNull SessionEntry entry,
                                                @NonNull ClientHolder holder) {
@@ -3436,6 +4493,61 @@ public final class SftpProtocolManager {
         }
         return ParsedTarget.valid(host, user, port <= 0 ? 22 : port, password, identity);
     }
+
+    @NonNull
+    private static String buildRemoteAuthorityLabel(@NonNull SessionEntry entry) {
+        ResolvedSshEndpoint endpoint = SessionEntrySshEndpointResolver.resolve(entry);
+        if (endpoint != null) {
+            String label = buildRemoteAuthorityLabel(endpoint.user, endpoint.hostIdentity, endpoint.port);
+            if (!label.isEmpty()) return label;
+            label = buildRemoteAuthorityLabel(endpoint.user, endpoint.host, endpoint.port);
+            if (!label.isEmpty()) return label;
+        }
+
+        ParsedTarget parsed = parseSshCommand(entry.sshCommand);
+        if (parsed.valid) {
+            String label = buildRemoteAuthorityLabel(parsed.user, parsed.host, parsed.port);
+            if (!label.isEmpty()) return label;
+        }
+
+        return sanitizeRemoteDisplayName(entry.displayName);
+    }
+
+    @NonNull
+    private static String buildRemoteAuthorityLabel(@Nullable String user, @Nullable String host, int port) {
+        String normalizedHost = host == null ? "" : host.trim();
+        if (normalizedHost.isEmpty()) return "";
+        String normalizedUser = user == null ? "" : user.trim();
+        String formattedHost = formatHostForAuthority(normalizedHost);
+        StringBuilder label = new StringBuilder();
+        if (!normalizedUser.isEmpty()) {
+            label.append(normalizedUser).append('@');
+        }
+        label.append(formattedHost);
+        if (port > 0 && port != 22) {
+            label.append(':').append(port);
+        }
+        return label.toString();
+    }
+
+    @NonNull
+    private static String formatHostForAuthority(@NonNull String host) {
+        String normalized = host.trim();
+        if (normalized.indexOf(':') >= 0 && !normalized.startsWith("[") && !normalized.endsWith("]")) {
+            return "[" + normalized + "]";
+        }
+        return normalized;
+    }
+
+    @NonNull
+    private static String sanitizeRemoteDisplayName(@Nullable String displayName) {
+        String value = displayName == null ? "" : displayName.trim();
+        while (value.startsWith("ssh ")) value = value.substring(4).trim();
+        if (value.startsWith("sftp://")) value = value.substring("sftp://".length()).trim();
+        if (value.endsWith("/")) value = value.substring(0, value.length() - 1).trim();
+        return value.isEmpty() ? "server" : value;
+    }
+
     @NonNull
     private static String classifyExceptionMessage(@Nullable Throwable throwable) {
         if (throwable == null) return "\u672a\u77e5\u9519\u8bef\u3002";
@@ -3571,6 +4683,10 @@ public final class SftpProtocolManager {
         boolean isCancelled();
     }
 
+    private interface ExecOutputLineListener {
+        void onLine(@NonNull String line);
+    }
+
     private static final class ClientHolder {
         @NonNull
         final String clientKey;
@@ -3667,6 +4783,23 @@ public final class SftpProtocolManager {
             return (ChannelSftp) channel;
         }
 
+        @NonNull
+        ChannelExec openExecChannel(@NonNull String command) throws Exception {
+            Channel channel = session.openChannel("exec");
+            ChannelExec exec = (ChannelExec) channel;
+            exec.setCommand(command);
+            exec.setInputStream(null);
+            exec.connect(12_000);
+            return exec;
+        }
+
+        void closeExecChannel(@Nullable ChannelExec channel, boolean broken) {
+            safeDisconnect(channel);
+            if (broken) {
+                close();
+            }
+        }
+
         private void pruneIdleChannelsLocked() {
             long now = System.currentTimeMillis();
             while (!idleChannels.isEmpty()) {
@@ -3701,7 +4834,7 @@ public final class SftpProtocolManager {
         }
     }
 
-    private static void safeDisconnect(@Nullable ChannelSftp channel) {
+    private static void safeDisconnect(@Nullable Channel channel) {
         if (channel == null) return;
         try {
             channel.disconnect();
@@ -3717,6 +4850,27 @@ public final class SftpProtocolManager {
         PooledChannel(@Nullable ChannelSftp channel, long idleSinceMs) {
             this.channel = channel;
             this.idleSinceMs = idleSinceMs;
+        }
+    }
+
+    private static final class StrongFingerprint {
+        @NonNull
+        final String remoteSha256;
+        @NonNull
+        final String localSha256;
+        @NonNull
+        final String level;
+        @NonNull
+        final String method;
+
+        StrongFingerprint(@NonNull String remoteSha256,
+                          @NonNull String localSha256,
+                          @NonNull String level,
+                          @NonNull String method) {
+            this.remoteSha256 = remoteSha256;
+            this.localSha256 = localSha256;
+            this.level = level;
+            this.method = method;
         }
     }
 
@@ -4137,6 +5291,193 @@ public final class SftpProtocolManager {
         }
     }
 
+    public static final class VirtualPathInfo {
+        public final boolean success;
+        @NonNull
+        public final String virtualRoot;
+        @NonNull
+        public final String remotePath;
+        @NonNull
+        public final String displayName;
+        @NonNull
+        public final String authorityLabel;
+        @NonNull
+        public final String messageCn;
+
+        private VirtualPathInfo(boolean success,
+                                @NonNull String virtualRoot,
+                                @NonNull String remotePath,
+                                @NonNull String displayName,
+                                @NonNull String authorityLabel,
+                                @NonNull String messageCn) {
+            this.success = success;
+            this.virtualRoot = virtualRoot;
+            this.remotePath = remotePath;
+            this.displayName = displayName;
+            this.authorityLabel = authorityLabel;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static VirtualPathInfo ok(@NonNull String virtualRoot,
+                                  @NonNull String remotePath,
+                                  @NonNull String displayName,
+                                  @NonNull String authorityLabel) {
+            return new VirtualPathInfo(true, virtualRoot, remotePath, displayName, authorityLabel, "");
+        }
+
+        @NonNull
+        static VirtualPathInfo fail(@NonNull String messageCn) {
+            return new VirtualPathInfo(false, "", "", "", "", messageCn);
+        }
+    }
+
+    public interface RemoteCommandControl {
+        boolean isCancelled();
+    }
+
+    public static final class LocalRealizationResult {
+        public final boolean success;
+        public final boolean reusable;
+        public final boolean stale;
+        @NonNull
+        public final String localPath;
+        public final long remoteModifiedMs;
+        public final long remoteSize;
+        @NonNull
+        public final String remoteSha256;
+        @NonNull
+        public final String localSha256;
+        @NonNull
+        public final String freshnessLevel;
+        @NonNull
+        public final String freshnessMethod;
+        @NonNull
+        public final String messageCn;
+
+        private LocalRealizationResult(boolean success,
+                                       boolean reusable,
+                                       boolean stale,
+                                       @NonNull String localPath,
+                                       long remoteModifiedMs,
+                                       long remoteSize,
+                                       @NonNull String remoteSha256,
+                                       @NonNull String localSha256,
+                                       @NonNull String freshnessLevel,
+                                       @NonNull String freshnessMethod,
+                                       @NonNull String messageCn) {
+            this.success = success;
+            this.reusable = reusable;
+            this.stale = stale;
+            this.localPath = localPath;
+            this.remoteModifiedMs = remoteModifiedMs;
+            this.remoteSize = remoteSize;
+            this.remoteSha256 = remoteSha256;
+            this.localSha256 = localSha256;
+            this.freshnessLevel = freshnessLevel;
+            this.freshnessMethod = freshnessMethod;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static LocalRealizationResult reusable(@NonNull String localPath, long remoteModifiedMs, long remoteSize) {
+            return reusable(localPath, remoteModifiedMs, remoteSize, "", "", VirtualLocalFileRegistry.LEVEL_WEAK_STAT, VirtualLocalFileRegistry.METHOD_WEAK_STAT);
+        }
+
+        @NonNull
+        static LocalRealizationResult reusable(@NonNull String localPath,
+                                               long remoteModifiedMs,
+                                               long remoteSize,
+                                               @NonNull String remoteSha256,
+                                               @NonNull String localSha256,
+                                               @NonNull String freshnessLevel,
+                                               @NonNull String freshnessMethod) {
+            return new LocalRealizationResult(true, true, false, localPath, remoteModifiedMs, remoteSize,
+                remoteSha256, localSha256, freshnessLevel, freshnessMethod, "");
+        }
+
+        @NonNull
+        static LocalRealizationResult missing(@NonNull String messageCn) {
+            return new LocalRealizationResult(true, false, false, "", -1L, -1L, "", "",
+                VirtualLocalFileRegistry.LEVEL_UNKNOWN, "", messageCn);
+        }
+
+        @NonNull
+        static LocalRealizationResult stale(@NonNull String messageCn) {
+            return stale(messageCn, -1L, -1L);
+        }
+
+        @NonNull
+        static LocalRealizationResult stale(@NonNull String messageCn, long remoteModifiedMs, long remoteSize) {
+            return new LocalRealizationResult(true, false, true, "", remoteModifiedMs, remoteSize, "", "",
+                VirtualLocalFileRegistry.LEVEL_UNKNOWN, "", messageCn);
+        }
+
+        @NonNull
+        static LocalRealizationResult fail(@NonNull String messageCn) {
+            return new LocalRealizationResult(false, false, false, "", -1L, -1L, "", "",
+                VirtualLocalFileRegistry.LEVEL_UNKNOWN, "", messageCn);
+        }
+    }
+
+    public static final class RemoteCommandResult {
+        public final boolean success;
+        public final int exitCode;
+        @NonNull
+        public final String stdout;
+        @NonNull
+        public final String stderr;
+        @NonNull
+        public final String messageCn;
+
+        private RemoteCommandResult(boolean success,
+                                    int exitCode,
+                                    @NonNull String stdout,
+                                    @NonNull String stderr,
+                                    @NonNull String messageCn) {
+            this.success = success;
+            this.exitCode = exitCode;
+            this.stdout = stdout;
+            this.stderr = stderr;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static RemoteCommandResult ok(int exitCode, @Nullable String stdout, @Nullable String stderr) {
+            return new RemoteCommandResult(
+                true,
+                exitCode,
+                stdout == null ? "" : stdout,
+                stderr == null ? "" : stderr,
+                ""
+            );
+        }
+
+        @NonNull
+        static RemoteCommandResult fail(@NonNull String messageCn) {
+            return new RemoteCommandResult(false, -1, "", "", messageCn);
+        }
+
+        @NonNull
+        static RemoteCommandResult fail(int exitCode,
+                                        @Nullable String stdout,
+                                        @Nullable String stderr,
+                                        @NonNull String messageCn) {
+            return new RemoteCommandResult(
+                false,
+                exitCode,
+                stdout == null ? "" : stdout,
+                stderr == null ? "" : stderr,
+                messageCn
+            );
+        }
+
+        @NonNull
+        static RemoteCommandResult cancelled() {
+            return new RemoteCommandResult(false, -1, "", "", "\u64cd\u4f5c\u5df2\u53d6\u6d88\u3002");
+        }
+    }
+
     public static final class ListResult {
         public final boolean success;
         @NonNull
@@ -4172,26 +5513,49 @@ public final class SftpProtocolManager {
         public final long remoteModifiedMs;
         public final long remoteSize;
         @NonNull
+        public final String remoteSha256;
+        @NonNull
+        public final String localSha256;
+        public final boolean reusedLocal;
+        @NonNull
         public final String messageCn;
 
-        private MaterializeResult(boolean success, @NonNull String localPath,
-                                  long remoteModifiedMs, long remoteSize,
+        private MaterializeResult(boolean success,
+                                  @NonNull String localPath,
+                                  long remoteModifiedMs,
+                                  long remoteSize,
+                                  @NonNull String remoteSha256,
+                                  @NonNull String localSha256,
+                                  boolean reusedLocal,
                                   @NonNull String messageCn) {
             this.success = success;
             this.localPath = localPath;
             this.remoteModifiedMs = remoteModifiedMs;
             this.remoteSize = remoteSize;
+            this.remoteSha256 = remoteSha256;
+            this.localSha256 = localSha256;
+            this.reusedLocal = reusedLocal;
             this.messageCn = messageCn;
         }
 
         @NonNull
         static MaterializeResult ok(@NonNull String localPath, long remoteModifiedMs, long remoteSize) {
-            return new MaterializeResult(true, localPath, remoteModifiedMs, remoteSize, "");
+            return ok(localPath, remoteModifiedMs, remoteSize, "", "", false);
+        }
+
+        @NonNull
+        static MaterializeResult ok(@NonNull String localPath,
+                                    long remoteModifiedMs,
+                                    long remoteSize,
+                                    @NonNull String remoteSha256,
+                                    @NonNull String localSha256,
+                                    boolean reusedLocal) {
+            return new MaterializeResult(true, localPath, remoteModifiedMs, remoteSize, remoteSha256, localSha256, reusedLocal, "");
         }
 
         @NonNull
         static MaterializeResult fail(@NonNull String messageCn) {
-            return new MaterializeResult(false, "", -1L, -1L, messageCn);
+            return new MaterializeResult(false, "", -1L, -1L, "", "", false, messageCn);
         }
     }
 
@@ -4240,6 +5604,213 @@ public final class SftpProtocolManager {
         @NonNull
         static DeleteResult fail(@NonNull String messageCn) {
             return new DeleteResult(false, "", messageCn);
+        }
+    }
+
+    public interface RemoteDeleteProgressListener {
+        void onProgress(@NonNull RemoteDeleteProgress progress);
+    }
+
+    public interface RemoteDeleteControl {
+        boolean isCancelled();
+    }
+
+    public static final class RemoteDeleteProgress {
+        @NonNull public final String stage;
+        @NonNull public final String stageLabelCn;
+        public final int totalItems;
+        public final int completedItems;
+        public final int successItems;
+        public final int failedItems;
+        public final int skippedItems;
+        @NonNull public final String currentVirtualPath;
+        @NonNull public final String currentRemotePath;
+        @NonNull public final String currentDisplayName;
+        public final long elapsedMs;
+        @NonNull public final String messageCn;
+        public final long currentEntryDone;
+        public final long currentEntryTotal;
+
+        private RemoteDeleteProgress(@NonNull String stage,
+                                     @NonNull String stageLabelCn,
+                                     int totalItems,
+                                     int completedItems,
+                                     int successItems,
+                                     int failedItems,
+                                     int skippedItems,
+                                     @NonNull String currentVirtualPath,
+                                     @NonNull String currentRemotePath,
+                                     @NonNull String currentDisplayName,
+                                     long elapsedMs,
+                                     @NonNull String messageCn,
+                                     long currentEntryDone,
+                                     long currentEntryTotal) {
+            this.stage = stage;
+            this.stageLabelCn = stageLabelCn;
+            this.totalItems = Math.max(0, totalItems);
+            this.completedItems = Math.max(0, completedItems);
+            this.successItems = Math.max(0, successItems);
+            this.failedItems = Math.max(0, failedItems);
+            this.skippedItems = Math.max(0, skippedItems);
+            this.currentVirtualPath = currentVirtualPath;
+            this.currentRemotePath = currentRemotePath;
+            this.currentDisplayName = currentDisplayName;
+            this.elapsedMs = Math.max(0L, elapsedMs);
+            this.messageCn = messageCn;
+            this.currentEntryDone = Math.max(0L, currentEntryDone);
+            this.currentEntryTotal = Math.max(0L, currentEntryTotal);
+        }
+    }
+
+    public static final class RemoteDeleteItemResult {
+        public final boolean success;
+        public final boolean skipped;
+        public final boolean directory;
+        public final boolean existedBefore;
+        public final boolean verifiedMissing;
+        public final boolean usedExec;
+        public final boolean usedSftpFallback;
+        @NonNull public final String virtualPath;
+        @NonNull public final String remotePath;
+        @NonNull public final String displayName;
+        @NonNull public final String messageCn;
+
+        private RemoteDeleteItemResult(boolean success,
+                                       boolean skipped,
+                                       boolean directory,
+                                       boolean existedBefore,
+                                       boolean verifiedMissing,
+                                       boolean usedExec,
+                                       boolean usedSftpFallback,
+                                       @NonNull String virtualPath,
+                                       @NonNull String remotePath,
+                                       @NonNull String displayName,
+                                       @NonNull String messageCn) {
+            this.success = success;
+            this.skipped = skipped;
+            this.directory = directory;
+            this.existedBefore = existedBefore;
+            this.verifiedMissing = verifiedMissing;
+            this.usedExec = usedExec;
+            this.usedSftpFallback = usedSftpFallback;
+            this.virtualPath = virtualPath;
+            this.remotePath = remotePath;
+            this.displayName = displayName;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static RemoteDeleteItemResult success(@NonNull String virtualPath,
+                                              @NonNull String remotePath,
+                                              @NonNull String displayName,
+                                              boolean directory,
+                                              boolean missingBefore,
+                                              boolean usedExec,
+                                              boolean usedSftpFallback,
+                                              @NonNull String messageCn) {
+            return new RemoteDeleteItemResult(true, false, directory, !missingBefore, true, usedExec,
+                usedSftpFallback, virtualPath, remotePath, displayName, messageCn);
+        }
+
+        @NonNull
+        static RemoteDeleteItemResult skipped(@NonNull String virtualPath,
+                                              @NonNull String remotePath,
+                                              @NonNull String displayName,
+                                              boolean directory,
+                                              @NonNull String messageCn) {
+            return new RemoteDeleteItemResult(true, true, directory, true, false, false, false,
+                virtualPath, remotePath, displayName, messageCn);
+        }
+
+        @NonNull
+        static RemoteDeleteItemResult fail(@NonNull String virtualPath,
+                                           @NonNull String remotePath,
+                                           @NonNull String displayName,
+                                           boolean directory,
+                                           boolean usedExec,
+                                           boolean usedSftpFallback,
+                                           @NonNull String messageCn) {
+            return new RemoteDeleteItemResult(false, false, directory, true, false, usedExec,
+                usedSftpFallback, virtualPath, remotePath, displayName, messageCn);
+        }
+    }
+
+    public static final class RemoteDeleteResult {
+        public final boolean success;
+        public final boolean cancelled;
+        public final int totalItems;
+        public final int plannedItems;
+        public final int deletedItems;
+        public final int failedItems;
+        public final int skippedItems;
+        public final long elapsedMs;
+        @NonNull public final ArrayList<String> deletedVirtualPaths;
+        @NonNull public final ArrayList<RemoteDeleteItemResult> itemResults;
+        @NonNull public final String messageCn;
+
+        public RemoteDeleteResult(boolean success,
+                                  boolean cancelled,
+                                  int totalItems,
+                                  int plannedItems,
+                                  int deletedItems,
+                                  int failedItems,
+                                  int skippedItems,
+                                  long elapsedMs,
+                                  @NonNull ArrayList<String> deletedVirtualPaths,
+                                  @NonNull ArrayList<RemoteDeleteItemResult> itemResults,
+                                  @NonNull String messageCn) {
+            this.success = success;
+            this.cancelled = cancelled;
+            this.totalItems = Math.max(0, totalItems);
+            this.plannedItems = Math.max(0, plannedItems);
+            this.deletedItems = Math.max(0, deletedItems);
+            this.failedItems = Math.max(0, failedItems);
+            this.skippedItems = Math.max(0, skippedItems);
+            this.elapsedMs = Math.max(0L, elapsedMs);
+            this.deletedVirtualPaths = new ArrayList<>(deletedVirtualPaths);
+            this.itemResults = new ArrayList<>(itemResults);
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static RemoteDeleteResult fromItems(int totalItems,
+                                            boolean cancelled,
+                                            long elapsedMs,
+                                            @NonNull ArrayList<RemoteDeleteItemResult> itemResults) {
+            int deleted = 0;
+            int failed = 0;
+            int skipped = 0;
+            int planned = 0;
+            ArrayList<String> deletedVirtualPaths = new ArrayList<>();
+            for (RemoteDeleteItemResult item : itemResults) {
+                if (item == null) continue;
+                if (item.skipped) {
+                    skipped++;
+                    continue;
+                }
+                planned++;
+                if (item.success) {
+                    deleted++;
+                    if (!TextUtils.isEmpty(item.virtualPath)) deletedVirtualPaths.add(item.virtualPath);
+                } else {
+                    failed++;
+                }
+            }
+            boolean success = !cancelled && failed == 0 && deleted + skipped >= totalItems;
+            String message;
+            if (cancelled) {
+                message = "删除已取消";
+            } else if (success) {
+                message = "删除完成";
+            } else if (deleted > 0) {
+                message = "删除部分完成";
+            } else if (failed > 0) {
+                message = "删除失败";
+            } else {
+                message = "没有可删除的远端目标";
+            }
+            return new RemoteDeleteResult(success, cancelled, totalItems, planned, deleted, failed, skipped,
+                elapsedMs, deletedVirtualPaths, itemResults, message);
         }
     }
 

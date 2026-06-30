@@ -16,10 +16,14 @@ import android.view.LayoutInflater
 import android.view.Menu
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
@@ -33,12 +37,6 @@ import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions
 import com.bumptech.glide.request.RequestOptions
 import com.qtalk.recyclerviewfastscroller.RecyclerViewFastScroller
 import com.stericson.RootTools.RootTools
-import net.lingala.zip4j.exception.ZipException
-import net.lingala.zip4j.io.inputstream.ZipInputStream
-import net.lingala.zip4j.io.outputstream.ZipOutputStream
-import net.lingala.zip4j.model.LocalFileHeader
-import net.lingala.zip4j.model.ZipParameters
-import net.lingala.zip4j.model.enums.EncryptionMethod
 import org.fossify.commons.adapters.MyRecyclerViewAdapter
 import org.fossify.commons.dialogs.ConfirmationDialog
 import org.fossify.commons.dialogs.FilePickerDialog
@@ -53,25 +51,17 @@ import org.fossify.commons.extensions.beVisible
 import org.fossify.commons.extensions.beVisibleIf
 import org.fossify.commons.extensions.convertToBitmap
 import org.fossify.commons.extensions.copyToClipboard
-import org.fossify.commons.extensions.createDirectorySync
 import org.fossify.commons.extensions.deleteFile
-import org.fossify.commons.extensions.deleteFileBg
-import org.fossify.commons.extensions.deleteFolderBg
 import org.fossify.commons.extensions.formatDate
 import org.fossify.commons.extensions.formatSize
-import org.fossify.commons.extensions.getAndroidSAFFileItems
 import org.fossify.commons.extensions.getAndroidSAFUri
 import org.fossify.commons.extensions.getAlertDialogBuilder
 import org.fossify.commons.extensions.getColoredDrawableWithColor
 import org.fossify.commons.extensions.getDefaultCopyDestinationPath
-import org.fossify.commons.extensions.getDocumentFile
 import org.fossify.commons.extensions.getDoesFilePathExist
 import org.fossify.commons.extensions.getFileCount
-import org.fossify.commons.extensions.getFileInputStreamSync
-import org.fossify.commons.extensions.getFileOutputStreamSync
 import org.fossify.commons.extensions.getFilenameFromPath
 import org.fossify.commons.extensions.getIsPathDirectory
-import org.fossify.commons.extensions.getMimeType
 import org.fossify.commons.extensions.getParentPath
 import org.fossify.commons.extensions.getProperSize
 import org.fossify.commons.extensions.getTextSize
@@ -82,13 +72,9 @@ import org.fossify.commons.extensions.highlightTextPart
 import org.fossify.commons.extensions.isAValidFilename
 import org.fossify.commons.extensions.isPathOnOTG
 import org.fossify.commons.extensions.isRestrictedSAFOnlyRoot
-import org.fossify.commons.extensions.relativizeWith
 import org.fossify.commons.extensions.setupViewBackground
-import org.fossify.commons.extensions.showErrorToast
 import org.fossify.commons.extensions.toFileDirItem
 import org.fossify.commons.extensions.toast
-import org.fossify.commons.helpers.CONFLICT_OVERWRITE
-import org.fossify.commons.helpers.CONFLICT_SKIP
 import org.fossify.commons.helpers.VIEW_TYPE_LIST
 import org.fossify.commons.helpers.ensureBackgroundThread
 import org.fossify.commons.helpers.getFilePlaceholderDrawables
@@ -103,15 +89,17 @@ import org.fossify.filemanager.databinding.ItemEmptyBinding
 import org.fossify.filemanager.databinding.ItemFileDirListBinding
 import org.fossify.filemanager.databinding.ItemFileGridBinding
 import org.fossify.filemanager.databinding.ItemSectionBinding
-import org.fossify.filemanager.dialogs.CompressAsDialog
 import org.fossify.filemanager.extensions.config
+import org.fossify.filemanager.extensions.isArchiveFile
 import org.fossify.filemanager.extensions.isPathOnRoot
-import org.fossify.filemanager.extensions.isZipFile
 import org.fossify.filemanager.extensions.setAs
-import org.fossify.filemanager.extensions.setLastModified
-import org.fossify.filemanager.extensions.sharePaths
 import org.fossify.filemanager.extensions.toggleItemVisibility
 import org.fossify.filemanager.extensions.tryOpenPathIntent
+import org.fossify.filemanager.helpers.ActiveTransferMode
+import org.fossify.filemanager.helpers.ActiveTransferRegistry
+import org.fossify.filemanager.helpers.ActiveTransferStatus
+import org.fossify.filemanager.helpers.ArchiveTransferWorkflow
+import org.fossify.filemanager.helpers.ClipboardPathFormatter
 import org.fossify.filemanager.helpers.FavoriteHelper
 import org.fossify.filemanager.helpers.OPEN_AS_AUDIO
 import org.fossify.filemanager.helpers.OPEN_AS_IMAGE
@@ -119,21 +107,22 @@ import org.fossify.filemanager.helpers.OPEN_AS_OTHER
 import org.fossify.filemanager.helpers.OPEN_AS_TEXT
 import org.fossify.filemanager.helpers.OPEN_AS_VIDEO
 import org.fossify.filemanager.helpers.NavigatorFolderHelper
+import org.fossify.filemanager.helpers.RecentPathFormatter
+import org.fossify.filemanager.helpers.RemoteDownloadCoordinator
 import org.fossify.filemanager.helpers.RootHelpers
+import org.fossify.filemanager.helpers.ShareSelectionWorkflow
 import org.fossify.filemanager.helpers.TransferExecutionPlan
 import org.fossify.filemanager.helpers.TransferSelectionKind
 import org.fossify.filemanager.helpers.TransferWorkflowStage
 import org.fossify.filemanager.helpers.TransferWorkflowStateMachine
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
+import org.fossify.filemanager.views.InlineTransferProgressView
 import com.termux.sessionsync.FileRootResolver
 import com.termux.sessionsync.SessionFileCoordinator
 import com.termux.sessionsync.SftpProtocolManager
-import java.io.BufferedInputStream
-import java.io.Closeable
 import java.io.File
 import java.util.Calendar
-import java.util.LinkedList
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -152,6 +141,7 @@ class ItemsAdapter(
 ) : MyRecyclerViewAdapter(activity, recyclerView, itemClick),
     RecyclerViewFastScroller.OnPopupTextUpdate {
 
+    private val simpleActivity: SimpleActivity = activity
     private lateinit var fileDrawable: Drawable
     private lateinit var folderDrawable: Drawable
     private var fileDrawables = HashMap<String, Drawable>()
@@ -165,7 +155,13 @@ class ItemsAdapter(
     private var timeFormat = ""
     private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
     private val transientHighlightKeys = LinkedHashSet<Int>()
+    private val recentDisplayPathCache = HashMap<String, String>()
     private var clearTransientHighlightRunnable: Runnable? = null
+    private val transferProgressListener: (Set<String>) -> Unit = { changedPaths ->
+        activity.runOnUiThread {
+            notifyTransferProgressChanged(changedPaths)
+        }
+    }
 
     private val config = activity.config
     private val viewType = if (canHaveIndividualViewType) {
@@ -177,6 +173,11 @@ class ItemsAdapter(
     }
     private val isListViewType = viewType == VIEW_TYPE_LIST
     private var displayFilenamesInGrid = config.displayFilenames
+    private val shareSelectionWorkflow = ShareSelectionWorkflow(
+        activity = activity,
+        sessionFileCoordinator = sessionFileCoordinator,
+        shouldShowHidden = { config.shouldShowHidden() }
+    )
 
     companion object {
         private const val ACTION_ENTER_MULTI_SELECT = -1
@@ -186,9 +187,17 @@ class ItemsAdapter(
         private const val TYPE_GRID_TYPE_DIVIDER = 4
         private const val TRANSIENT_HIGHLIGHT_DURATION_MS = 1_600L
         private const val TRANSIENT_HIGHLIGHT_RETRY_MS = 700L
+        private const val PAYLOAD_TRANSFER_PROGRESS = "transfer-progress"
         private val virtualDownloadInProgress = AtomicBoolean(false)
         private val transferWorkflowStateMachine = TransferWorkflowStateMachine()
         private val virtualUploadInProgress = AtomicBoolean(false)
+        private val ARCHIVE_DIALOG_SUFFIXES = listOf(
+            ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tbz2", ".tar.xz", ".txz", ".tar.zst", ".tzst",
+            ".zip", ".jar", ".apk", ".aar", ".war", ".tar", ".gz", ".bz2", ".xz", ".zst", ".7z", ".rar",
+            ".001", ".cab", ".iso", ".img", ".dmg", ".wim", ".swm", ".esd", ".ar", ".deb", ".rpm", ".cpio",
+            ".lzma", ".lz4", ".br", ".z", ".lzh", ".lha", ".chm", ".msi", ".nsis", ".udf", ".vhd", ".vhdx",
+            ".vmdk", ".qcow", ".qcow2", ".squashfs", ".crx", ".xar"
+        )
     }
 
     init {
@@ -204,7 +213,8 @@ class ItemsAdapter(
     override fun prepareActionMode(menu: Menu) {
         menu.apply {
             findItem(R.id.cab_decompress).isVisible =
-                getSelectedFileDirItems().map { it.path }.any { it.isZipFile() }
+                getSelectedFileDirItems().map { it.path }.any { it.isArchiveFile() }
+            findItem(R.id.cab_share).isVisible = shareSelectionWorkflow.canShare(getSelectedFileDirItems())
             findItem(R.id.cab_confirm_selection).isVisible = isPickMultipleIntent
             findItem(R.id.cab_copy_path).isVisible = isOneItemSelected()
             findItem(R.id.cab_open_with).isVisible = isOneFileSelected()
@@ -226,6 +236,7 @@ class ItemsAdapter(
             R.id.remove_favorite -> removeSelectedItemFromFavorites()
             R.id.cab_copy_path -> copyPath()
             R.id.cab_set_as -> setAs()
+            R.id.cab_share -> shareFiles()
             R.id.cab_open_with -> openWith()
             R.id.cab_open_as -> openAs()
             R.id.cab_copy_to -> copyMoveTo(true)
@@ -276,6 +287,18 @@ class ItemsAdapter(
             .inflate(layoutInflater, parent, false)
 
         return createViewHolder(binding.root)
+    }
+
+    override fun onBindViewHolder(holder: MyRecyclerViewAdapter.ViewHolder, position: Int, payloads: MutableList<Any>) {
+        if (payloads.contains(PAYLOAD_TRANSFER_PROGRESS)) {
+            val listItem = listItems.getOrNull(position)
+            if (listItem != null && !listItem.isSectionTitle && !listItem.isGridTypeDivider) {
+                val binding = Binding.getByItemViewType(holder.itemViewType, isListViewType).bind(holder.itemView)
+                bindTransferProgress(binding, listItem)
+                return
+            }
+        }
+        super.onBindViewHolder(holder, position, payloads)
     }
 
     override fun onBindViewHolder(holder: MyRecyclerViewAdapter.ViewHolder, position: Int) {
@@ -375,6 +398,9 @@ class ItemsAdapter(
             actions.add(LongPressAction(R.id.cab_confirm_selection, activity.getString(R.string.confirm_selection)))
         }
         actions.add(LongPressAction(ACTION_ENTER_MULTI_SELECT, activity.getString(R.string.multi_select)))
+        if (shareSelectionWorkflow.canShare(selected)) {
+            actions.add(LongPressAction(R.id.cab_share, activity.getString(R.string.share)))
+        }
         actions.add(LongPressAction(R.id.cab_rename, activity.getString(R.string.rename)))
         actions.add(LongPressAction(R.id.cab_properties, activity.getString(R.string.properties)))
 
@@ -399,8 +425,8 @@ class ItemsAdapter(
         actions.add(LongPressAction(R.id.cab_move_to, activity.getString(R.string.move_to)))
         actions.add(LongPressAction(R.id.cab_compress, activity.getString(R.string.compress)))
 
-        val hasZip = selected.any { it.path.isZipFile() }
-        if (hasZip) {
+        val hasArchive = selected.any { it.path.isArchiveFile() }
+        if (hasArchive) {
             actions.add(LongPressAction(R.id.cab_decompress, activity.getString(R.string.decompress)))
         }
 
@@ -417,6 +443,7 @@ class ItemsAdapter(
             R.id.remove_favorite,
             R.id.cab_copy_path,
             R.id.cab_set_as,
+            R.id.cab_share,
             R.id.cab_open_with,
             R.id.cab_open_as,
             R.id.cab_copy_to,
@@ -510,12 +537,9 @@ class ItemsAdapter(
     }
 
     private fun shareFiles() {
-        val selectedItems = getSelectedFileDirItems()
-        val paths = ArrayList<String>(selectedItems.size)
-        selectedItems.forEach {
-            addFileUris(it.path, paths)
+        shareSelectionWorkflow.share(getSelectedFileDirItems()) {
+            finishActMode()
         }
-        activity.sharePaths(paths)
     }
 
     private fun toggleFileVisibility(hide: Boolean) {
@@ -600,46 +624,17 @@ class ItemsAdapter(
         }
     }
 
-    @SuppressLint("NewApi")
-    private fun addFileUris(path: String, paths: ArrayList<String>) {
-        if (activity.getIsPathDirectory(path)) {
-            val shouldShowHidden = config.shouldShowHidden()
-            when {
-                activity.isRestrictedSAFOnlyRoot(path) -> {
-                    activity.getAndroidSAFFileItems(path, shouldShowHidden, false) { files ->
-                        files.forEach {
-                            addFileUris(activity.getAndroidSAFUri(it.path).toString(), paths)
-                        }
-                    }
-                }
-
-                activity.isPathOnOTG(path) -> {
-                    activity.getDocumentFile(path)?.listFiles()
-                        ?.filter { if (shouldShowHidden) true else !it.name!!.startsWith(".") }
-                        ?.forEach {
-                            addFileUris(it.uri.toString(), paths)
-                        }
-                }
-
-                else -> {
-                    File(path).listFiles()
-                        ?.filter { if (shouldShowHidden) true else !it.name.startsWith('.') }
-                        ?.forEach {
-                            addFileUris(it.absolutePath, paths)
-                        }
-                }
-            }
-        } else {
-            paths.add(path)
-        }
-    }
-
     private fun copyPath() {
         val selectedPath = getFirstSelectedItemPath()
         val clipboardPath = if (sessionFileCoordinator.isVirtualPath(activity, selectedPath)) {
-            sessionFileCoordinator.getDisplayPath(activity, selectedPath).takeIf { it.isNotBlank() } ?: selectedPath
+            val info = sessionFileCoordinator.describeVirtualPath(activity, selectedPath)
+            if (info.success) {
+                ClipboardPathFormatter.remoteLinuxPath(info.remotePath)
+            } else {
+                ClipboardPathFormatter.localPath(selectedPath)
+            }
         } else {
-            selectedPath
+            ClipboardPathFormatter.localPath(selectedPath)
         }
 
         activity.copyToClipboard(clipboardPath)
@@ -713,7 +708,8 @@ class ItemsAdapter(
             showFAB = true,
             canAddShowHiddenButton = true,
             showFavoritesButton = true,
-            targetScope = targetScope
+            targetScope = targetScope,
+            startAtCurrentPath = true
         ) { pickedPath ->
             config.lastCopyPath = pickedPath
 
@@ -805,6 +801,14 @@ class ItemsAdapter(
     }
 
     private fun resolveTransferPickerStartPath(sourcePath: String): String {
+        val sourceDirectory = sourcePath.trimEnd('/')
+        if (
+            sourceDirectory.isNotEmpty() &&
+            (sessionFileCoordinator.isVirtualPath(activity, sourceDirectory) || activity.getDoesFilePathExist(sourceDirectory))
+        ) {
+            return sourceDirectory
+        }
+
         val lastCopyPath = config.lastCopyPath.trimEnd('/')
         if (lastCopyPath.isNotEmpty() && sessionFileCoordinator.isVirtualPath(activity, lastCopyPath)) {
             return lastCopyPath
@@ -1049,192 +1053,68 @@ class ItemsAdapter(
             return
         }
         if (!transferWorkflowStateMachine.begin(TransferWorkflowStage.DOWNLOADING, "download")) {
-            activity.toast("\u5df2\u6709\u4f20\u8f93\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+            activity.toast("已有传输任务在执行，请稍后再试。")
             return
         }
         if (!virtualDownloadInProgress.compareAndSet(false, true)) {
             transferWorkflowStateMachine.markFailed("download-busy")
-            activity.toast("\u5df2\u6709\u4e0b\u8f7d\u4efb\u52a1\u5728\u6267\u884c\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+            activity.toast("已有下载任务在执行，请稍后再试。")
             return
         }
 
-        val progressDialog = activity.getAlertDialogBuilder()
-            .setTitle("\u4e0b\u8f7d\u4e2d")
-            .setMessage("\u6b63\u5728\u51c6\u5907\u4e0b\u8f7d...")
-            .setNegativeButton("\u53d6\u6d88", null)
-            .setCancelable(false)
-            .create()
-        val cancelled = AtomicBoolean(false)
-        progressDialog.setOnShowListener {
-            progressDialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
-                cancelled.set(true)
-                it.isEnabled = false
-            }
-        }
-        try {
-            progressDialog.show()
-        } catch (_: Exception) {
-        }
-
-        var lastUiUpdateAt = 0L
-        var lastSpeedAt = 0L
-        var lastSpeedBytes = 0L
-        var speedBytesPerSecond = 0L
-
-        ensureBackgroundThread {
-            try {
-                val virtualPaths = ArrayList<String>(virtualItems.size)
-                virtualItems.forEach { virtualPaths.add(it.path) }
-                val result = sessionFileCoordinator.downloadVirtualPaths(
-                    activity,
-                    virtualPaths,
-                    destination,
-                    object : SftpProtocolManager.DownloadProgressListener {
-                        override fun onProgress(progress: SftpProtocolManager.DownloadProgress) {
-                            val now = SystemClock.elapsedRealtime()
-                            if (lastSpeedAt == 0L) {
-                                lastSpeedAt = now
-                                lastSpeedBytes = progress.transferredBytes
-                            } else {
-                                val deltaMs = now - lastSpeedAt
-                                if (deltaMs >= 260L || progress.transferredBytes < lastSpeedBytes) {
-                                    val deltaBytes = progress.transferredBytes - lastSpeedBytes
-                                    speedBytesPerSecond = if (deltaMs > 0L && deltaBytes > 0L) {
-                                        deltaBytes * 1000L / deltaMs
-                                    } else {
-                                        0L
-                                    }
-                                    lastSpeedAt = now
-                                    lastSpeedBytes = progress.transferredBytes
-                                }
-                            }
-
-                            if (now - lastUiUpdateAt < 100L && progress.transferredBytes < progress.totalBytes) {
-                                return
-                            }
-                            lastUiUpdateAt = now
-
-                            val finishedCount = progress.completedFiles + progress.failedFiles
-                            val percent = if (progress.totalBytes > 0L) {
-                                ((progress.transferredBytes * 100L) / progress.totalBytes).coerceIn(0L, 100L)
-                            } else {
-                                0L
-                            }
-                            val sizeText = if (progress.totalBytes > 0L) {
-                                "${progress.transferredBytes.formatSize()} / ${progress.totalBytes.formatSize()}"
-                            } else {
-                                "${progress.transferredBytes.formatSize()} / ?"
-                            }
-                            val speedText = if (speedBytesPerSecond > 0L) {
-                                "${speedBytesPerSecond.formatSize()}/s"
-                            } else {
-                                "--"
-                            }
-                            val currentFile = if (progress.currentFile.isNotEmpty()) {
-                                progress.currentFile
-                            } else {
-                                "\u51c6\u5907\u4e2d..."
-                            }
-                            val message = StringBuilder()
-                                .append("\u5f53\u524d\uff1a").append(currentFile).append('\n')
-                                .append("\u8fdb\u5ea6\uff1a").append(finishedCount).append('/').append(progress.totalFiles)
-                                .append(" (").append(percent).append("%)").append('\n')
-                                .append("\u5927\u5c0f\uff1a").append(sizeText).append('\n')
-                                .append("\u901f\u5ea6\uff1a").append(speedText)
-                                .toString()
-
-                            activity.runOnUiThread {
-                                if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
-                                    progressDialog.setMessage(message)
-                                }
-                            }
-                        }
-                    },
-                    object : SftpProtocolManager.DownloadControl {
-                        override fun isCancelled(): Boolean = cancelled.get()
+        RemoteDownloadCoordinator.start(
+            activity = simpleActivity,
+            sessionFileCoordinator = sessionFileCoordinator,
+            sourceItems = virtualItems,
+            destinationPath = destination,
+            mode = ActiveTransferMode.NORMAL_DOWNLOAD,
+            title = "下载中",
+            fallbackFileName = "准备中...",
+            onOutcome = { outcome ->
+                when (outcome.status) {
+                    ActiveTransferStatus.SUCCESS -> {
+                        transferWorkflowStateMachine.markCompleted("download:${outcome.downloadedFiles}/${outcome.totalFiles}")
+                        activity.toast("下载完成：${outcome.downloadedFiles}/${outcome.totalFiles}，${outcome.downloadedBytes.formatSize()}")
                     }
-                )
 
-                activity.runOnUiThread {
-                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
-                        try {
-                            progressDialog.dismiss()
-                        } catch (_: Exception) {
+                    ActiveTransferStatus.CANCELLED -> {
+                        val message = outcome.messageCn.ifBlank { "下载已取消" }
+                        transferWorkflowStateMachine.markCancelled(message)
+                        if (outcome.downloadedFiles > 0) {
+                            activity.toast("下载已取消：${outcome.downloadedFiles}/${outcome.totalFiles}，${outcome.downloadedBytes.formatSize()}")
+                        } else {
+                            activity.toast(message)
                         }
                     }
 
-                    when {
-                        result.success -> {
-                            transferWorkflowStateMachine.markCompleted("download:${result.downloadedFiles}/${result.totalFiles}")
-                            activity.toast(
-                                "\u4e0b\u8f7d\u5b8c\u6210\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
-                                    result.downloadedBytes.formatSize()
-                                }"
-                            )
-                        }
-
-                        isCancelledTransferMessage(result.messageCn) -> {
-                            transferWorkflowStateMachine.markCancelled(result.messageCn)
-                            if (result.downloadedFiles > 0) {
-                                activity.toast(
-                                    "\u4e0b\u8f7d\u5df2\u53d6\u6d88\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
-                                        result.downloadedBytes.formatSize()
-                                    }"
-                                )
-                            } else {
-                                activity.toast(result.messageCn)
-                            }
-                        }
-
-                        result.downloadedFiles > 0 -> {
-                            transferWorkflowStateMachine.markFailed("download-partial:${result.downloadedFiles}/${result.totalFiles}")
-                            val reason = if (result.messageCn.isNotEmpty()) " ${result.messageCn}" else ""
-                            activity.toast(
-                                "\u90e8\u5206\u5b8c\u6210\uff1a${result.downloadedFiles}/${result.totalFiles}\uff0c${
-                                    result.downloadedBytes.formatSize()
-                                }$reason"
-                            )
-                        }
-
-                        else -> {
-                            val failure = if (result.messageCn.isNotEmpty()) {
-                                result.messageCn
-                            } else {
-                                "\u4e0b\u8f7d\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u7f51\u7edc\u6216\u8ba4\u8bc1\u4fe1\u606f\u3002"
-                            }
-                            transferWorkflowStateMachine.markFailed(failure)
-                            activity.toast(failure)
-                        }
+                    ActiveTransferStatus.PARTIAL -> {
+                        transferWorkflowStateMachine.markFailed("download-partial:${outcome.downloadedFiles}/${outcome.totalFiles}")
+                        val reason = if (outcome.messageCn.isNotEmpty()) " ${outcome.messageCn}" else ""
+                        activity.toast("部分完成：${outcome.downloadedFiles}/${outcome.totalFiles}，${outcome.downloadedBytes.formatSize()}$reason")
                     }
 
-                    if (result.downloadedFiles > 0 && result.downloadedLocalPaths.isNotEmpty()) {
-                        listener?.openPathAndHighlight(destination, ArrayList(result.downloadedLocalPaths))
-                    } else {
-                        listener?.refreshFragment()
-                    }
-                    finishActMode()
-                }
-            } catch (t: Throwable) {
-                activity.runOnUiThread {
-                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
-                        try {
-                            progressDialog.dismiss()
-                        } catch (_: Exception) {
+                    else -> {
+                        val failure = if (outcome.throwable != null && outcome.messageCn.isNotBlank()) {
+                            "下载异常：${outcome.messageCn}"
+                        } else {
+                            outcome.messageCn.ifBlank { "下载失败，请检查网络或认证信息。" }
                         }
-                    }
-                    val msg = t.message?.trim().orEmpty()
-                    if (msg.isNotEmpty()) {
-                        transferWorkflowStateMachine.markFailed(msg)
-                        activity.toast("\u4e0b\u8f7d\u5f02\u5e38\uff1a$msg")
-                    } else {
-                        transferWorkflowStateMachine.markFailed("download-exception")
-                        activity.toast("\u4e0b\u8f7d\u5f02\u5e38\uff0c\u8bf7\u91cd\u8bd5\u3002")
+                        transferWorkflowStateMachine.markFailed(failure)
+                        activity.toast(failure)
                     }
                 }
-            } finally {
+
+                if (outcome.downloadedFiles > 0 && outcome.downloadedLocalPaths.isNotEmpty()) {
+                    listener?.openPathAndHighlight(destination, ArrayList(outcome.downloadedLocalPaths))
+                } else {
+                    listener?.refreshFragment()
+                }
+            },
+            onFinish = {
+                finishActMode()
                 virtualDownloadInProgress.set(false)
             }
-        }
+        )
     }
 
     private fun runVirtualUpload(localItems: List<FileDirItem>, destinationVirtualPath: String) {
@@ -1458,304 +1338,549 @@ class ItemsAdapter(
     }
 
     private fun compressSelection() {
-        val firstPath = getFirstSelectedItemPath()
-        if (activity.isPathOnOTG(firstPath)) {
-            activity.toast(R.string.unknown_error_occurred)
-            return
-        }
+        val selectedItems = getSelectedFileDirItems()
+        if (selectedItems.isEmpty()) return
 
-        CompressAsDialog(activity, firstPath) { destination, password ->
-            activity.handleAndroidSAFDialog(firstPath) { granted ->
-                if (!granted) {
-                    return@handleAndroidSAFDialog
-                }
-                activity.handleSAFDialog(firstPath) {
-                    if (!it) {
-                        return@handleSAFDialog
-                    }
-
-                    activity.toast(R.string.compressing)
-                    val paths = getSelectedFileDirItems().map { it.path }
-                    ensureBackgroundThread {
-                        if (compressPaths(paths, destination, password)) {
-                            activity.runOnUiThread {
-                                activity.toast(R.string.compression_successful)
-                                listener?.refreshFragment()
-                                finishActMode()
-                            }
-                        } else {
-                            activity.toast(R.string.compressing_failed)
-                        }
-                    }
-                }
-            }
-        }
+        showArchiveDestinationPicker(selectedItems, archiveModeCompress = true)
     }
 
     private fun decompressSelection() {
-        val firstPath = getFirstSelectedItemPath()
-        if (activity.isPathOnOTG(firstPath)) {
-            activity.toast(R.string.unknown_error_occurred)
+        val selectedItems = getSelectedFileDirItems()
+            .filter { it.path.isArchiveFile() }
+            .toCollection(ArrayList())
+        if (selectedItems.isEmpty()) {
+            activity.toast(R.string.decompressing_failed)
             return
         }
 
-        activity.handleSAFDialog(firstPath) {
-            if (!it) {
-                return@handleSAFDialog
-            }
-
-            val paths = getSelectedFileDirItems()
-                .asSequence()
-                .map { it.path }
-                .filter { it.isZipFile() }
-                .toList()
-            ensureBackgroundThread {
-                tryDecompressingPaths(paths) { success ->
-                    activity.runOnUiThread {
-                        if (success) {
-                            activity.toast(R.string.decompression_successful)
-                            listener?.refreshFragment()
-                            finishActMode()
-                        } else {
-                            activity.toast(R.string.decompressing_failed)
-                        }
-                    }
-                }
-            }
-        }
+        showArchiveDestinationPicker(selectedItems, archiveModeCompress = false)
     }
 
-    private fun tryDecompressingPaths(
-        sourcePaths: List<String>,
-        callback: (success: Boolean) -> Unit
+    private fun showArchiveDestinationPicker(
+        selectedItems: ArrayList<FileDirItem>,
+        archiveModeCompress: Boolean
     ) {
-        sourcePaths.forEach { path ->
-            ZipInputStream(BufferedInputStream(activity.getFileInputStreamSync(path))).use { zipInputStream ->
-                try {
-                    val fileDirItems = ArrayList<FileDirItem>()
-                    var entry = zipInputStream.nextEntry
-                    while (entry != null) {
-                        val currPath = if (entry.isDirectory) {
-                            path
-                        } else {
-                            "${path.getParentPath().trimEnd('/')}/${entry.fileName}"
-                        }
-                        val fileDirItem = FileDirItem(
-                            path = currPath,
-                            name = entry.fileName,
-                            isDirectory = entry.isDirectory,
-                            children = 0,
-                            size = entry.uncompressedSize
-                        )
-                        fileDirItems.add(fileDirItem)
-                        entry = zipInputStream.nextEntry
-                    }
-                    val destinationPath = fileDirItems.first().getParentPath().trimEnd('/')
-                    activity.runOnUiThread {
-                        activity.checkConflicts(fileDirItems, destinationPath, 0, LinkedHashMap()) {
-                            ensureBackgroundThread {
-                                decompressPaths(sourcePaths, it, callback)
-                            }
-                        }
-                    }
-                } catch (zipException: ZipException) {
-                    if (zipException.type == ZipException.Type.WRONG_PASSWORD) {
-                        activity.showErrorToast(activity.getString(R.string.invalid_password))
-                    } else {
-                        activity.showErrorToast(zipException)
-                    }
-                } catch (exception: Exception) {
-                    activity.showErrorToast(exception)
-                }
+        val firstPath = selectedItems.firstOrNull()?.path ?: return
+        val startPath = resolveArchivePickerStartPath(firstPath)
+        FilePickerDialog(
+            activity = activity,
+            currPath = startPath,
+            pickFile = false,
+            showHidden = config.shouldShowHidden(),
+            showFAB = true,
+            canAddShowHiddenButton = true,
+            showFavoritesButton = true,
+            targetScope = FilePickerDialog.TargetScope.ANY,
+            startAtCurrentPath = true
+        ) { destinationDirectory ->
+            if (archiveModeCompress) {
+                showArchiveCompressionOptionsDialog(selectedItems, destinationDirectory)
+            } else {
+                showArchiveDecompressionOptionsDialog(selectedItems, destinationDirectory)
             }
         }
     }
 
-    private fun decompressPaths(
-        paths: List<String>,
-        conflictResolutions: LinkedHashMap<String, Int>,
-        callback: (success: Boolean) -> Unit
+    private fun resolveArchivePickerStartPath(firstPath: String): String {
+        val parent = firstPath.getParentPath().trimEnd('/')
+        if (sessionFileCoordinator.isVirtualPath(activity, parent) || activity.getDoesFilePathExist(parent)) {
+            return parent
+        }
+
+        val lastCopyPath = config.lastCopyPath.trimEnd('/')
+        if (
+            lastCopyPath.isNotEmpty() &&
+            (sessionFileCoordinator.isVirtualPath(activity, lastCopyPath) || activity.getDoesFilePathExist(lastCopyPath))
+        ) {
+            return lastCopyPath
+        }
+
+        return FileRootResolver.termuxPrivateRoot(activity)
+    }
+
+    private fun showArchiveCompressionOptionsDialog(
+        selectedItems: ArrayList<FileDirItem>,
+        destinationDirectory: String
     ) {
-        paths.forEach { path ->
-            val zipInputStream =
-                ZipInputStream(BufferedInputStream(activity.getFileInputStreamSync(path)))
-            zipInputStream.use {
-                try {
-                    var entry = zipInputStream.nextEntry
-                    val zipFileName = path.getFilenameFromPath()
-                    val newFolderName = zipFileName.subSequence(0, zipFileName.length - 4)
-                    while (entry != null) {
-                        val parentPath = path.getParentPath()
-                        val newPath = "$parentPath/$newFolderName/${entry.fileName.trimEnd('/')}"
-
-                        val resolution = getConflictResolution(conflictResolutions, newPath)
-                        val doesPathExist = activity.getDoesFilePathExist(newPath)
-                        if (doesPathExist && resolution == CONFLICT_OVERWRITE) {
-                            val fileDirItem = FileDirItem(
-                                path = newPath,
-                                name = newPath.getFilenameFromPath(),
-                                isDirectory = entry.isDirectory
-                            )
-                            if (activity.getIsPathDirectory(path)) {
-                                activity.deleteFolderBg(fileDirItem, false) {
-                                    if (it) {
-                                        extractEntry(newPath, entry, zipInputStream)
-                                    } else {
-                                        callback(false)
-                                    }
-                                }
-                            } else {
-                                activity.deleteFileBg(fileDirItem, false, false) {
-                                    if (it) {
-                                        extractEntry(newPath, entry, zipInputStream)
-                                    } else {
-                                        callback(false)
-                                    }
-                                }
-                            }
-                        } else if (!doesPathExist) {
-                            extractEntry(newPath, entry, zipInputStream)
-                        }
-
-                        entry = zipInputStream.nextEntry
-                    }
-                    callback(true)
-                } catch (e: Exception) {
-                    activity.showErrorToast(e)
-                    callback(false)
-                }
-            }
-        }
-    }
-
-    private fun extractEntry(
-        newPath: String,
-        entry: LocalFileHeader,
-        zipInputStream: ZipInputStream
-    ) {
-        if (entry.isDirectory) {
-            if (!activity.createDirectorySync(newPath) && !activity.getDoesFilePathExist(newPath)) {
-                val error =
-                    String.format(activity.getString(R.string.could_not_create_file), newPath)
-                activity.showErrorToast(error)
-            }
-        } else {
-            val fos = activity.getFileOutputStreamSync(newPath, newPath.getMimeType())
-            if (fos != null) {
-                zipInputStream.copyTo(fos)
-                File(newPath).setLastModified(entry)
-            }
-        }
-    }
-
-    private fun getConflictResolution(
-        conflictResolutions: LinkedHashMap<String, Int>,
-        path: String
-    ): Int {
-        return if (conflictResolutions.size == 1 && conflictResolutions.containsKey("")) {
-            conflictResolutions[""]!!
-        } else if (conflictResolutions.containsKey(path)) {
-            conflictResolutions[path]!!
-        } else {
-            CONFLICT_SKIP
-        }
-    }
-
-    @SuppressLint("NewApi")
-    private fun compressPaths(
-        sourcePaths: List<String>,
-        targetPath: String,
-        password: String? = null
-    ): Boolean {
-        val queue = LinkedList<String>()
-        val fos = activity.getFileOutputStreamSync(targetPath, "application/zip") ?: return false
-
-        val zout =
-            password?.let { ZipOutputStream(fos, password.toCharArray()) } ?: ZipOutputStream(fos)
-        var res: Closeable = fos
-
-        fun zipEntry(name: String, lastModified: Long) = ZipParameters().also {
-            it.fileNameInZip = name
-            it.lastModifiedFileTime = lastModified
-            if (password != null) {
-                it.isEncryptFiles = true
-                it.encryptionMethod = EncryptionMethod.AES
-            }
+        val hasRemoteSource = selectedItems.any { sessionFileCoordinator.isVirtualPath(activity, it.path) }
+        if (!hasRemoteSource) {
+            showArchiveCompressionOptionsDialogWithChoices(
+                selectedItems = selectedItems,
+                destinationDirectory = destinationDirectory,
+                formatOptions = defaultLocalArchiveFormatChoices(),
+                remoteSource = false,
+                detectedTools = emptyList()
+            )
+            return
         }
 
+        val cancelled = AtomicBoolean(false)
+        val probeDialog = activity.getAlertDialogBuilder()
+            .setTitle("检测服务器压缩工具")
+            .setMessage("正在检测服务器压缩/解压工具...")
+            .setNegativeButton("取消", null)
+            .setCancelable(false)
+            .create()
+        probeDialog.setOnShowListener {
+            probeDialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+                cancelled.set(true)
+                it.isEnabled = false
+                probeDialog.setMessage("正在取消...")
+            }
+        }
         try {
-            sourcePaths.forEach { currentPath ->
-                var name: String
-                var mainFilePath = currentPath
-                val base = "${mainFilePath.getParentPath()}/"
-                res = zout
-                queue.push(mainFilePath)
-                if (activity.getIsPathDirectory(mainFilePath)) {
-                    name = "${mainFilePath.getFilenameFromPath()}/"
-                    val dirModified = File(mainFilePath).lastModified()
-                    zout.putNextEntry(
-                        ZipParameters().also {
-                            it.fileNameInZip = name
-                            it.lastModifiedFileTime = dirModified
-                        }
+            probeDialog.show()
+        } catch (_: Exception) {
+        }
+
+        ensureBackgroundThread {
+            val workflow = ArchiveTransferWorkflow(activity, sessionFileCoordinator)
+            val result = workflow.resolveCompressionFormatChoices(selectedItems, cancelled) { message ->
+                activity.runOnUiThread {
+                    if (!activity.isDestroyed && !activity.isFinishing && probeDialog.isShowing) {
+                        probeDialog.setMessage(message)
+                    }
+                }
+            }
+
+            activity.runOnUiThread {
+                dismissTransferDialog(probeDialog)
+                when {
+                    cancelled.get() -> activity.toast("操作已取消。")
+                    result.success -> showArchiveCompressionOptionsDialogWithChoices(
+                        selectedItems = selectedItems,
+                        destinationDirectory = destinationDirectory,
+                        formatOptions = result.choices,
+                        remoteSource = result.remoteSource,
+                        detectedTools = result.detectedTools
+                    )
+                    else -> showArchiveFailureDialog(
+                        ArchiveTransferWorkflow.ArchiveResult(
+                            success = false,
+                            message = result.message.ifBlank { "检测服务器压缩工具失败。" },
+                            dialogTitle = "服务器压缩工具不可用"
+                        )
                     )
                 }
+            }
+        }
+    }
 
-                while (!queue.isEmpty()) {
-                    mainFilePath = queue.pop()
-                    if (activity.getIsPathDirectory(mainFilePath)) {
-                        if (activity.isRestrictedSAFOnlyRoot(mainFilePath)) {
-                            activity.getAndroidSAFFileItems(mainFilePath, true) { files ->
-                                for (file in files) {
-                                    name = file.path.relativizeWith(base)
-                                    if (activity.getIsPathDirectory(file.path)) {
-                                        queue.push(file.path)
-                                        name = "${name.trimEnd('/')}/"
-                                        zout.putNextEntry(zipEntry(name, file.modified))
-                                    } else {
-                                        zout.putNextEntry(zipEntry(name, file.modified))
-                                        activity.getFileInputStreamSync(file.path)!!.copyTo(zout)
-                                        zout.closeEntry()
-                                    }
-                                }
-                            }
-                        } else {
-                            val mainFile = File(mainFilePath)
-                            for (file in mainFile.listFiles()) {
-                                name = file.path.relativizeWith(base)
-                                if (activity.getIsPathDirectory(file.absolutePath)) {
-                                    queue.push(file.absolutePath)
-                                    name = "${name.trimEnd('/')}/"
-                                    zout.putNextEntry(zipEntry(name, file.lastModified()))
-                                } else {
-                                    zout.putNextEntry(zipEntry(name, file.lastModified()))
-                                    activity.getFileInputStreamSync(file.path)!!.copyTo(zout)
-                                    zout.closeEntry()
-                                }
-                            }
-                        }
+    private fun showArchiveCompressionOptionsDialogWithChoices(
+        selectedItems: ArrayList<FileDirItem>,
+        destinationDirectory: String,
+        formatOptions: List<ArchiveTransferWorkflow.CompressionFormatChoice>,
+        remoteSource: Boolean,
+        detectedTools: List<String>
+    ) {
+        if (formatOptions.isEmpty()) {
+            showArchiveFailureDialog(
+                ArchiveTransferWorkflow.ArchiveResult(
+                    success = false,
+                    message = "没有可用的压缩格式。",
+                    dialogTitle = "服务器压缩工具不可用"
+                )
+            )
+            return
+        }
 
-                    } else {
-                        name =
-                            if (base == currentPath) {
-                                currentPath.getFilenameFromPath()
-                            } else {
-                                mainFilePath.relativizeWith(base)
-                            }
-                        val fileModified = File(mainFilePath).lastModified()
-                        zout.putNextEntry(zipEntry(name, fileModified))
-                        activity.getFileInputStreamSync(mainFilePath)!!.copyTo(zout)
-                        zout.closeEntry()
+        val container = createArchiveOptionsContainer()
+        val nameInput = createArchiveEditText(defaultCompressionName(selectedItems), "压缩包名称")
+        val levelOptions = listOf(
+            "标准（-mx=5）" to ArchiveTransferWorkflow.CompressionLevel.NORMAL,
+            "最快（-mx=1）" to ArchiveTransferWorkflow.CompressionLevel.FAST,
+            "最大（-mx=9）" to ArchiveTransferWorkflow.CompressionLevel.MAXIMUM,
+            "仅打包（-mx=0）" to ArchiveTransferWorkflow.CompressionLevel.STORE
+        )
+        val formatSpinner = createArchiveSpinner(formatOptions.map { it.label })
+        val levelSpinner = createArchiveSpinner(levelOptions.map { it.first })
+        val passwordCheck = CheckBox(activity).apply {
+            text = "使用密码"
+        }
+        val passwordInput = createArchiveEditText("", "密码").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            visibility = View.GONE
+        }
+        val encryptNamesCheck = CheckBox(activity).apply {
+            text = "加密文件名（仅 7z）"
+            isChecked = true
+            visibility = View.GONE
+        }
+        fun selectedFormat(): ArchiveTransferWorkflow.CompressionFormat {
+            return formatOptions[formatSpinner.selectedItemPosition.coerceAtLeast(0)].format
+        }
+        fun syncPasswordControls() {
+            val format = selectedFormat()
+            val canUsePassword = !remoteSource && archiveFormatSupportsPassword(format)
+            passwordCheck.beVisibleIf(canUsePassword)
+            if (!canUsePassword) {
+                passwordCheck.isChecked = false
+                passwordInput.text?.clear()
+            }
+            passwordInput.beVisibleIf(canUsePassword && passwordCheck.isChecked)
+            encryptNamesCheck.beVisibleIf(
+                canUsePassword &&
+                    passwordCheck.isChecked &&
+                    format == ArchiveTransferWorkflow.CompressionFormat.SEVEN_Z
+            )
+        }
+        passwordCheck.setOnCheckedChangeListener { _, _ ->
+            syncPasswordControls()
+        }
+        formatSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                syncPasswordControls()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {
+                syncPasswordControls()
+            }
+        }
+
+        addArchiveOption(container, "名称", nameInput)
+        addArchiveOption(container, "格式", formatSpinner)
+        addArchiveOption(container, "压缩等级", levelSpinner)
+        if (remoteSource && detectedTools.isNotEmpty()) {
+            container.addView(TextView(activity).apply {
+                text = "服务器工具：${detectedTools.joinToString("、")}"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            }, archiveOptionLayoutParams())
+        }
+        container.addView(passwordCheck, archiveOptionLayoutParams())
+        container.addView(passwordInput, archiveOptionLayoutParams())
+        container.addView(encryptNamesCheck, archiveOptionLayoutParams())
+        syncPasswordControls()
+
+        val dialog = activity.getAlertDialogBuilder()
+            .setTitle("压缩选项")
+            .setView(container)
+            .setPositiveButton("开始压缩", null)
+            .setNegativeButton(R.string.cancel, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val archiveName = nameInput.text?.toString()?.trim().orEmpty()
+                val password = if (passwordCheck.isChecked) passwordInput.text?.toString().orEmpty() else ""
+                val format = formatOptions[formatSpinner.selectedItemPosition].format
+                if (!validateArchiveName(archiveName)) {
+                    return@setOnClickListener
+                }
+                if (passwordCheck.isChecked && password.isEmpty()) {
+                    activity.toast(R.string.empty_password_new)
+                    return@setOnClickListener
+                }
+                if (!archiveFormatSupportsPassword(format) && password.isNotBlank()) {
+                    activity.toast("${format.suffix} 格式不支持密码")
+                    return@setOnClickListener
+                }
+
+                dialog.dismiss()
+                runArchiveCompressWorkflow(
+                    selectedItems = selectedItems,
+                    destinationDirectory = destinationDirectory,
+                    options = ArchiveTransferWorkflow.CompressionOptions(
+                        archiveName = archiveName,
+                        format = format,
+                        level = levelOptions[levelSpinner.selectedItemPosition].second,
+                        password = password,
+                        encryptFileNames = encryptNamesCheck.isChecked
+                    )
+                )
+            }
+        }
+        dialog.show()
+    }
+
+    private fun defaultLocalArchiveFormatChoices(): List<ArchiveTransferWorkflow.CompressionFormatChoice> {
+        return listOf(
+            ArchiveTransferWorkflow.CompressionFormatChoice(
+                format = ArchiveTransferWorkflow.CompressionFormat.SEVEN_Z,
+                label = "7z（推荐）"
+            ),
+            ArchiveTransferWorkflow.CompressionFormatChoice(
+                format = ArchiveTransferWorkflow.CompressionFormat.ZIP,
+                label = "ZIP"
+            ),
+            ArchiveTransferWorkflow.CompressionFormatChoice(
+                format = ArchiveTransferWorkflow.CompressionFormat.TAR,
+                label = "TAR"
+            )
+        )
+    }
+
+    private fun archiveFormatSupportsPassword(format: ArchiveTransferWorkflow.CompressionFormat): Boolean {
+        return format == ArchiveTransferWorkflow.CompressionFormat.SEVEN_Z ||
+            format == ArchiveTransferWorkflow.CompressionFormat.ZIP
+    }
+
+    private fun showArchiveDecompressionOptionsDialog(
+        selectedItems: ArrayList<FileDirItem>,
+        destinationDirectory: String
+    ) {
+        val container = createArchiveOptionsContainer()
+        val nameInput = createArchiveEditText(defaultDecompressionName(selectedItems), "输出文件夹名称")
+        val conflictOptions = listOf(
+            "自动重命名（-aou）" to ArchiveTransferWorkflow.DecompressConflictStrategy.AUTO_RENAME,
+            "覆盖已有（-aoa）" to ArchiveTransferWorkflow.DecompressConflictStrategy.OVERWRITE,
+            "跳过已有（-aos）" to ArchiveTransferWorkflow.DecompressConflictStrategy.SKIP_EXISTING
+        )
+        val conflictSpinner = createArchiveSpinner(conflictOptions.map { it.first })
+
+        addArchiveOption(container, "输出文件夹", nameInput)
+        addArchiveOption(container, "冲突策略", conflictSpinner)
+
+        val dialog = activity.getAlertDialogBuilder()
+            .setTitle("解压选项")
+            .setView(container)
+            .setPositiveButton("开始解压", null)
+            .setNegativeButton(R.string.cancel, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val outputName = nameInput.text?.toString()?.trim().orEmpty()
+                if (!validateArchiveName(outputName)) {
+                    return@setOnClickListener
+                }
+
+                dialog.dismiss()
+                runArchiveDecompressWorkflow(
+                    selectedItems = selectedItems,
+                    destinationDirectory = destinationDirectory,
+                    options = ArchiveTransferWorkflow.DecompressOptions(
+                        outputFolderName = outputName,
+                        conflictStrategy = conflictOptions[conflictSpinner.selectedItemPosition].second
+                    )
+                )
+            }
+        }
+        dialog.show()
+    }
+
+    private fun createArchiveOptionsContainer(): LinearLayout {
+        val margin = resources.getDimensionPixelSize(R.dimen.activity_margin)
+        return LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(margin, margin / 2, margin, 0)
+        }
+    }
+
+    private fun addArchiveOption(container: LinearLayout, label: String, view: View) {
+        container.addView(TextView(activity).apply {
+            text = label
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        }, archiveOptionLayoutParams())
+        container.addView(view, archiveOptionLayoutParams())
+    }
+
+    private fun createArchiveEditText(value: String, hintText: String): EditText {
+        return EditText(activity).apply {
+            setText(value)
+            hint = hintText
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            selectAll()
+        }
+    }
+
+    private fun createArchiveSpinner(labels: List<String>): Spinner {
+        return Spinner(activity).apply {
+            adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_item, labels).also {
+                it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+        }
+    }
+
+    private fun archiveOptionLayoutParams(): LinearLayout.LayoutParams {
+        val topMargin = resources.getDimensionPixelSize(R.dimen.small_margin)
+        return LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            this.topMargin = topMargin
+        }
+    }
+
+    private fun validateArchiveName(name: String): Boolean {
+        return when {
+            name.isBlank() -> {
+                activity.toast(R.string.empty_name)
+                false
+            }
+            !name.isAValidFilename() -> {
+                activity.toast(R.string.invalid_name)
+                false
+            }
+            else -> true
+        }
+    }
+
+    private fun defaultCompressionName(selectedItems: List<FileDirItem>): String {
+        val base = if (selectedItems.size == 1) {
+            val item = selectedItems.first()
+            val name = item.name.ifBlank { item.path.getFilenameFromPath() }.ifBlank { "archive" }
+            if (!item.isDirectory && name.contains('.')) {
+                name.substringBeforeLast('.').ifBlank { name }
+            } else {
+                name
+            }
+        } else {
+            selectedItems.firstOrNull()?.path?.getParentPath()?.getFilenameFromPath().orEmpty().ifBlank { "archive" }
+        }
+        return sanitizeArchiveDialogName(base).ifBlank { "archive" }
+    }
+
+    private fun defaultDecompressionName(selectedItems: List<FileDirItem>): String {
+        val firstName = selectedItems.firstOrNull()?.name
+            ?: selectedItems.firstOrNull()?.path?.getFilenameFromPath()
+            ?: "extracted"
+        return sanitizeArchiveDialogName(stripArchiveSuffix(firstName)).ifBlank { "extracted" }
+    }
+
+    private fun stripArchiveSuffix(name: String): String {
+        val suffix = ARCHIVE_DIALOG_SUFFIXES
+            .filter { name.endsWith(it, ignoreCase = true) }
+            .maxByOrNull { it.length }
+            .orEmpty()
+        return if (suffix.isBlank()) name else name.dropLast(suffix.length)
+    }
+
+    private fun sanitizeArchiveDialogName(raw: String): String {
+        return raw.replace('\\', '/')
+            .substringAfterLast('/')
+            .trim()
+            .trimEnd('.')
+    }
+
+    private fun runArchiveCompressWorkflow(
+        selectedItems: ArrayList<FileDirItem>,
+        destinationDirectory: String,
+        options: ArchiveTransferWorkflow.CompressionOptions
+    ) {
+        runArchiveWorkflow(
+            title = "压缩中",
+            initialMessage = "正在准备压缩...",
+            destinationDirectory = destinationDirectory
+        ) { workflow, cancelled, progress ->
+            workflow.compress(selectedItems, destinationDirectory, cancelled, progress, options)
+        }
+    }
+
+    private fun runArchiveDecompressWorkflow(
+        selectedItems: ArrayList<FileDirItem>,
+        destinationDirectory: String,
+        options: ArchiveTransferWorkflow.DecompressOptions
+    ) {
+        runArchiveWorkflow(
+            title = "解压中",
+            initialMessage = "正在准备解压...",
+            destinationDirectory = destinationDirectory
+        ) { workflow, cancelled, progress ->
+            workflow.decompress(selectedItems, destinationDirectory, cancelled, progress, options)
+        }
+    }
+
+    private fun runArchiveWorkflow(
+        title: String,
+        initialMessage: String,
+        destinationDirectory: String,
+        operation: (
+            workflow: ArchiveTransferWorkflow,
+            cancelled: AtomicBoolean,
+            progress: (String) -> Unit
+        ) -> ArchiveTransferWorkflow.ArchiveResult
+    ) {
+        if (activity.isDestroyed || activity.isFinishing) {
+            return
+        }
+
+        config.lastCopyPath = destinationDirectory
+        val progressDialog = activity.getAlertDialogBuilder()
+            .setTitle(title)
+            .setMessage(initialMessage)
+            .setNegativeButton("取消", null)
+            .setCancelable(false)
+            .create()
+        val cancelled = AtomicBoolean(false)
+        progressDialog.setOnShowListener {
+            progressDialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+                cancelled.set(true)
+                it.isEnabled = false
+                progressDialog.setMessage("正在取消...")
+            }
+        }
+        try {
+            progressDialog.show()
+        } catch (_: Exception) {
+        }
+
+        ensureBackgroundThread {
+            val workflow = ArchiveTransferWorkflow(activity, sessionFileCoordinator)
+            val result = operation(workflow, cancelled) { message ->
+                activity.runOnUiThread {
+                    if (!activity.isDestroyed && !activity.isFinishing && progressDialog.isShowing) {
+                        progressDialog.setMessage(message)
                     }
                 }
             }
-        } catch (exception: Exception) {
-            activity.showErrorToast(exception)
-            return false
-        } finally {
-            res.close()
+
+            activity.runOnUiThread {
+                dismissTransferDialog(progressDialog)
+                when {
+                    result.success -> {
+                        activity.toast(result.message.ifBlank { "归档操作完成。" })
+                        if (result.targetPath.isNotBlank() && result.highlightPaths.isNotEmpty()) {
+                            listener?.openPathAndHighlight(result.targetPath, result.highlightPaths)
+                        } else {
+                            listener?.refreshFragment()
+                        }
+                    }
+
+                    result.cancelled -> {
+                        activity.toast(result.message.ifBlank { "操作已取消。" })
+                        listener?.refreshFragment()
+                    }
+
+                    result.installCommand.isNotBlank() -> {
+                        showArchiveToolInstallDialog(result)
+                        listener?.refreshFragment()
+                    }
+
+                    result.dialogTitle.isNotBlank() -> {
+                        showArchiveFailureDialog(result)
+                        listener?.refreshFragment()
+                    }
+
+                    else -> {
+                        activity.toast(result.message.ifBlank { "归档操作失败，请重试。" })
+                        listener?.refreshFragment()
+                    }
+                }
+                finishActMode()
+            }
         }
-        return true
+    }
+
+    private fun showArchiveToolInstallDialog(result: ArchiveTransferWorkflow.ArchiveResult) {
+        val command = result.installCommand
+        val message = result.message.ifBlank { "本地缺少 7-Zip 工具链。请在 Termux 终端执行安装命令后重试。" } +
+            "\n\n安装命令：\n$command"
+        activity.getAlertDialogBuilder()
+            .setTitle("需要安装 7-Zip")
+            .setMessage(message)
+            .setPositiveButton("复制命令") { _, _ ->
+                activity.copyToClipboard(command)
+                activity.toast("安装命令已复制")
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showArchiveFailureDialog(result: ArchiveTransferWorkflow.ArchiveResult) {
+        activity.getAlertDialogBuilder()
+            .setTitle(result.dialogTitle.ifBlank { "归档操作失败" })
+            .setMessage(result.message.ifBlank { "归档操作失败，请重试。" })
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
     }
 
     private fun askConfirmDelete() {
@@ -1949,6 +2074,7 @@ class ItemsAdapter(
             currentItemsHash = newItems.hashCode()
             textToHighlight = highlightText
             listItems = newItems.clone() as ArrayList<ListItem>
+            recentDisplayPathCache.clear()
             notifyDataSetChanged()
             finishActMode()
         } else if (textToHighlight != highlightText) {
@@ -2045,6 +2171,9 @@ class ItemsAdapter(
     fun setRecentPathMetadataEnabled(enabled: Boolean) {
         if (showRecentPathMetadata == enabled) return
         showRecentPathMetadata = enabled
+        if (!enabled) {
+            recentDisplayPathCache.clear()
+        }
         notifyDataSetChanged()
     }
 
@@ -2059,8 +2188,15 @@ class ItemsAdapter(
 
     fun isGridTypeDivider(position: Int) = listItems.getOrNull(position)?.isGridTypeDivider ?: false
 
+    override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
+        super.onAttachedToRecyclerView(recyclerView)
+        ActiveTransferRegistry.addListener(transferProgressListener)
+    }
+
     override fun onViewRecycled(holder: ViewHolder) {
         super.onViewRecycled(holder)
+        Binding.getByItemViewType(holder.itemViewType, isListViewType)
+            .bind(holder.itemView).itemTransferProgress?.bind(null)
         if (!activity.isDestroyed && !activity.isFinishing) {
             val icon = Binding.getByItemViewType(holder.itemViewType, isListViewType)
                 .bind(holder.itemView).itemIcon
@@ -2071,9 +2207,24 @@ class ItemsAdapter(
     }
 
     override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        ActiveTransferRegistry.removeListener(transferProgressListener)
         clearPendingHighlightClear()
         transientHighlightKeys.clear()
         super.onDetachedFromRecyclerView(recyclerView)
+    }
+
+    private fun notifyTransferProgressChanged(changedPaths: Set<String>) {
+        if (activity.isDestroyed || activity.isFinishing || changedPaths.isEmpty()) return
+        changedPaths.forEach { path ->
+            val position = listItems.indexOfFirst { it.path == path }
+            if (position != -1) {
+                notifyItemChanged(position + positionOffset, PAYLOAD_TRANSFER_PROGRESS)
+            }
+        }
+    }
+
+    private fun bindTransferProgress(binding: ItemViewBinding, listItem: ListItem) {
+        binding.itemTransferProgress?.bind(ActiveTransferRegistry.stateFor(listItem.path))
     }
 
     private fun setupView(binding: ItemViewBinding, listItem: ListItem) {
@@ -2141,7 +2292,7 @@ class ItemsAdapter(
                     itemDate?.beGone()
                 } else {
                     if (showRecentPathMetadata && isListViewType) {
-                        itemDetails?.text = listItem.path
+                        itemDetails?.text = listItem.getRecentDisplayPath()
                         itemDetails?.alpha = 0.48f
                         itemDetails?.setTextSize(TypedValue.COMPLEX_UNIT_PX, recentMetadataFontSize)
                         itemDate?.beVisible()
@@ -2177,7 +2328,17 @@ class ItemsAdapter(
                             .into(itemIcon!!)
                     }
                 }
+                bindTransferProgress(this, listItem)
+            } else {
+                itemTransferProgress?.bind(null)
             }
+        }
+    }
+
+    private fun ListItem.getRecentDisplayPath(): String {
+        recentDisplayPath?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        return recentDisplayPathCache.getOrPut(path) {
+            RecentPathFormatter.displayPath(activity, path, sessionFileCoordinator)
         }
     }
 
@@ -2392,6 +2553,7 @@ class ItemsAdapter(
         val itemDetails: TextView?
         val itemDate: TextView?
         val itemSection: TextView?
+        val itemTransferProgress: InlineTransferProgressView?
     }
 
     private class ItemSectionBindingAdapter(val binding: ItemSectionBinding) : ItemViewBinding {
@@ -2402,6 +2564,7 @@ class ItemsAdapter(
         override val itemDate: TextView? = null
         override val itemCheck: ImageView? = null
         override val itemSection: TextView = binding.itemSection
+        override val itemTransferProgress: InlineTransferProgressView? = null
         override fun getRoot(): View = binding.root
     }
 
@@ -2413,6 +2576,7 @@ class ItemsAdapter(
         override val itemDate: TextView? = null
         override val itemCheck: ImageView? = null
         override val itemSection: TextView? = null
+        override val itemTransferProgress: InlineTransferProgressView? = null
 
         override fun getRoot(): View = binding.root
     }
@@ -2427,6 +2591,7 @@ class ItemsAdapter(
         override val itemDate: TextView = binding.itemDate
         override val itemCheck: ImageView? = null
         override val itemSection: TextView? = null
+        override val itemTransferProgress: InlineTransferProgressView = binding.itemTransferProgress
 
         override fun getRoot(): View = binding.root
     }
@@ -2439,6 +2604,7 @@ class ItemsAdapter(
         override val itemDate: TextView? = null
         override val itemCheck: ImageView = binding.itemCheck
         override val itemSection: TextView? = null
+        override val itemTransferProgress: InlineTransferProgressView = binding.itemTransferProgress
 
         override fun getRoot(): View = binding.root
     }
@@ -2451,6 +2617,7 @@ class ItemsAdapter(
         override val itemDate: TextView? = null
         override val itemCheck: ImageView? = null
         override val itemSection: TextView? = null
+        override val itemTransferProgress: InlineTransferProgressView = binding.itemTransferProgress
 
         override fun getRoot(): View = binding.root
     }

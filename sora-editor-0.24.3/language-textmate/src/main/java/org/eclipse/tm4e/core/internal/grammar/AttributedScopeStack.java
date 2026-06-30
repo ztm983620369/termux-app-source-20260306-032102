@@ -33,7 +33,14 @@ import org.eclipse.tm4e.core.internal.utils.StringUtils;
 public final class AttributedScopeStack {
 
 	@NonNullByDefault({}) // https://github.com/eclipse-jdt/eclipse.jdt.core/issues/233
-	record Frame(int encodedTokenAttributes, List<String> scopeNames) {
+	static final class Frame {
+		final int encodedTokenAttributes;
+		final List<String> scopeNames;
+
+		Frame(final int encodedTokenAttributes, final List<String> scopeNames) {
+			this.encodedTokenAttributes = encodedTokenAttributes;
+			this.scopeNames = scopeNames;
+		}
 	}
 
 	@Nullable

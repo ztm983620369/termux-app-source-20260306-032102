@@ -26,6 +26,9 @@ import org.fossify.filemanager.databinding.ActivityReadTextBinding
 import org.fossify.filemanager.dialogs.SaveAsDialog
 import org.fossify.filemanager.extensions.openPath
 import org.fossify.filemanager.views.GestureEditText
+import com.termux.ecjbridge.EcjBridgeContract
+import com.termux.ecjbridge.EcjProjectDetector
+import com.termux.ecjbridge.EcjProjectLauncher
 import java.io.File
 import java.io.OutputStream
 
@@ -91,6 +94,9 @@ class ReadTextActivity : SimpleActivity() {
         }
 
         setupSearchButtons()
+        binding.readTextEcjRun.setOnClickListener {
+            runEcjProjectFromEditor()
+        }
     }
 
     override fun onResume() {
@@ -173,6 +179,7 @@ class ReadTextActivity : SimpleActivity() {
         if (filePath.isEmpty()) {
             filePath = getRealPathFromURI(intent.data!!) ?: ""
         }
+        refreshEditorEcjRunButton()
     }
 
     private fun saveAsText(shouldExitAfterSaving: Boolean = false) {
@@ -325,7 +332,64 @@ class ReadTextActivity : SimpleActivity() {
             } else {
                 showKeyboard(binding.readTextView)
             }
+            refreshEditorEcjRunButton()
         }
+    }
+
+    private fun refreshEditorEcjRunButton() {
+        binding.readTextEcjRun.beVisibleIf(findEcjProjectRootForEditorFile() != null)
+    }
+
+    private fun runEcjProjectFromEditor() {
+        val projectRoot = findEcjProjectRootForEditorFile()
+        if (projectRoot == null) {
+            toast("当前文件不属于 ECJ 项目")
+            return
+        }
+        if (!saveEditorTextBeforeEcjRun()) {
+            return
+        }
+
+        try {
+            EcjProjectLauncher.launchProject(this, projectRoot)
+        } catch (_: android.content.ActivityNotFoundException) {
+            toast("未找到 ECJ App：${EcjBridgeContract.ECJ_APP_PACKAGE}")
+        } catch (t: Throwable) {
+            toast(t.message ?: t.toString())
+        }
+    }
+
+    private fun saveEditorTextBeforeEcjRun(): Boolean {
+        updateResolvedFilePathForReadOnlyCheck()
+        if (filePath.isBlank()) return true
+
+        val currentText = binding.readTextView.text.toString()
+        if (currentText == originalText) return true
+
+        return try {
+            File(filePath).writeText(currentText)
+            originalText = currentText
+            true
+        } catch (t: Throwable) {
+            showErrorToast(t.message ?: t.toString())
+            false
+        }
+    }
+
+    private fun findEcjProjectRootForEditorFile(): File? {
+        updateResolvedFilePathForReadOnlyCheck()
+        return EcjProjectDetector.findNearestProjectRoot(filePath)
+    }
+
+    private fun updateResolvedFilePathForReadOnlyCheck() {
+        if (filePath.isNotEmpty()) return
+        filePath = runCatching {
+            when {
+                intent.extras?.containsKey(REAL_FILE_PATH) == true -> intent.extras?.get(REAL_FILE_PATH).toString()
+                intent.data != null -> getRealPathFromURI(intent.data!!) ?: ""
+                else -> ""
+            }
+        }.getOrNull().orEmpty()
     }
 
     private fun setupSearchButtons() {

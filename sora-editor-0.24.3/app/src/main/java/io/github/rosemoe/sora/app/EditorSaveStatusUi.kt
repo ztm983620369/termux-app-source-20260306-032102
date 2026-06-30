@@ -13,15 +13,30 @@ internal class EditorSaveStatusUi {
     private var rootView: View? = null
     private var spinnerView: ProgressBar? = null
     private var syncedDotView: View? = null
+    private var hasClickAction: Boolean = false
 
-    fun bind(menu: Menu) {
+    fun bind(menu: Menu, onClick: (() -> Unit)? = null) {
         menuItem = menu.findItem(R.id.save_sync_status)
         val actionView = menuItem?.actionView
         rootView = actionView
         spinnerView = actionView?.findViewById(R.id.save_sync_spinner)
         syncedDotView = actionView?.findViewById(R.id.save_sync_dot)
-        actionView?.isClickable = false
-        actionView?.isFocusable = false
+        hasClickAction = onClick != null
+        actionView?.isClickable = hasClickAction
+        actionView?.isFocusable = hasClickAction
+        actionView?.setOnClickListener(
+            onClick?.let { click ->
+                View.OnClickListener { click() }
+            }
+        )
+        menuItem?.setOnMenuItemClickListener(
+            onClick?.let { click ->
+                MenuItem.OnMenuItemClickListener {
+                    click()
+                    true
+                }
+            }
+        )
     }
 
     fun render(snapshot: EditorSyncSnapshot) {
@@ -32,6 +47,11 @@ internal class EditorSaveStatusUi {
             if (visible && snapshot.indicatorState == EditorSyncIndicatorState.SPINNING) View.VISIBLE else View.GONE
         syncedDotView?.visibility =
             if (visible && snapshot.indicatorState == EditorSyncIndicatorState.SYNCED) View.VISIBLE else View.GONE
-        rootView?.contentDescription = snapshot.statusText ?: menuItem?.title
+        val statusText = snapshot.statusText ?: menuItem?.title
+        rootView?.contentDescription = if (hasClickAction && visible) {
+            "$statusText，点击刷新最新内容"
+        } else {
+            statusText
+        }
     }
 }

@@ -91,7 +91,6 @@ import com.termux.bridge.FileOpenListener;
 import com.termux.bridge.FileEditorContract;
 import com.termux.bridge.FileOpenEvent;
 import com.termux.bridge.FileOpenRequest;
-import com.termux.ui.nav.UiShellNavBridge;
 import com.termux.extensionshub.ExtensionsHubController;
 import java.io.BufferedReader;
 import java.io.File;
@@ -356,6 +355,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private FmActivityMainBinding mFileManagerBinding;
     private Bundle mFileManagerSavedState;
     private Intent mFileManagerIntent;
+    @Nullable
+    private String mPendingFileManagerOpenPath;
     private TermuxActivityUiReceiver mUiReceiver;
     private FileObserver mUiRequestFileObserver;
     @Nullable
@@ -912,12 +913,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
     public void openFilesAtPath(String path) {
         if (path == null || path.trim().isEmpty()) return;
-        UiShellNavBridge.setRequestedFilesDir(this, path);
+        mPendingFileManagerOpenPath = path.trim();
         if (mFileManagerIntent == null) mFileManagerIntent = new Intent();
         mFileManagerIntent.setAction(Intent.ACTION_VIEW);
-        mFileManagerIntent.setData(Uri.fromFile(new File(path)));
+        mFileManagerIntent.setData(Uri.fromFile(new File(mPendingFileManagerOpenPath)));
         if (mFileManagerController != null) {
-            mFileManagerController.openPath(path, true);
+            mFileManagerController.openPath(mPendingFileManagerOpenPath, true);
+            mPendingFileManagerOpenPath = null;
         }
         if (mBottomNavigationView != null) {
             mBottomNavigationView.setSelectedItemId(TAB_FILES);
@@ -961,6 +963,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     public void createDocumentConfirmed(String path) {
         if (mFileManagerController != null) {
             mFileManagerController.createDocumentConfirmed(path);
+        }
+    }
+
+    @Override
+    public void runEcjProject(String path) {
+        if (mFileManagerController != null) {
+            mFileManagerController.runEcjProject(path);
         }
     }
 
@@ -1826,7 +1835,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             if (mFileManagerSavedState != null) {
                 mFileManagerController.onRestoreInstanceState(mFileManagerSavedState);
             } else {
-                String requested = UiShellNavBridge.consumeRequestedFilesDir(this);
+                String requested = mPendingFileManagerOpenPath;
+                mPendingFileManagerOpenPath = null;
                 if (requested != null && !requested.trim().isEmpty()) {
                     mFileManagerController.openPath(requested.trim(), true);
                 }
@@ -1906,9 +1916,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                             if (intent != null && intent.getExtras() != null) {
                                 launchFailsafe = intent.getExtras().getBoolean(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
                             }
-                            boolean restoredPinnedSsh = mTermuxTerminalSessionActivityClient != null &&
+                            boolean restoredTermuxSessions = mTermuxTerminalSessionActivityClient != null &&
+                                mTermuxTerminalSessionActivityClient.restoreTermuxSessionsIfRequested(launchFailsafe);
+                            boolean restoredPinnedSsh = !restoredTermuxSessions && mTermuxTerminalSessionActivityClient != null &&
                                 mTermuxTerminalSessionActivityClient.ensurePinnedSshSession(true);
-                            if (!restoredPinnedSsh) {
+                            if (!restoredTermuxSessions && !restoredPinnedSsh) {
                                 mTermuxTerminalSessionActivityClient.addNewSession(launchFailsafe, null);
                             }
                         } catch (WindowManager.BadTokenException e) {
@@ -1928,12 +1940,17 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                     boolean isFailSafe = intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
                     mTermuxTerminalSessionActivityClient.addNewSession(isFailSafe, null);
                 } else {
-                    bootstrapTerminalSessionSelection(mTermuxTerminalSessionActivityClient.getCurrentStoredSessionOrLast());
+                    bootstrapTerminalSessionSelection(mTermuxTerminalSessionActivityClient.getRestoreForegroundSessionOrStoredOrLast());
                 }
             }
 
             // Update the {@link TerminalSession} and {@link TerminalEmulator} clients.
             mTermuxService.setTermuxTerminalSessionClient(mTermuxTerminalSessionActivityClient);
+            if (mTermuxTerminalSessionActivityClient != null) {
+                boolean launchFailsafe = intent != null && intent.getExtras() != null &&
+                    intent.getExtras().getBoolean(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
+                mTermuxTerminalSessionActivityClient.materializeDetachedCrushSessionsIfRequested(launchFailsafe);
+            }
         } finally {
             endSessionUiBatch();
         }
@@ -2158,6 +2175,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                         TerminalSession terminalSession = termuxSession.getTerminalSession();
                         if (terminalSession == null) return;
 
+                        if (service.getTermuxSessionsSize() <= 1 &&
+                            !mTermuxTerminalSessionActivityClient.ensureSessionBeforeClosingLastTab(terminalSession)) {
+                            return;
+                        }
+
                         int sessionsSize = service.getTermuxSessionsSize();
                         boolean isClosingCurrent = terminalSession == getCurrentSession();
 
@@ -2174,14 +2196,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                             refreshTerminalTopBar();
                         }
 
+                        mTermuxTerminalSessionActivityClient.forgetSessionRestoreForUserAction(terminalSession);
                         if (terminalSession.isRunning()) {
                             termuxSession.killIfExecuting(TermuxActivity.this, true);
                         } else {
                             service.removeTermuxSession(terminalSession);
-                        }
-
-                        if (sessionsSize <= 1 && !getTerminalSelectionSnapshot(null).configSelected) {
-                            finishActivityIfNotFinishing();
                         }
                     }
 
@@ -2292,6 +2311,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (accepted) {
             applyTerminalProgrammaticFocusPolicy(false);
             dispatchCommittedSessionSelection(session);
+            if (mTermuxTerminalSessionActivityClient != null) {
+                mTermuxTerminalSessionActivityClient.persistTerminalSessionSelection(session);
+            }
         }
         refreshTerminalSessionSurface();
         refreshTerminalTopBar();
@@ -3154,6 +3176,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         b.setMessage(R.string.title_confirm_kill_process);
         b.setPositiveButton(android.R.string.yes, (dialog, id) -> {
             dialog.dismiss();
+            if (mTermuxTerminalSessionActivityClient != null) {
+                mTermuxTerminalSessionActivityClient.destroySessionRestoreForUserAction(session);
+            }
             session.finishIfRunning();
         });
         b.setNegativeButton(android.R.string.no, null);

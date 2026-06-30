@@ -27,7 +27,10 @@ data class EditorSyncTarget(
     val originPath: String? = null,
     val originDisplayPath: String? = null,
     val originModifiedMs: Long? = null,
-    val originSize: Long? = null
+    val originSize: Long? = null,
+    val originSha256: String? = null,
+    val originFingerprintLevel: String? = null,
+    val originFingerprintMethod: String? = null
 ) {
     fun supportsSaving(): Boolean {
         return !readOnly && localPath.isNotBlank()
@@ -55,6 +58,7 @@ data class EditorSyncSnapshot(
     val lastSuccessfulRevision: Long = 0L,
     val inFlightRevision: Long? = null,
     val inFlightTrigger: EditorSaveTrigger? = null,
+    val externalReloadInProgress: Boolean = false,
     val hasUnsavedChanges: Boolean = false,
     val canSave: Boolean = false,
     val indicatorState: EditorSyncIndicatorState = EditorSyncIndicatorState.HIDDEN,

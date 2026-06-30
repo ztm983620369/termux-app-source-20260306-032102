@@ -40,15 +40,32 @@ import org.eclipse.tm4e.core.internal.rule.RuleId;
 public final class StateStack implements IStateStack {
 
 	@NonNullByDefault({}) // https://github.com/eclipse-jdt/eclipse.jdt.core/issues/233
-	record Frame(
-			RuleId ruleId,
-			@Nullable Integer enterPos,
-			@Nullable Integer anchorPos,
-			boolean beginRuleCapturedEOL,
-			@Nullable String endRule,
-			List<AttributedScopeStack.Frame> nameScopesList,
-			/** on top of nameScopesList */
-			List<AttributedScopeStack.Frame> contentNameScopesList) {
+	static final class Frame {
+		final RuleId ruleId;
+		final @Nullable Integer enterPos;
+		final @Nullable Integer anchorPos;
+		final boolean beginRuleCapturedEOL;
+		final @Nullable String endRule;
+		final List<AttributedScopeStack.Frame> nameScopesList;
+		/** on top of nameScopesList */
+		final List<AttributedScopeStack.Frame> contentNameScopesList;
+
+		Frame(
+				final RuleId ruleId,
+				final @Nullable Integer enterPos,
+				final @Nullable Integer anchorPos,
+				final boolean beginRuleCapturedEOL,
+				final @Nullable String endRule,
+				final List<AttributedScopeStack.Frame> nameScopesList,
+				final List<AttributedScopeStack.Frame> contentNameScopesList) {
+			this.ruleId = ruleId;
+			this.enterPos = enterPos;
+			this.anchorPos = anchorPos;
+			this.beginRuleCapturedEOL = beginRuleCapturedEOL;
+			this.endRule = endRule;
+			this.nameScopesList = nameScopesList;
+			this.contentNameScopesList = contentNameScopesList;
+		}
 	}
 
 	public static final StateStack NULL = new StateStack(

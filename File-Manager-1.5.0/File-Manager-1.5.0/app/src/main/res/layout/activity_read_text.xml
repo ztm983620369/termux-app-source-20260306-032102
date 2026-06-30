@@ -17,7 +17,16 @@
             android:background="@color/color_primary"
             app:menu="@menu/menu_editor"
             app:title="@string/file_editor"
-            app:titleTextAppearance="@style/AppTheme.ActionBar.TitleTextStyle" />
+            app:titleTextAppearance="@style/AppTheme.ActionBar.TitleTextStyle">
+
+            <org.fossify.filemanager.views.EcjRunCapsuleButton
+                android:id="@+id/read_text_ecj_run"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_gravity="end|center_vertical"
+                android:layout_marginEnd="8dp"
+                android:visibility="gone" />
+        </com.google.android.material.appbar.MaterialToolbar>
 
     </org.fossify.commons.views.MyAppBarLayout>
 

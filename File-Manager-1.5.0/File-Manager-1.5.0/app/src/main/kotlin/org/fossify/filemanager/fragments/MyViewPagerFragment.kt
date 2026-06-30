@@ -8,7 +8,6 @@ import com.termux.bridge.FileOpenRequest
 import com.termux.sessionsync.SessionFileCoordinator
 import org.fossify.commons.extensions.*
 import org.fossify.commons.helpers.VIEW_TYPE_LIST
-import org.fossify.commons.helpers.ensureBackgroundThread
 import org.fossify.commons.models.FileDirItem
 import org.fossify.commons.views.MyFloatingActionButton
 import org.fossify.filemanager.R
@@ -20,7 +19,10 @@ import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.extensions.isPathOnRoot
 import org.fossify.filemanager.extensions.openPath
 import org.fossify.filemanager.extensions.tryOpenPathIntent
-import org.fossify.filemanager.helpers.OPEN_AS_IMAGE
+import org.fossify.filemanager.helpers.ActiveTransferStatus
+import org.fossify.filemanager.helpers.FileOpenStateMachine
+import org.fossify.filemanager.helpers.RemoteDeleteCoordinator
+import org.fossify.filemanager.helpers.RemoteDeleteOutcome
 import org.fossify.filemanager.helpers.RootHelpers
 import org.fossify.filemanager.interfaces.FileManagerDependencies
 
@@ -62,10 +64,11 @@ abstract class MyViewPagerFragment<BINDING : MyViewPagerFragment.InnerBinding>(c
             }
         } else {
             if (openRequest != null) {
-                if (shouldOpenRemoteImageWithSystemViewer(openRequest)) {
-                    activity?.openPath(path, false, OPEN_AS_IMAGE)
-                } else {
-                    FileOpenBridge.dispatch(openRequest)
+                when (val action = FileOpenStateMachine.decide(openRequest.toFileOpenStateInput()).action) {
+                    is FileOpenStateMachine.Action.OpenInEditor -> FileOpenBridge.dispatch(action.request)
+                    is FileOpenStateMachine.Action.OpenWithSystemViewer -> {
+                        activity?.openPath(action.path, action.forceChooser, action.openAsType)
+                    }
                 }
             } else {
                 activity?.tryOpenPathIntent(path, false)
@@ -73,10 +76,14 @@ abstract class MyViewPagerFragment<BINDING : MyViewPagerFragment.InnerBinding>(c
         }
     }
 
-    private fun shouldOpenRemoteImageWithSystemViewer(openRequest: FileOpenRequest): Boolean {
-        if (openRequest.originType != FileOpenRequest.ORIGIN_SFTP_VIRTUAL) return false
-        val mimeType = openRequest.mimeType?.lowercase() ?: return false
-        return mimeType.startsWith("image/")
+    private fun FileOpenRequest.toFileOpenStateInput(): FileOpenStateMachine.Input {
+        return FileOpenStateMachine.Input(
+            path = path,
+            displayName = displayName,
+            extension = extension,
+            mimeType = mimeType,
+            request = this
+        )
     }
 
     fun updateIsCreateDocumentIntent(isCreateDocumentIntent: Boolean) {
@@ -144,48 +151,71 @@ abstract class MyViewPagerFragment<BINDING : MyViewPagerFragment.InnerBinding>(c
 
     private fun deleteRemoteFiles(files: ArrayList<FileDirItem>, onFinished: () -> Unit) {
         val simpleActivity = activity as? SimpleActivity ?: return
-        val progressDialog = simpleActivity.getAlertDialogBuilder()
-            .setTitle("服务器删除中")
-            .setMessage("正在准备删除...")
-            .setCancelable(false)
-            .create()
-        try {
-            progressDialog.show()
-        } catch (_: Exception) {
+        RemoteDeleteCoordinator.start(
+            activity = simpleActivity,
+            sessionFileCoordinator = SessionFileCoordinator.getInstance(),
+            sourceItems = files,
+            onOutcome = { outcome ->
+                cleanupDeletedRemoteFavorites(simpleActivity, files, outcome)
+                showRemoteDeleteOutcome(simpleActivity, outcome)
+            },
+            onFinish = onFinished
+        )
+    }
+
+    private fun cleanupDeletedRemoteFavorites(
+        simpleActivity: SimpleActivity,
+        files: ArrayList<FileDirItem>,
+        outcome: RemoteDeleteOutcome
+    ) {
+        outcome.deletedVirtualPaths.forEach { path -> simpleActivity.config.removeFavorite(path) }
+        val deletedParents = outcome.deletedVirtualPaths.filter { it.isNotBlank() }
+        files.forEach { file ->
+            if (deletedParents.any { parent -> file.path == parent || file.path.startsWith("$parent/") }) {
+                simpleActivity.config.removeFavorite(file.path)
+            }
         }
+    }
 
-        ensureBackgroundThread {
-            var deletedCount = 0
-            val deletedPaths = ArrayList<String>()
-            val failed = ArrayList<String>()
-            files.forEachIndexed { index, file ->
-                simpleActivity.runOnUiThread {
-                    if (!simpleActivity.isDestroyed && !simpleActivity.isFinishing && progressDialog.isShowing) {
-                        progressDialog.setMessage("正在删除 ${index + 1}/${files.size}\n${file.name.ifBlank { file.path.getFilenameFromPath() }}")
-                    }
-                }
-                val result = SessionFileCoordinator.getInstance().deleteVirtualPath(simpleActivity.applicationContext, file.path)
-                if (result.success) {
-                    deletedCount++
-                    deletedPaths.add(file.path)
-                } else {
-                    failed.add(file.name.ifBlank { file.path.getFilenameFromPath() })
-                }
-            }
+    private fun showRemoteDeleteOutcome(simpleActivity: SimpleActivity, outcome: RemoteDeleteOutcome) {
+        val elapsed = RemoteDeleteCoordinator.formatElapsed(outcome.elapsedMs)
+        when (outcome.status) {
+            ActiveTransferStatus.SUCCESS -> simpleActivity.toast("服务器删除完成：${outcome.deletedItems} 项，耗时 $elapsed")
+            ActiveTransferStatus.CANCELLED -> simpleActivity.toast("服务器删除已取消：已删除 ${outcome.deletedItems}/${outcome.totalItems} 项")
+            ActiveTransferStatus.PARTIAL -> showRemoteDeleteFailureDialog(simpleActivity, "服务器删除部分完成", outcome, elapsed)
+            ActiveTransferStatus.FAILED -> showRemoteDeleteFailureDialog(simpleActivity, "服务器删除失败", outcome, elapsed)
+            else -> simpleActivity.toast(outcome.messageCn.ifBlank { "服务器删除完成" })
+        }
+    }
 
-            simpleActivity.runOnUiThread {
-                try {
-                    progressDialog.dismiss()
-                } catch (_: Exception) {
-                }
-                when {
-                    failed.isEmpty() -> simpleActivity.toast("服务器删除完成：$deletedCount 项")
-                    deletedCount > 0 -> simpleActivity.toast("服务器删除部分完成：$deletedCount/${files.size}，失败 ${failed.joinToString()}")
-                    else -> simpleActivity.toast("服务器删除失败：${failed.joinToString()}")
-                }
-                deletedPaths.forEach { path -> simpleActivity.config.removeFavorite(path) }
-                onFinished()
+    private fun showRemoteDeleteFailureDialog(
+        simpleActivity: SimpleActivity,
+        title: String,
+        outcome: RemoteDeleteOutcome,
+        elapsed: String
+    ) {
+        val failures = outcome.failedMessages.take(8)
+        val more = (outcome.failedMessages.size - failures.size).coerceAtLeast(0)
+        val message = buildString {
+            append("成功 ${outcome.deletedItems}/${outcome.totalItems} 项")
+            if (outcome.skippedItems > 0) append("，跳过 ${outcome.skippedItems} 项")
+            append("，失败 ${outcome.failedItems} 项，耗时 $elapsed")
+            if (failures.isNotEmpty()) {
+                append("\n\n")
+                failures.forEach { append("• ").append(it).append('\n') }
+                if (more > 0) append("… 等 $more 项")
+            } else if (outcome.messageCn.isNotBlank()) {
+                append("\n\n").append(outcome.messageCn)
             }
+        }.trim()
+        try {
+            simpleActivity.getAlertDialogBuilder()
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton(android.R.string.ok, null)
+                .show()
+        } catch (_: Exception) {
+            simpleActivity.toast(message)
         }
     }
 

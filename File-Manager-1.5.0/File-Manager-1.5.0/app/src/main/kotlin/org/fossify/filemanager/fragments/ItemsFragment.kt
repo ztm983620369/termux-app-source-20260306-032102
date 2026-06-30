@@ -15,6 +15,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.recyclerview.widget.GridLayoutManager
 import com.termux.bridge.RecentFileEntry
 import com.termux.bridge.RecentFileHistory
+import com.termux.ecjbridge.EcjProjectDetector
 import com.termux.sessionsync.SftpProtocolManager
 import org.fossify.commons.activities.BaseSimpleActivity
 import org.fossify.commons.extensions.*
@@ -29,18 +30,21 @@ import org.fossify.filemanager.databinding.ItemsFragmentBinding
 import org.fossify.filemanager.dialogs.CreateNewItemDialog
 import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.extensions.isPathOnRoot
-import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
-import org.fossify.filemanager.helpers.NavigatorFolderHelper
-import org.fossify.filemanager.helpers.RootHelpers
-import org.fossify.filemanager.helpers.TermuxPathScope
+import org.fossify.filemanager.helpers.ActiveTransferMode
+import org.fossify.filemanager.helpers.ActiveTransferStatus
 import org.fossify.filemanager.helpers.DownloadedApkArchiveInfo
 import org.fossify.filemanager.helpers.DownloadedApkInstallerSupport
+import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
+import org.fossify.filemanager.helpers.NavigatorFolderHelper
+import org.fossify.filemanager.helpers.RecentPathFormatter
+import org.fossify.filemanager.helpers.RemoteDownloadCoordinator
+import org.fossify.filemanager.helpers.RootHelpers
+import org.fossify.filemanager.helpers.TermuxPathScope
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
 import com.termux.bridge.FileOpenRequest
 import com.termux.sessionsync.SessionFileCoordinator
 import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
 
 class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerFragment<MyViewPagerFragment.ItemsInnerBinding>(context, attributeSet),
     ItemOperationsListener {
@@ -69,6 +73,8 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     private var zoomListener: MyRecyclerView.MyZoomListener? = null
     private var pendingRevealRequest: RevealRequest? = null
     private var contentMode = ContentMode.DIRECTORY
+    private var appliedSearchText: String? = null
+    private var appliedSearchSourceHash = 0
 
     private var storedItems = ArrayList<ListItem>()
     private var itemsIgnoringSearch = ArrayList<ListItem>()
@@ -116,6 +122,9 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                 pathBarHolder.setOnLongClickListener {
                     fileManagerControllerCommands.showPathBarActions(it, currentPath)
                     true
+                }
+                pathBarEcjRun.setOnClickListener {
+                    fileManagerControllerCommands.runEcjProject(currentPath)
                 }
                 itemsSwipeRefresh.setOnRefreshListener { refreshFragment() }
                 itemsFab.setOnClickListener {
@@ -233,6 +242,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             }
 
             itemsIgnoringSearch = listItems
+            invalidateAppliedSearchState()
             activity?.runOnUiThread {
                 fileManagerControllerCommands.refreshMenuItems()
                 addItems(listItems, forceRefresh)
@@ -248,7 +258,11 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         activity?.runOnUiThread {
             binding.itemsSwipeRefresh.isRefreshing = false
             binding.pathBarText.text = buildPathBarLabel()
+            binding.pathBarEcjRun.beVisibleIf(shouldShowPathBarEcjRun())
             if (!forceRefresh && items.hashCode() == storedItems.hashCode()) {
+                if (lastSearchedText.isEmpty()) {
+                    markSearchApplied("")
+                }
                 return@runOnUiThread
             }
 
@@ -287,6 +301,9 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
 
             getRecyclerLayoutManager().onRestoreInstanceState(scrollStates[currentPath])
             applyPendingRevealIfNeeded(items)
+            if (lastSearchedText.isEmpty()) {
+                markSearchApplied("")
+            }
         }
     }
 
@@ -300,7 +317,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                 val ctx = context!!
                 val config = ctx.config
                 if (NavigatorFolderHelper.isNavigatorPath(ctx, path)) {
-                    callback(path, NavigatorFolderHelper.buildNavigatorItems(ctx))
+                    callback(path, NavigatorFolderHelper.buildNavigatorItems(ctx, path))
                 } else if (sessionFileCoordinator.isVirtualPath(ctx, path)) {
                     val result = sessionFileCoordinator.listVirtualPath(ctx, path)
                     if (!result.success) {
@@ -444,6 +461,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
 
                 recentEntriesByPath = result.entriesByPath
                 itemsIgnoringSearch = result.items
+                invalidateAppliedSearchState()
                 addItems(result.items, forceRefresh)
                 if (context != null && currentViewType != context!!.config.getFolderViewType(currentPath)) {
                     setupLayoutManager()
@@ -484,7 +502,8 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                     val name = entry.displayName.ifBlank { normalizedListPath.getFilenameFromPath() }
                     val size = entry.resolveRecentSize(file, isRemote)
                     val modified = entry.openedAtMs
-                    listItems.add(ListItem(normalizedListPath, name, false, 0, size, modified, false, false))
+                    val displayPath = RecentPathFormatter.displayPath(ctx, entry, sessionFileCoordinator)
+                    listItems.add(ListItem(normalizedListPath, name, false, 0, size, modified, false, false, displayPath))
                     recentEntries[normalizedListPath] = entry
                 }
             }
@@ -565,6 +584,10 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
 
         if (context != null && NavigatorFolderHelper.isNavigatorPath(context!!, currentPath)) {
             val ctx = context!!
+            if (NavigatorFolderHelper.isNavigatorPath(ctx, item.path)) {
+                openDirectory(item.path)
+                return
+            }
             val selectedSessionKey = NavigatorFolderHelper.resolveSessionKeyForTargetPath(ctx, item.path)
             sessionFileCoordinator.setSelectedSessionKey(ctx, selectedSessionKey)
             if (directoryNavigationHandler?.onDirectoryNavigationRequested(this, currentPath, item, true) == true) {
@@ -578,7 +601,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             if (item.isDirectory) {
                 openDirectory(item.path)
             } else if (item.name.endsWith(".apk", true)) {
-                downloadRemoteApkToDownloads(item)
+                openReusableOrDownloadRemoteApk(item)
             } else {
                 showProgressBar()
                 ensureBackgroundThread {
@@ -600,7 +623,10 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                                         originPath = item.path,
                                         originDisplayPath = sessionFileCoordinator.getDisplayPath(context!!, item.path),
                                         originModifiedMs = result.remoteModifiedMs.takeIf { it >= 0L },
-                                        originSize = result.remoteSize.takeIf { it >= 0L }
+                                        originSize = result.remoteSize.takeIf { it >= 0L },
+                                        originSha256 = result.remoteSha256.takeIf { it.isNotBlank() },
+                                        originFingerprintLevel = result.remoteSha256.takeIf { it.isNotBlank() }?.let { "STRONG_CONTENT" },
+                                        originFingerprintMethod = result.remoteSha256.takeIf { it.isNotBlank() }?.let { "remote-native-or-sftp-sha256" }
                                     )
                                 )
                             } else {
@@ -619,6 +645,33 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
             openDirectory(item.path)
         } else {
             clickedPath(item.path)
+        }
+    }
+
+    private fun openReusableOrDownloadRemoteApk(item: FileDirItem) {
+        val hostActivity = activity ?: return
+        showProgressBar()
+        ensureBackgroundThread {
+            val reusable = sessionFileCoordinator.findReusableLocalForVirtualFile(hostActivity, item.path)
+            hostActivity.runOnUiThread {
+                hideProgressBar()
+                if (reusable.success && reusable.reusable && reusable.localPath.isNotBlank() && File(reusable.localPath).exists()) {
+                    hostActivity.rescanPath(reusable.localPath)
+                    val apkInfo = DownloadedApkInstallerSupport.readArchiveInfo(hostActivity, reusable.localPath)
+                    if (apkInfo != null) {
+                        hostActivity.toast("已使用本地最新 APK。")
+                        showDownloadedApkDialog(item, reusable.localPath, apkInfo)
+                    } else {
+                        hostActivity.toast("本地 APK 无法读取，正在重新下载...")
+                        downloadRemoteApkToDownloads(item)
+                    }
+                } else {
+                    if (reusable.success && reusable.stale && reusable.messageCn.isNotBlank()) {
+                        hostActivity.toast(reusable.messageCn)
+                    }
+                    downloadRemoteApkToDownloads(item)
+                }
+            }
         }
     }
 
@@ -641,167 +694,91 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
 
     private fun startRemoteApkDownload(item: FileDirItem, downloadsPath: String) {
         val hostActivity = activity ?: return
-        val progressDialog = hostActivity.getAlertDialogBuilder()
-            .setTitle("下载 APK")
-            .setMessage("正在准备下载...")
-            .setNegativeButton("取消", null)
-            .setCancelable(false)
-            .create()
-        val cancelled = AtomicBoolean(false)
-        progressDialog.setOnShowListener {
-            progressDialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
-                cancelled.set(true)
-                it.isEnabled = false
-            }
-        }
-        try {
-            progressDialog.show()
-        } catch (_: Exception) {
-        }
-
-        var lastUiUpdateAt = 0L
-        var lastSpeedAt = 0L
-        var lastSpeedBytes = 0L
-        var speedBytesPerSecond = 0L
-
-        ensureBackgroundThread {
-            try {
-                val result = sessionFileCoordinator.downloadVirtualPaths(
-                    hostActivity,
-                    listOf(item.path),
-                    downloadsPath,
-                    object : SftpProtocolManager.DownloadProgressListener {
-                        override fun onProgress(progress: SftpProtocolManager.DownloadProgress) {
-                            val now = SystemClock.elapsedRealtime()
-                            if (lastSpeedAt == 0L) {
-                                lastSpeedAt = now
-                                lastSpeedBytes = progress.transferredBytes
-                            } else {
-                                val deltaMs = now - lastSpeedAt
-                                if (deltaMs >= 260L || progress.transferredBytes < lastSpeedBytes) {
-                                    val deltaBytes = progress.transferredBytes - lastSpeedBytes
-                                    speedBytesPerSecond = if (deltaMs > 0L && deltaBytes > 0L) {
-                                        deltaBytes * 1000L / deltaMs
-                                    } else {
-                                        0L
-                                    }
-                                    lastSpeedAt = now
-                                    lastSpeedBytes = progress.transferredBytes
-                                }
-                            }
-
-                            if (now - lastUiUpdateAt < 100L && progress.transferredBytes < progress.totalBytes) {
-                                return
-                            }
-                            lastUiUpdateAt = now
-
-                            val finishedCount = progress.completedFiles + progress.failedFiles
-                            val percent = if (progress.totalBytes > 0L) {
-                                ((progress.transferredBytes * 100L) / progress.totalBytes).coerceIn(0L, 100L)
-                            } else {
-                                0L
-                            }
-                            val sizeText = if (progress.totalBytes > 0L) {
-                                "${progress.transferredBytes.formatSize()} / ${progress.totalBytes.formatSize()}"
-                            } else {
-                                "${progress.transferredBytes.formatSize()} / ?"
-                            }
-                            val speedText = if (speedBytesPerSecond > 0L) {
-                                "${speedBytesPerSecond.formatSize()}/s"
-                            } else {
-                                "--"
-                            }
-                            val currentFile = progress.currentFile.ifEmpty { item.name.ifBlank { "apk" } }
-                            val message = StringBuilder()
-                                .append("当前：").append(currentFile).append('\n')
-                                .append("进度：").append(finishedCount).append('/').append(progress.totalFiles)
-                                .append(" (").append(percent).append("%)").append('\n')
-                                .append("大小：").append(sizeText).append('\n')
-                                .append("速度：").append(speedText)
-                                .toString()
-
-                            hostActivity.runOnUiThread {
-                                if (!hostActivity.isDestroyed && !hostActivity.isFinishing && progressDialog.isShowing) {
-                                    progressDialog.setMessage(message)
-                                }
-                            }
-                        }
-                    },
-                    object : SftpProtocolManager.DownloadControl {
-                        override fun isCancelled(): Boolean = cancelled.get()
-                    }
-                )
-
-                hostActivity.runOnUiThread {
-                    try {
-                        if (progressDialog.isShowing) progressDialog.dismiss()
-                    } catch (_: Exception) {
+        RemoteDownloadCoordinator.start(
+            activity = hostActivity,
+            sessionFileCoordinator = sessionFileCoordinator,
+            sourceItems = listOf(item),
+            destinationPath = downloadsPath,
+            mode = ActiveTransferMode.APK_DOWNLOAD,
+            title = "下载 APK",
+            fallbackFileName = item.name.ifBlank { "apk" },
+            onOutcome = { outcome ->
+                when (outcome.status) {
+                    ActiveTransferStatus.SUCCESS -> {
+                        hostActivity.toast("APK 下载完成：${outcome.downloadedBytes.formatSize()}")
                     }
 
-                    when {
-                        result.success -> {
-                            hostActivity.toast(
-                                "APK 下载完成：${result.downloadedBytes.formatSize()}"
-                            )
-                        }
-
-                        result.downloadedFiles > 0 -> {
-                            hostActivity.toast(
-                                "APK 已部分下载：${result.downloadedFiles}/${result.totalFiles}"
-                            )
-                        }
-
-                        result.messageCn.contains("已取消") -> {
-                            hostActivity.toast(result.messageCn)
-                        }
-
-                        else -> {
-                            hostActivity.toast(result.messageCn.ifBlank { "APK 下载失败，请重试。" })
-                        }
+                    ActiveTransferStatus.PARTIAL -> {
+                        val reason = outcome.messageCn.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()
+                        hostActivity.toast("APK 已部分下载：${outcome.downloadedFiles}/${outcome.totalFiles}$reason")
                     }
 
-                    val downloadedPath = result.downloadedLocalPaths.firstOrNull()
-                        ?.takeIf { it.isNotBlank() && File(it).exists() }
-                    if (downloadedPath != null) {
-                        hostActivity.rescanPath(downloadedPath)
-                        showDownloadedApkDialog(item, downloadedPath)
+                    ActiveTransferStatus.CANCELLED -> {
+                        hostActivity.toast(outcome.messageCn.ifBlank { "APK 下载已取消" })
+                    }
+
+                    else -> {
+                        val failure = if (outcome.throwable != null && outcome.messageCn.isNotBlank()) {
+                            "APK 下载异常：${outcome.messageCn}"
+                        } else {
+                            outcome.messageCn.ifBlank { "APK 下载失败，请重试。" }
+                        }
+                        hostActivity.toast(failure)
                     }
                 }
-            } catch (t: Throwable) {
-                hostActivity.runOnUiThread {
-                    try {
-                        if (progressDialog.isShowing) progressDialog.dismiss()
-                    } catch (_: Exception) {
+
+                val downloadedPath = outcome.downloadedLocalPaths.firstOrNull()
+                    ?.takeIf { it.isNotBlank() && File(it).exists() }
+                if (downloadedPath != null) {
+                    ensureBackgroundThread {
+                        sessionFileCoordinator.registerDownloadedLocalForVirtualFile(hostActivity, item.path, downloadedPath)
                     }
-                    val msg = t.message?.trim().orEmpty()
-                    hostActivity.toast(if (msg.isNotEmpty()) "APK 下载异常：$msg" else "APK 下载异常，请重试。")
+                    hostActivity.rescanPath(downloadedPath)
+                    val apkInfo = DownloadedApkInstallerSupport.readArchiveInfo(hostActivity, downloadedPath)
+                    if (apkInfo != null) {
+                        showDownloadedApkDialog(item, downloadedPath, apkInfo)
+                    } else if (outcome.status != ActiveTransferStatus.FAILED) {
+                        hostActivity.toast("APK 文件不完整或无法读取，已保留到 Download 目录。")
+                    }
                 }
             }
-        }
+        )
     }
 
-    private fun showDownloadedApkDialog(item: FileDirItem, downloadedPath: String) {
+    private fun showDownloadedApkDialog(
+        item: FileDirItem,
+        downloadedPath: String,
+        apkInfo: DownloadedApkArchiveInfo? = null
+    ) {
         val hostActivity = activity ?: return
-        val apkInfo = DownloadedApkInstallerSupport.readArchiveInfo(hostActivity, downloadedPath)
+        val resolvedApkInfo = apkInfo ?: DownloadedApkInstallerSupport.readArchiveInfo(hostActivity, downloadedPath)
         val file = File(downloadedPath)
         val dialogView = hostActivity.layoutInflater.inflate(R.layout.dialog_downloaded_apk_card, null)
         bindDownloadedApkDialogView(
             dialogView = dialogView,
             item = item,
             downloadedPath = downloadedPath,
-            apkInfo = apkInfo,
+            apkInfo = resolvedApkInfo,
             fileSize = file.length()
         )
 
+        var explicitChoiceMade = false
         val dialog = hostActivity.getAlertDialogBuilder()
             .setView(dialogView)
             .setPositiveButton("安装后删除") { _, _ ->
+                explicitChoiceMade = true
                 fileManagerControllerCommands.installDownloadedApk(downloadedPath, true)
             }
             .setNegativeButton("保留") { _, _ ->
+                explicitChoiceMade = true
                 hostActivity.toast("已保留到 Download 目录。")
             }
             .create()
+        dialog.setOnDismissListener {
+            if (!explicitChoiceMade && file.exists()) {
+                hostActivity.toast("已保留到 Download 目录。")
+            }
+        }
         dialog.setOnShowListener {
             val accentColor = hostActivity.getProperPrimaryColor()
             dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextColor(accentColor)
@@ -918,7 +895,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     private fun buildPathBarLabel(): String {
         val ctx = context ?: return currentPath
         val base = if (NavigatorFolderHelper.isNavigatorPath(ctx, currentPath)) {
-            NavigatorFolderHelper.displayTitle()
+            NavigatorFolderHelper.displayTitleForPath(ctx, currentPath)
         } else {
             sessionFileCoordinator.getDisplayPath(ctx, currentPath)
         }
@@ -927,6 +904,15 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
         } else {
             base
         }
+    }
+
+    private fun shouldShowPathBarEcjRun(): Boolean {
+        val ctx = context ?: return false
+        if (isCreateDocumentIntent || contentMode != ContentMode.DIRECTORY) return false
+        if (NavigatorFolderHelper.isNavigatorPath(ctx, currentPath)) return false
+        if (sessionFileCoordinator.isVirtualPath(ctx, currentPath)) return false
+        if (sessionFileCoordinator.isStaleVirtualPath(ctx, currentPath)) return false
+        return EcjProjectDetector.findNearestProjectRoot(currentPath) != null
     }
 
     private fun RecentFileEntry.remoteOriginPath(): String? {
@@ -956,6 +942,12 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
     }
 
     override fun searchQueryChanged(text: String) {
+        val sourceHash = itemsIgnoringSearch.hashCode()
+        if (isSearchAlreadyApplied(text, sourceHash)) {
+            lastSearchedText = text
+            return
+        }
+
         lastSearchedText = text
         if (context == null) {
             return
@@ -980,6 +972,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                 getRecyclerAdapter()?.updateItems(filtered, text)
                 hideProgressBar()
             }
+            markSearchApplied(text, sourceHash)
             return
         }
 
@@ -992,6 +985,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                     itemsPlaceholder.beGone()
                     itemsPlaceholder2.beGone()
                     hideProgressBar()
+                    markSearchApplied(text, sourceHash)
                 }
 
                 text.length == 1 -> {
@@ -999,6 +993,7 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                     itemsPlaceholder.beVisible()
                     itemsPlaceholder2.beVisible()
                     hideProgressBar()
+                    markSearchApplied(text, sourceHash)
                 }
 
                 else -> {
@@ -1039,11 +1034,28 @@ class ItemsFragment(context: Context, attributeSet: AttributeSet) : MyViewPagerF
                             itemsPlaceholder.beVisibleIf(listItems.isEmpty())
                             itemsPlaceholder2.beGone()
                             hideProgressBar()
+                            if (lastSearchedText == text) {
+                                markSearchApplied(text, sourceHash)
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    private fun isSearchAlreadyApplied(text: String, sourceHash: Int): Boolean {
+        return appliedSearchText == text && appliedSearchSourceHash == sourceHash
+    }
+
+    private fun markSearchApplied(text: String, sourceHash: Int = itemsIgnoringSearch.hashCode()) {
+        appliedSearchText = text
+        appliedSearchSourceHash = sourceHash
+    }
+
+    private fun invalidateAppliedSearchState() {
+        appliedSearchText = null
+        appliedSearchSourceHash = 0
     }
 
     private fun searchFiles(text: String, path: String): ArrayList<ListItem> {

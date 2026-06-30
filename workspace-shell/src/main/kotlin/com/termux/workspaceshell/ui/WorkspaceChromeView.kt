@@ -11,6 +11,8 @@ import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.appbar.MaterialToolbar
 import com.termux.workspaceshell.databinding.ViewWorkspaceChromeBinding
 import com.termux.workspaceshell.model.WorkspaceShellState
+import com.termux.workspaceshell.model.WorkspaceTabModel
+import com.termux.workspaceshell.model.WorkspaceTabTone
 
 class WorkspaceChromeView @JvmOverloads constructor(
     context: Context,
@@ -20,6 +22,7 @@ class WorkspaceChromeView @JvmOverloads constructor(
 
     private val binding = ViewWorkspaceChromeBinding.inflate(LayoutInflater.from(context), this)
     private var searchWatcher: TextWatcher? = null
+    private var lastTabsVisualKey: List<TabVisualKey> = emptyList()
 
     var onSearchQueryChangedListener: ((String) -> Unit)? = null
     var onSearchCloseListener: (() -> Unit)? = null
@@ -37,7 +40,11 @@ class WorkspaceChromeView @JvmOverloads constructor(
     fun toolbar(): MaterialToolbar = binding.workspaceToolbar
 
     fun render(state: WorkspaceShellState) {
-        binding.workspaceTabsBar.setTabs(state.tabs)
+        val tabsVisualKey = state.tabs.map { it.visualKey() }
+        if (tabsVisualKey != lastTabsVisualKey) {
+            binding.workspaceTabsBar.setTabs(state.tabs)
+            lastTabsVisualKey = tabsVisualKey
+        }
         if (!binding.workspaceSearchPanel.isVisible && state.searchVisible) {
             setSearchVisible(true, requestFocus = false)
         } else if (binding.workspaceSearchPanel.isVisible && !state.searchVisible) {
@@ -53,6 +60,7 @@ class WorkspaceChromeView @JvmOverloads constructor(
 
     fun setPalette(palette: WorkspaceChromePalette) {
         setBackgroundColor(palette.backgroundColor)
+        lastTabsVisualKey = emptyList()
         binding.workspaceTabsBar.setPalette(palette)
         binding.workspaceHeader.setBackgroundColor(palette.backgroundColor)
         binding.workspaceToolbar.setBackgroundColor(palette.backgroundColor)
@@ -98,4 +106,28 @@ class WorkspaceChromeView @JvmOverloads constructor(
         searchWatcher = watcher
         editText.addTextChangedListener(watcher)
     }
+
+    private fun WorkspaceTabModel.visualKey(): TabVisualKey {
+        return TabVisualKey(
+            id = id,
+            title = title,
+            selected = selected,
+            tone = tone,
+            badgeText = badgeText,
+            closable = closable,
+            locked = locked,
+            contentDescription = contentDescription
+        )
+    }
+
+    private data class TabVisualKey(
+        val id: String,
+        val title: String,
+        val selected: Boolean,
+        val tone: WorkspaceTabTone,
+        val badgeText: String?,
+        val closable: Boolean,
+        val locked: Boolean,
+        val contentDescription: String?
+    )
 }

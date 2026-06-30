@@ -47,10 +47,20 @@
                     android:paddingStart="@dimen/tiny_margin"
                     android:textSize="@dimen/smaller_text_size"
                     app:layout_constraintBottom_toBottomOf="parent"
-                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintEnd_toStartOf="@+id/path_bar_ecj_run"
                     app:layout_constraintStart_toEndOf="@+id/path_bar_up"
                     app:layout_constraintTop_toTopOf="parent"
                     app:layout_constraintVertical_bias="0.5" />
+
+                <org.fossify.filemanager.views.EcjRunCapsuleButton
+                    android:id="@+id/path_bar_ecj_run"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:layout_marginStart="10dp"
+                    android:visibility="gone"
+                    app:layout_constraintBottom_toBottomOf="parent"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintTop_toTopOf="parent" />
             </androidx.constraintlayout.widget.ConstraintLayout>
 
             <com.google.android.material.progressindicator.LinearProgressIndicator

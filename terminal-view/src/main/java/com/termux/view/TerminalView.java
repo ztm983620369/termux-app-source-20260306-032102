@@ -161,6 +161,7 @@ public final class TerminalView extends View {
                         requestFocusFromTouch();
                         requestFocus();
                     }
+                    if (mClient != null) mClient.onTextInputTap(event);
                     sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, true);
                     sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, false);
                     scrolledWithFinger = false;
@@ -183,6 +184,7 @@ public final class TerminalView extends View {
                     requestFocusFromTouch();
                     requestFocus();
                 }
+                mClient.onTextInputTap(event);
                 mClient.onSingleTapUp(event);
                 return true;
             }

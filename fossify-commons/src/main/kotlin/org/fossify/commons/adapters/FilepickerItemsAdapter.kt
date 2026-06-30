@@ -137,6 +137,9 @@ class FilepickerItemsAdapter(
 
     private fun getChildrenCnt(item: FileDirItem): String {
         val children = item.children
+        if (children < 0) {
+            return ""
+        }
         return activity.resources.getQuantityString(R.plurals.items, children, children)
     }
 

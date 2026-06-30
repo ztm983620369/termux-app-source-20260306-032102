@@ -16,6 +16,7 @@ import org.fossify.commons.extensions.renameFile
 import org.fossify.commons.extensions.setAsIntent
 import org.fossify.commons.extensions.sharePathsIntent
 import org.fossify.filemanager.BuildConfig
+import org.fossify.filemanager.helpers.FileOpenStateMachine
 import org.fossify.filemanager.helpers.OPEN_AS_AUDIO
 import org.fossify.filemanager.helpers.OPEN_AS_DEFAULT
 import org.fossify.filemanager.helpers.OPEN_AS_IMAGE
@@ -48,19 +49,41 @@ fun Activity.tryOpenPathIntent(path: String, forceChooser: Boolean, openAsType: 
             val forced = getMimeType(openAsType).ifBlank { null }
             val mimeType = forced ?: mimeByExt
             val readOnly = !file.canWrite()
-            FileOpenBridge.dispatch(
-                FileOpenRequest(
+            val request = FileOpenRequest(
+                path = file.absolutePath,
+                displayName = name,
+                readOnly = readOnly,
+                extension = ext,
+                mimeType = mimeType,
+                originType = FileOpenRequest.ORIGIN_LOCAL,
+                originPath = file.absolutePath,
+                originModifiedMs = file.lastModified().takeIf { it > 0L },
+                originSize = file.length().takeIf { it >= 0L }
+            )
+            val trigger = when {
+                forceChooser -> FileOpenStateMachine.Trigger.OPEN_WITH_CHOOSER
+                openAsType != OPEN_AS_DEFAULT -> FileOpenStateMachine.Trigger.OPEN_AS
+                else -> FileOpenStateMachine.Trigger.DEFAULT_OPEN
+            }
+            val decision = FileOpenStateMachine.decide(
+                FileOpenStateMachine.Input(
                     path = file.absolutePath,
                     displayName = name,
-                    readOnly = readOnly,
                     extension = ext,
                     mimeType = mimeType,
-                    originType = FileOpenRequest.ORIGIN_LOCAL,
-                    originPath = file.absolutePath,
-                    originModifiedMs = file.lastModified().takeIf { it > 0L },
-                    originSize = file.length().takeIf { it >= 0L }
+                    request = request,
+                    trigger = trigger,
+                    openAsType = openAsType
                 )
             )
+            when (val action = decision.action) {
+                is FileOpenStateMachine.Action.OpenInEditor -> FileOpenBridge.dispatch(action.request)
+                is FileOpenStateMachine.Action.OpenWithSystemViewer -> openPath(
+                    action.path,
+                    action.forceChooser,
+                    action.openAsType
+                )
+            }
             if (finishActivity) {
                 finish()
             }

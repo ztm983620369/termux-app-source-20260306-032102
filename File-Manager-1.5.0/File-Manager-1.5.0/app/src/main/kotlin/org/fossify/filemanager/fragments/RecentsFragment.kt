@@ -24,6 +24,7 @@ import org.fossify.filemanager.adapters.ItemsAdapter
 import org.fossify.filemanager.databinding.RecentsFragmentBinding
 import org.fossify.filemanager.extensions.config
 import org.fossify.filemanager.helpers.MAX_COLUMN_COUNT
+import org.fossify.filemanager.helpers.RecentPathFormatter
 import org.fossify.filemanager.helpers.TermuxPathScope
 import org.fossify.filemanager.interfaces.ItemOperationsListener
 import org.fossify.filemanager.models.ListItem
@@ -222,7 +223,10 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
                         originPath = remoteOriginPath,
                         originDisplayPath = originDisplayPath,
                         originModifiedMs = result.remoteModifiedMs.takeIf { it >= 0L },
-                        originSize = result.remoteSize.takeIf { it >= 0L }
+                        originSize = result.remoteSize.takeIf { it >= 0L },
+                        originSha256 = result.remoteSha256.takeIf { it.isNotBlank() },
+                        originFingerprintLevel = result.remoteSha256.takeIf { it.isNotBlank() }?.let { "STRONG_CONTENT" },
+                        originFingerprintMethod = result.remoteSha256.takeIf { it.isNotBlank() }?.let { "remote-native-or-sftp-sha256" }
                     )
                 )
             }
@@ -255,7 +259,8 @@ class RecentsFragment(context: Context, attributeSet: AttributeSet) : MyViewPage
                     val name = entry.displayName.ifBlank { listPath.getFilenameFromPath() }
                     val size = entry.resolveRecentSize(file, isRemote)
                     val modified = entry.openedAtMs
-                    listItems.add(ListItem(listPath, name, false, 0, size, modified, false, false))
+                    val displayPath = RecentPathFormatter.displayPath(context, entry, sessionFileCoordinator)
+                    listItems.add(ListItem(listPath, name, false, 0, size, modified, false, false, displayPath))
                     recentEntries[listPath] = entry
                 }
             }

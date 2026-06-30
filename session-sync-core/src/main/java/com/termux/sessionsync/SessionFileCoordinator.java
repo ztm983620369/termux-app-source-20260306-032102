@@ -160,6 +160,47 @@ public final class SessionFileCoordinator {
     }
 
     @NonNull
+    public SftpProtocolManager.VirtualPathInfo describeVirtualPath(@NonNull Context context, @Nullable String path) {
+        initialize(context);
+        return SftpProtocolManager.getInstance().describeVirtualPath(context, path);
+    }
+
+    public void invalidateVirtualDirectoryCache(@NonNull Context context, @Nullable String path) {
+        initialize(context);
+        SftpProtocolManager.getInstance().invalidateVirtualDirectoryCache(context, path);
+    }
+
+    @NonNull
+    public SftpProtocolManager.LocalRealizationResult findReusableLocalForVirtualFile(@NonNull Context context,
+                                                                                       @Nullable String path) {
+        initialize(context);
+        return SftpProtocolManager.getInstance().findReusableLocalForVirtualFile(context, path);
+    }
+
+    @NonNull
+    public SftpProtocolManager.LocalRealizationResult registerDownloadedLocalForVirtualFile(@NonNull Context context,
+                                                                                             @Nullable String path,
+                                                                                             @Nullable String localPath) {
+        initialize(context);
+        return SftpProtocolManager.getInstance().registerDownloadedLocalForVirtualFile(context, path, localPath);
+    }
+
+    @NonNull
+    public SftpProtocolManager.RemoteCommandResult executeRemoteCommand(@NonNull Context context,
+                                                                        @Nullable String virtualAnchorPath,
+                                                                        @NonNull String shellCommand,
+                                                                        @Nullable SftpProtocolManager.RemoteCommandControl control) {
+        initialize(context);
+        SftpProtocolManager.RemoteCommandResult result = SftpProtocolManager.getInstance()
+            .executeRemoteCommand(context, virtualAnchorPath, shellCommand, control);
+        if (!result.success) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "executeRemoteCommand",
+                null, "\u8fdc\u7a0b\u547d\u4ee4\u6267\u884c\u5931\u8d25", result.messageCn);
+        }
+        return result;
+    }
+
+    @NonNull
     public SftpProtocolManager.ListResult listVirtualPath(@NonNull Context context, @Nullable String path) {
         initialize(context);
         SftpProtocolManager.ListResult result = SftpProtocolManager.getInstance().listVirtualPath(context, path);
@@ -312,6 +353,21 @@ public final class SessionFileCoordinator {
         if (!result.success) {
             SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "deleteVirtualPath",
                 null, "\u5220\u9664\u865a\u62df\u76ee\u6807\u5931\u8d25", result.messageCn);
+        }
+        return result;
+    }
+
+    @NonNull
+    public SftpProtocolManager.RemoteDeleteResult deleteVirtualPaths(@NonNull Context context,
+                                                                     @NonNull List<String> virtualPaths,
+                                                                     @Nullable SftpProtocolManager.RemoteDeleteProgressListener listener,
+                                                                     @Nullable SftpProtocolManager.RemoteDeleteControl control) {
+        initialize(context);
+        SftpProtocolManager.RemoteDeleteResult result = SftpProtocolManager.getInstance()
+            .deleteVirtualPaths(context, virtualPaths, listener, control);
+        if (!result.success && !result.cancelled) {
+            SessionSyncTracer.getInstance().warn(context, "SessionFileCoordinator", "deleteVirtualPaths",
+                null, "\u6279\u91cf\u5220\u9664\u865a\u62df\u76ee\u6807\u5931\u8d25", result.messageCn);
         }
         return result;
     }

@@ -40,6 +40,7 @@ import org.fossify.commons.extensions.getSomeDocumentSdk30
 import org.fossify.commons.extensions.getTextSize
 import org.fossify.commons.extensions.handleHiddenFolderPasswordProtection
 import org.fossify.commons.extensions.handleLockedFolderOpening
+import org.fossify.commons.extensions.humanizePath
 import org.fossify.commons.extensions.internalStoragePath
 import org.fossify.commons.extensions.getStorageDirectories
 import org.fossify.commons.extensions.isAccessibleWithSAFSdk30
@@ -64,6 +65,7 @@ import java.io.File
  * @param pickFile toggle used to determine if we are picking a file or a folder
  * @param showHidden toggle for showing hidden items, whose name starts with a dot
  * @param showFAB toggle the displaying of a Floating Action Button for creating new folders
+ * @param startAtCurrentPath opens the passed currPath directly instead of the workspace root
  * @param callback the callback used for returning the selected file/folder
  */
 class FilePickerDialog(
@@ -78,6 +80,7 @@ class FilePickerDialog(
     private val showRationale: Boolean = true,
     private val enforceStorageRestrictions: Boolean = true,
     private val targetScope: TargetScope = TargetScope.ANY,
+    private val startAtCurrentPath: Boolean = false,
     private val callback: (pickedPath: String) -> Unit
 ) : Breadcrumbs.BreadcrumbsListener {
 
@@ -88,8 +91,11 @@ class FilePickerDialog(
     }
 
     private val sessionFileCoordinator = SessionFileCoordinator.getInstance()
-    private val termuxRootPath = activity.filesDir.absolutePath.trimEnd('/')
-    private var showWorkspaceRoot = true
+    private val termuxRootPath = normalizePath(activity.filesDir.absolutePath)
+    private val termuxHomePath = normalizePath(File(termuxRootPath, TERMUX_HOME_RELATIVE_PATH).absolutePath)
+    private val workspaceRootPath = normalizePath("$termuxRootPath/$WORKSPACE_ROOT_RELATIVE_PATH")
+    private var workspacePath = workspaceRootPath
+    private var showWorkspaceRoot = !startAtCurrentPath
     private var mFirstUpdate = true
     private var mPrevPath = ""
     private var mScrollStates = HashMap<String, Parcelable>()
@@ -108,7 +114,8 @@ class FilePickerDialog(
         }
 
         mDialogView.filepickerToggleStorage.setOnClickListener {
-            if (!showWorkspaceRoot) {
+            if (!showWorkspaceRoot || workspacePath != workspaceRootPath) {
+                workspacePath = workspaceRootPath
                 showWorkspaceRoot = true
                 tryUpdateItems()
             }
@@ -151,7 +158,7 @@ class FilePickerDialog(
 
         mDialogView.filepickerFavoritesLabel.text = "${activity.getString(R.string.favorites)}:"
         mDialogView.filepickerFabShowFavorites.apply {
-            beVisibleIf(showFavoritesButton && context.baseConfig.favorites.isNotEmpty())
+            beVisibleIf(showFavoritesButton && scopedFavoritePaths().isNotEmpty())
             setOnClickListener {
                 if (mDialogView.filepickerFavoritesHolder.isVisible()) {
                     hideFavorites()
@@ -166,6 +173,17 @@ class FilePickerDialog(
                 mDialog = alertDialog
                 alertDialog.onBackPressedDispatcher.addCallback(alertDialog) {
                     val breadcrumbs = mDialogView.filepickerBreadcrumbs
+                    if (showWorkspaceRoot) {
+                        if (workspacePath != workspaceRootPath) {
+                            workspacePath = workspaceRootPath
+                            tryUpdateItems()
+                        } else {
+                            isEnabled = false
+                            alertDialog.onBackPressedDispatcher.onBackPressed()
+                        }
+                        return@addCallback
+                    }
+
                     if (breadcrumbs.getItemCount() > 1) {
                         breadcrumbs.removeBreadcrumb()
                         currPath = breadcrumbs.getLastItem().path.trimEnd('/')
@@ -197,9 +215,10 @@ class FilePickerDialog(
     private fun tryUpdateItems() {
         ensureBackgroundThread {
             if (showWorkspaceRoot) {
+                val workspaceItems = buildWorkspaceItems(workspacePath)
                 activity.runOnUiThread {
                     mDialogView.filepickerPlaceholder.beGone()
-                    updateItems(buildWorkspaceItems())
+                    updateItems(workspaceItems)
                 }
                 return@ensureBackgroundThread
             }
@@ -214,7 +233,7 @@ class FilePickerDialog(
     }
 
     private fun updateItems(items: ArrayList<FileDirItem>) {
-        if (!containsDirectory(items) && !mFirstUpdate && !pickFile && !showFAB) {
+        if (!showWorkspaceRoot && !containsDirectory(items) && !mFirstUpdate && !pickFile && !showFAB) {
             verifyPath()
             return
         }
@@ -226,8 +245,13 @@ class FilePickerDialog(
         }
         val adapter = FilepickerItemsAdapter(activity, displayItems, mDialogView.filepickerList) {
             if (showWorkspaceRoot) {
-                currPath = (it as FileDirItem).path
-                showWorkspaceRoot = false
+                val selectedPath = (it as FileDirItem).path
+                if (isWorkspaceGroupPath(selectedPath)) {
+                    workspacePath = selectedPath
+                } else {
+                    currPath = selectedPath
+                    showWorkspaceRoot = false
+                }
                 tryUpdateItems()
                 return@FilepickerItemsAdapter
             }
@@ -250,17 +274,18 @@ class FilePickerDialog(
 
         mDialogView.apply {
             filepickerList.adapter = adapter
-            filepickerBreadcrumbs.setBreadcrumb(if (showWorkspaceRoot) WORKSPACE_ROOT_TITLE else currPath)
+            filepickerBreadcrumbs.setBreadcrumb(if (showWorkspaceRoot) workspaceBreadcrumbPath() else currPath)
+            filepickerFab.beVisibleIf(showFAB && !showWorkspaceRoot)
 
             if (root.context.areSystemAnimationsEnabled) {
                 filepickerList.scheduleLayoutAnimation()
             }
 
-            layoutManager.onRestoreInstanceState(mScrollStates[currPath.trimEnd('/')])
+            layoutManager.onRestoreInstanceState(mScrollStates[currentNavigationPath()])
         }
 
         mFirstUpdate = false
-        mPrevPath = currPath
+        mPrevPath = currentNavigationPath()
     }
 
     private fun verifyPath() {
@@ -426,7 +451,7 @@ class FilePickerDialog(
     private fun containsDirectory(items: List<FileDirItem>) = items.any { it.isDirectory }
 
     private fun setupFavorites() {
-        FilepickerFavoritesAdapter(activity, activity.baseConfig.favorites.toMutableList(), mDialogView.filepickerFavoritesList) {
+        FilepickerFavoritesAdapter(activity, scopedFavoritePaths().toMutableList(), mDialogView.filepickerFavoritesList) {
             currPath = it as String
             showWorkspaceRoot = false
             tryUpdateItems()
@@ -454,8 +479,17 @@ class FilePickerDialog(
     }
 
     override fun breadcrumbClicked(id: Int) {
+        if (showWorkspaceRoot) {
+            if (workspacePath != workspaceRootPath) {
+                workspacePath = workspaceRootPath
+                tryUpdateItems()
+            }
+            return
+        }
+
         if (id == 0) {
             if (!showWorkspaceRoot) {
+                workspacePath = workspaceRootPath
                 showWorkspaceRoot = true
                 tryUpdateItems()
             }
@@ -513,21 +547,31 @@ class FilePickerDialog(
         return if (activity.getDoesFilePathExist(path)) path else preferredLocalRoot()
     }
 
-    private fun buildWorkspaceItems(): ArrayList<FileDirItem> {
+    private fun buildWorkspaceItems(path: String = workspaceRootPath): ArrayList<FileDirItem> {
+        val normalized = normalizePath(path)
+        return when {
+            isTermuxGroupPath(normalized) -> buildTermuxEnvironmentItems()
+            isPhoneStorageGroupPath(normalized) -> buildPhoneStorageItems()
+            else -> buildRootWorkspaceItems()
+        }
+    }
+
+    private fun buildRootWorkspaceItems(): ArrayList<FileDirItem> {
         val items = ArrayList<FileDirItem>()
         val now = System.currentTimeMillis()
         val usedPaths = LinkedHashSet<String>()
 
-        fun addWorkspace(name: String, path: String) {
-            val normalized = path.trimEnd('/')
+        fun addWorkspace(name: String, path: String, requireExisting: Boolean = true) {
+            val normalized = normalizePath(path)
             if (normalized.isEmpty()) return
             if (!usedPaths.add(normalized)) return
+            if (requireExisting && !sessionFileCoordinator.isVirtualPath(activity, normalized) && !File(normalized).isDirectory) return
             items.add(
                 FileDirItem(
                     normalized,
                     name,
                     true,
-                    0,
+                    NAVIGATION_ITEM_CHILDREN,
                     0L,
                     now
                 )
@@ -535,26 +579,15 @@ class FilePickerDialog(
         }
 
         if (targetScope != TargetScope.REMOTE_ONLY) {
-            addWorkspace("Termux", termuxRootPath)
+            addWorkspace("本地工作目录", preferredLocalRoot(), requireExisting = false)
+            addWorkspace("Termux 环境", workspaceGroupPath(TERMUX_GROUP), requireExisting = false)
 
-            val localRoots = LinkedHashSet<String>()
-            val internal = activity.internalStoragePath.trimEnd('/')
-            if (internal.isNotEmpty() && activity.getDoesFilePathExist(internal)) {
-                localRoots.add(internal)
-            }
-            activity.getStorageDirectories().forEach { root ->
-                val normalized = root.trimEnd('/')
-                if (normalized.isNotEmpty() && activity.getDoesFilePathExist(normalized)) {
-                    localRoots.add(normalized)
-                }
+            if (phoneStorageRoots().isNotEmpty()) {
+                addWorkspace("手机存储", workspaceGroupPath(PHONE_STORAGE_GROUP), requireExisting = false)
             }
 
-            localRoots.forEach { root ->
-                val storageLabel = if (root == internal) "手机存储" else "存储 / $root"
-                addWorkspace(storageLabel, root)
-                buildSystemDirectoryItems(root).forEach { (name, path) ->
-                    addWorkspace("$storageLabel / $name", path)
-                }
+            scopedFavoritePaths().forEach { path ->
+                addWorkspace("收藏 / ${workspaceFavoriteLabel(path)}", path)
             }
         }
 
@@ -569,19 +602,83 @@ class FilePickerDialog(
         return items
     }
 
-    private fun buildSystemDirectoryItems(rootPath: String): List<Pair<String, String>> {
-        val root = rootPath.trimEnd('/')
-        if (root.isEmpty()) return emptyList()
+    private fun buildTermuxEnvironmentItems(): ArrayList<FileDirItem> {
+        val items = ArrayList<FileDirItem>()
+        val now = System.currentTimeMillis()
+        val usedPaths = LinkedHashSet<String>()
+        val prefixPath = normalizePath(File(termuxRootPath, "usr").absolutePath)
+
+        fun addFolder(name: String, path: String, requireExisting: Boolean = true) {
+            val normalized = normalizePath(path)
+            if (!usedPaths.add(normalized)) return
+            if (requireExisting && !File(normalized).isDirectory) return
+            items.add(
+                FileDirItem(
+                    normalized,
+                    name,
+                    true,
+                    NAVIGATION_ITEM_CHILDREN,
+                    0L,
+                    now
+                )
+            )
+        }
+
+        addFolder("Termux / HOME", termuxHomePath, requireExisting = false)
+        addFolder("Termux / projects", File(termuxHomePath, "projects").absolutePath)
+        addFolder("Termux / .termux", File(termuxHomePath, ".termux").absolutePath)
+        addFolder("Termux / files", termuxRootPath)
+        addFolder("Termux / PREFIX", prefixPath)
+        addFolder("Termux / tmp", File(prefixPath, "tmp").absolutePath)
+
+        return items
+    }
+
+    private fun buildPhoneStorageItems(): ArrayList<FileDirItem> {
+        val items = ArrayList<FileDirItem>()
+        val now = System.currentTimeMillis()
+        val usedPaths = LinkedHashSet<String>()
+        val internalRoot = normalizePath(activity.internalStoragePath)
+
+        fun addFolder(name: String, path: String) {
+            val normalized = normalizePath(path)
+            if (!usedPaths.add(normalized)) return
+            if (!File(normalized).isDirectory) return
+            items.add(
+                FileDirItem(
+                    normalized,
+                    name,
+                    true,
+                    NAVIGATION_ITEM_CHILDREN,
+                    0L,
+                    now
+                )
+            )
+        }
+
+        phoneStorageRoots().forEach { root ->
+            val prefix = if (root == internalRoot) "手机存储" else "外部存储"
+            addFolder("$prefix / 根目录", root)
+            buildPhoneDirectoryItems(root).forEach { (name, path) ->
+                addFolder("$prefix / $name", path)
+            }
+        }
+
+        return items
+    }
+
+    private fun buildPhoneDirectoryItems(rootPath: String): List<Pair<String, String>> {
+        val root = normalizePath(rootPath)
 
         val candidates = linkedMapOf(
-            "Documents" to File(root, Environment.DIRECTORY_DOCUMENTS).absolutePath,
-            "Downloads" to File(root, Environment.DIRECTORY_DOWNLOADS).absolutePath,
+            "下载" to File(root, Environment.DIRECTORY_DOWNLOADS).absolutePath,
+            "文档" to File(root, Environment.DIRECTORY_DOCUMENTS).absolutePath,
             "DCIM" to File(root, Environment.DIRECTORY_DCIM).absolutePath,
-            "Pictures" to File(root, Environment.DIRECTORY_PICTURES).absolutePath,
-            "Movies" to File(root, Environment.DIRECTORY_MOVIES).absolutePath,
-            "Music" to File(root, Environment.DIRECTORY_MUSIC).absolutePath,
-            "Podcasts" to File(root, Environment.DIRECTORY_PODCASTS).absolutePath,
-            "Audiobooks" to File(root, Environment.DIRECTORY_AUDIOBOOKS).absolutePath,
+            "图片" to File(root, Environment.DIRECTORY_PICTURES).absolutePath,
+            "视频" to File(root, Environment.DIRECTORY_MOVIES).absolutePath,
+            "音乐" to File(root, Environment.DIRECTORY_MUSIC).absolutePath,
+            "播客" to File(root, Environment.DIRECTORY_PODCASTS).absolutePath,
+            "有声书" to File(root, Environment.DIRECTORY_AUDIOBOOKS).absolutePath,
             "Android/data" to File(root, "Android/data").absolutePath,
             "Android/obb" to File(root, "Android/obb").absolutePath
         )
@@ -596,9 +693,8 @@ class FilePickerDialog(
     }
 
     private fun preferredLocalRoot(): String {
-        val internal = activity.internalStoragePath.trimEnd('/')
-        if (internal.isNotEmpty() && activity.getDoesFilePathExist(internal)) {
-            return internal
+        if (File(termuxHomePath).isDirectory) {
+            return termuxHomePath
         }
         return termuxRootPath
     }
@@ -609,7 +705,98 @@ class FilePickerDialog(
             ?.let { FileRootResolver.resolveVirtualRoot(activity, it.entry) }
     }
 
+    private fun phoneStorageRoots(): List<String> {
+        val roots = LinkedHashSet<String>()
+        val internal = normalizePath(activity.internalStoragePath)
+        if (internal != "/" && File(internal).isDirectory) {
+            roots.add(internal)
+        }
+
+        activity.getStorageDirectories().forEach { raw ->
+            val normalized = normalizePath(raw)
+            if (normalized != "/" && File(normalized).isDirectory) {
+                roots.add(normalized)
+            }
+        }
+
+        return roots.toList()
+    }
+
+    private fun scopedFavoritePaths(): List<String> {
+        return activity.baseConfig.favorites
+            .map { normalizePath(it) }
+            .filter { isAllowedForTargetScope(it) }
+            .filter { path ->
+                sessionFileCoordinator.isVirtualPath(activity, path) ||
+                    (activity.getDoesFilePathExist(path) && activity.getIsPathDirectory(path))
+            }
+    }
+
+    private fun isAllowedForTargetScope(path: String): Boolean {
+        val isRemote = sessionFileCoordinator.isVirtualPath(activity, normalizePath(path))
+        return when (targetScope) {
+            TargetScope.ANY -> true
+            TargetScope.LOCAL_ONLY -> !isRemote
+            TargetScope.REMOTE_ONLY -> isRemote
+        }
+    }
+
+    private fun workspaceFavoriteLabel(path: String): String {
+        return if (sessionFileCoordinator.isVirtualPath(activity, path)) {
+            sessionFileCoordinator.getDisplayPath(activity, path)
+        } else {
+            activity.humanizePath(path).substringAfterLast('/').ifBlank { path.getFilenameFromPath() }
+        }
+    }
+
+    private fun currentNavigationPath(): String {
+        return if (showWorkspaceRoot) workspacePath else currPath.trimEnd('/')
+    }
+
+    private fun workspaceBreadcrumbPath(): String {
+        return when {
+            isTermuxGroupPath(workspacePath) -> "$WORKSPACE_ROOT_TITLE/Termux 环境"
+            isPhoneStorageGroupPath(workspacePath) -> "$WORKSPACE_ROOT_TITLE/手机存储"
+            else -> WORKSPACE_ROOT_TITLE
+        }
+    }
+
+    private fun workspaceGroupPath(group: String): String {
+        return normalizePath("$workspaceRootPath/$group")
+    }
+
+    private fun isWorkspaceGroupPath(path: String): Boolean {
+        val normalized = normalizePath(path)
+        return isTermuxGroupPath(normalized) || isPhoneStorageGroupPath(normalized)
+    }
+
+    private fun isTermuxGroupPath(path: String): Boolean {
+        return normalizePath(path) == workspaceGroupPath(TERMUX_GROUP)
+    }
+
+    private fun isPhoneStorageGroupPath(path: String): Boolean {
+        return normalizePath(path) == workspaceGroupPath(PHONE_STORAGE_GROUP)
+    }
+
+    private fun normalizePath(rawPath: String?): String {
+        var path = rawPath.orEmpty().trim().replace('\\', '/')
+        while (path.contains("//")) {
+            path = path.replace("//", "/")
+        }
+
+        if (path.endsWith("/") && path.length > 1) {
+            path = path.substring(0, path.length - 1)
+        }
+
+        return if (path.isEmpty()) "/" else path
+    }
+
     companion object {
-        private const val WORKSPACE_ROOT_TITLE = "工作区"
+        private const val WORKSPACE_ROOT_TITLE = "核心导航器"
+        private const val WORKSPACE_ROOT_RELATIVE_PATH = ".termux/.file-picker"
+        private const val TERMUX_HOME_RELATIVE_PATH = "home"
+        private const val TERMUX_GROUP = "termux"
+        private const val PHONE_STORAGE_GROUP = "phone-storage"
+        private const val NAVIGATION_ITEM_CHILDREN = -1
     }
 }

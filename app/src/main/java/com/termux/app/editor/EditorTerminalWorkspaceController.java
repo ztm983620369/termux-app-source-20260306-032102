@@ -458,6 +458,7 @@ public final class EditorTerminalWorkspaceController {
             refreshTopBar();
         }
 
+        sessionClient.forgetSessionRestoreForUserAction(terminalSession);
         if (terminalSession.isRunning()) {
             termuxSession.killIfExecuting(mHost.getContext(), true);
         } else {
