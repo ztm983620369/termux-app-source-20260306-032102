@@ -59,7 +59,7 @@ import com.termux.terminal.TerminalColors;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
 import com.termux.terminal.TextStyle;
-import com.termux.terminalsessioncore.CrushRestoreStateMachine;
+import com.termux.terminalsessioncore.CodexRestoreStateMachine;
 import com.termux.terminalsessioncore.SshTmuxSessionStateMachine;
 import com.termux.terminalsessionruntime.RemoteTmuxListResult;
 import com.termux.terminalsessionruntime.SshTmuxOperationResult;
@@ -72,7 +72,6 @@ import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -132,19 +131,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     private static final String TMUX_SESSION_EXISTS = "__TMUX_EXISTS__";
     private static final String TMUX_SESSION_NOT_FOUND = "__TMUX_NOT_FOUND__";
     private static final Pattern PS_LINE_PATTERN = Pattern.compile("^\\s*(\\d+)\\s+(\\d+)\\s+(.+)$");
-    private static final String CRUSH_RESTORE_PREFS = "crush_restore_prefs";
-    private static final String KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID = "crush_restore.foreground_session_id";
-    private static final String CRUSH_RESTORE_STATE_PATH = TermuxConstants.TERMUX_HOME_DIR_PATH +
-        "/.crush/termux-active-sessions.json";
-    private static final String CRUSH_RESTORE_DEFAULT_DISPLAY_NAME = "Crush";
-    private static final String CRUSH_RESTORE_HOST_COMMAND = "crush-restore";
-    private static final String CRUSH_RESTORE_STATE_ACTIVE = "active";
-    private static final String CRUSH_RESTORE_STATE_DETACHED = "detached";
-    private static final String CRUSH_RESTORE_STATE_CLOSED = "closed";
-    private static final String TERMUX_RESTORE_STATE_PATH = TermuxConstants.TERMUX_HOME_DIR_PATH +
-        "/.termux/session-restore-state.json";
-    private static final int TERMUX_RESTORE_VERSION = 1;
-    private static final String TERMUX_RESTORE_TYPE_CRUSH = "crush";
+    private static final String CODEX_RESTORE_DEFAULT_DISPLAY_NAME = "Codex";
+    private static final int TERMUX_RESTORE_VERSION = TermuxSessionRestoreStore.SCHEMA_VERSION;
+    private static final String TERMUX_RESTORE_TYPE_CODEX = "codex";
     private static final String TERMUX_RESTORE_TYPE_SSH_TMUX = "ssh_tmux";
     private static final String TERMUX_RESTORE_TYPE_LOCAL_TMUX = "local_tmux";
     private static final String TERMUX_RESTORE_TYPE_SSH = "ssh";
@@ -158,17 +147,28 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     private static final String LOG_TAG = "TermuxTerminalSessionActivityClient";
     private static final int SSH_BG_MAX_THREADS = 4;
     private static final long SSH_BG_KEEP_ALIVE_SECONDS = 30L;
+    private static final long TERMINAL_TITLE_SETTLE_DELAY_MS = 1250L;
+    private static final long SESSION_SELECTION_PERSIST_IDLE_DELAY_MS = 180L;
     private static final AtomicInteger SSH_BG_THREAD_COUNTER = new AtomicInteger(1);
     private static final ExecutorService SSH_BG_EXECUTOR = createSshBackgroundExecutor();
     private final AtomicBoolean mEnsuringPinnedSshSessions = new AtomicBoolean(false);
     private final AtomicBoolean mEnsurePinnedSshSessionsRetryScheduled = new AtomicBoolean(false);
     private final AtomicBoolean mEnsurePinnedSshSessionsPending = new AtomicBoolean(false);
     private final AtomicBoolean mEnsurePinnedSshSessionsPendingSwitchToAny = new AtomicBoolean(false);
-    private final AtomicBoolean mMaterializingDetachedCrushSessions = new AtomicBoolean(false);
-    private final Object mNativeCrushRestoreLock = new Object();
-    private final Map<String, CrushRestoreRecord> mNativeCrushRestoreByInstance = new HashMap<>();
-    private final Map<String, String> mNativeCrushRestoreInstanceByHandle = new HashMap<>();
-    private final HashSet<String> mNativeCrushRestoreSuppressedHandles = new HashSet<>();
+    private final Object mNativeCodexRestoreLock = new Object();
+    private final Map<String, CodexRestoreRecord> mNativeCodexRestoreByThread = new HashMap<>();
+    private final Map<String, String> mNativeCodexRestoreThreadByHandle = new HashMap<>();
+    private final HashSet<String> mNativeCodexRestoreSuppressedHandles = new HashSet<>();
+    private final Handler mTerminalTitleHandler = new Handler(Looper.getMainLooper());
+    private final Map<TerminalSession, Runnable> mPendingTerminalTitleUpdates = new HashMap<>();
+    private final Handler mSessionSelectionPersistenceHandler = new Handler(Looper.getMainLooper());
+    @Nullable private TerminalSession mPendingSessionSelectionPersistence;
+    @NonNull
+    private final Runnable mPersistPendingSessionSelection = () -> {
+        TerminalSession pending = mPendingSessionSelectionPersistence;
+        mPendingSessionSelectionPersistence = null;
+        if (pending != null) persistTermuxSessionRestoreState(pending);
+    };
     private final Object mSshPersistRecordsLock = new Object();
     private boolean mRestoringTermuxSessions = false;
     @Nullable
@@ -358,6 +358,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             termuxSessionListNotifyUpdated();
             maybeAutoSwitchToProotSession();
             maybeAutoRestorePinnedSshSessions();
+            reconcileManagedCodexSessions("activity_start");
         }
 
         // The current terminal session may have changed while being away, force
@@ -386,12 +387,32 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             // quickly enough before the call to play(). https://stackoverflow.com/questions/35435625
             loadBellSoundPool();
         }
+        reconcileManagedCodexSessions("activity_resume");
+    }
+
+    public void reconcileManagedCodexSessions(@NonNull String reason) {
+        TermuxService service = mActivity.getTermuxService();
+        if (service == null || service.isTermuxSessionsEmpty() || mRestoringTermuxSessions) return;
+        service.getCodexSessionRecoveryController().reconcile(reason);
+    }
+
+    public void onManagedCodexSessionRecovered(@NonNull TerminalSession terminalSession,
+                                               boolean restoreForeground) {
+        if (mActivity.isFinishing() || mActivity.isDestroyed()) return;
+        TerminalSession current = mActivity.getCurrentSession();
+        if (restoreForeground || current == null || !current.isRunning()) {
+            setCurrentSession(terminalSession);
+        }
+        termuxSessionListNotifyUpdated();
+        persistTermuxSessionRestoreState(mActivity.getCurrentSession());
     }
 
     /**
      * Should be called when mActivity.onStop() is called
      */
     public void onStop() {
+        mSessionSelectionPersistenceHandler.removeCallbacks(mPersistPendingSessionSelection);
+        mPendingSessionSelectionPersistence = null;
         // Store current session in shared preferences so that it can be restored later in
         // {@link #onStart} if needed.
         TerminalSession selectedSession = getLastExplicitSelectedSessionOrCurrent();
@@ -423,24 +444,40 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @Override
     public void onTitleChanged(@NonNull TerminalSession updatedSession) {
-        persistTermuxSessionRestoreState();
-        if (!mActivity.isVisible()) return;
-
-        if (updatedSession != mActivity.getCurrentSession()) {
-            // Only show toast for other sessions than the current one, since the user
-            // probably consciously caused the title change to change in the current session
-            // and don't want an annoying toast for that.
-            mActivity.showToast(toToastTitle(updatedSession), true);
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mTerminalTitleHandler.post(() -> onTitleChanged(updatedSession));
+            return;
         }
 
-        termuxSessionListNotifyUpdated();
+        Runnable pending = mPendingTerminalTitleUpdates.remove(updatedSession);
+        if (pending != null) mTerminalTitleHandler.removeCallbacks(pending);
+
+        Runnable settledUpdate = () -> {
+            mPendingTerminalTitleUpdates.remove(updatedSession);
+            persistTermuxSessionRestoreState();
+            if (!mActivity.isVisible()) return;
+
+            if (updatedSession != mActivity.getCurrentSession()) {
+                mActivity.showToast(toToastTitle(updatedSession), true);
+            }
+            termuxSessionListNotifyUpdated();
+        };
+        mPendingTerminalTitleUpdates.put(updatedSession, settledUpdate);
+        mTerminalTitleHandler.postDelayed(settledUpdate, TERMINAL_TITLE_SETTLE_DELAY_MS);
     }
 
     @Override
     public void onSessionFinished(@NonNull TerminalSession finishedSession) {
+        Runnable pendingTitleUpdate = mPendingTerminalTitleUpdates.remove(finishedSession);
+        if (pendingTitleUpdate != null) mTerminalTitleHandler.removeCallbacks(pendingTitleUpdate);
         clearRuntimeStateForSessionHandle(finishedSession.mHandle);
         mSshTmuxRuntimeEngine.onTerminalSessionFinished(finishedSession);
         TermuxService service = mActivity.getTermuxService();
+
+        if (service != null && service.getCodexSessionRecoveryController().handleFinishedSession(finishedSession)) {
+            if (service.wantsToStop()) mActivity.finishActivityIfNotFinishing();
+            return;
+        }
 
         if (service == null || service.wantsToStop()) {
             // The service wants to stop as soon as possible.
@@ -528,9 +565,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             updateBackgroundColor();
     }
 
-    private void handleCrushRestoreHostControlCommand(@NonNull TerminalSession session,
+    private void handleCodexRestoreHostControlCommand(@NonNull TerminalSession session,
                                                       @Nullable String argument) {
-        Runnable action = () -> handleCrushRestoreHostControlCommandOnUi(session, argument);
+        Runnable action = () -> handleCodexRestoreHostControlCommandOnUi(session, argument);
         if (mActivity.isFinishing() || mActivity.isDestroyed()) return;
         if (Looper.myLooper() == mActivity.getMainLooper()) {
             action.run();
@@ -539,83 +576,107 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         }
     }
 
-    private void handleCrushRestoreHostControlCommandOnUi(@NonNull TerminalSession session,
+    private void handleCodexRestoreHostControlCommandOnUi(@NonNull TerminalSession session,
                                                           @Nullable String argument) {
-        if (TextUtils.isEmpty(argument)) return;
-
-        JSONObject json;
-        try {
-            json = new JSONObject(argument);
-        } catch (Exception e) {
-            Logger.logWarn(LOG_TAG, "Invalid Crush restore host payload: " + e.getMessage());
+        CodexSessionHostProtocol.Event event = CodexSessionHostProtocol.parse(argument);
+        if (event == null) {
+            Logger.logWarn(LOG_TAG, "Ignoring invalid Codex session host event");
             return;
         }
 
-        String event = optJsonString(json, "event").toLowerCase(Locale.ROOT);
-        if ("clear".equals(event) || "closed".equals(event) || "detached".equals(event)) {
-            forgetTermuxRestoreForSession(session);
-            forgetNativeCrushRestoreForSession(session);
-            persistTermuxSessionRestoreState(mActivity.getCurrentSession());
+        String handle = nullToEmpty(session.mHandle);
+        int order = getLiveSessionOrder(session);
+        if (event.type == CodexRestoreStateMachine.HostEvent.CLOSED) {
+            CodexRestoreRecord current = findCodexRestoreRecordForSession(session);
+            if (current != null && !TextUtils.equals(current.threadId, event.threadId)) {
+                Logger.logWarn(LOG_TAG, "Ignoring stale Codex close event for " + event.threadId);
+                return;
+            }
+            TermuxSessionRestoreStore.UpdateResult result = TermuxSessionRestoreStore.applyCodexEvent(
+                handle, order, event);
+            if (result == TermuxSessionRestoreStore.UpdateResult.IGNORED && current == null) return;
+            if (result == TermuxSessionRestoreStore.UpdateResult.FAILED) {
+                Logger.logWarn(LOG_TAG, "Failed to persist Codex close telemetry; lease remains authoritative");
+                return;
+            }
+            if (result != TermuxSessionRestoreStore.UpdateResult.APPLIED) return;
+            forgetNativeCodexRestoreForSession(session);
+            TermuxService service = mActivity.getTermuxService();
+            if (service != null) service.getCodexSessionRecoveryController().onLeaseClosed(event.threadId);
             termuxSessionListNotifyUpdated();
             return;
         }
 
-        CrushRestoreRecord existing = findNativeCrushRestoreRecordForSession(session);
-        CrushRestoreRecord inferred = inferCrushRestoreRecordFromExecutionCommand(session);
+        if (!CodexProcessIdentity.isLiveCodexProcessForSession(session, event.processId)) {
+            Logger.logWarn(LOG_TAG, "Ignoring Codex restore identity from an unrelated process");
+            return;
+        }
+        int codexPid = event.processId;
 
-        String instanceId = optJsonString(json, "instance_id");
-        if (TextUtils.isEmpty(instanceId) && existing != null) instanceId = existing.instanceId;
-        if (TextUtils.isEmpty(instanceId) && inferred != null) instanceId = inferred.instanceId;
-        if (TextUtils.isEmpty(instanceId)) return;
-
-        String sessionId = optJsonString(json, "session_id");
-        if (TextUtils.isEmpty(sessionId) && existing != null) sessionId = existing.sessionId;
-
-        String workingDirectory = optJsonString(json, "cwd");
+        String workingDirectory = event.workingDirectory;
         if (TextUtils.isEmpty(workingDirectory)) workingDirectory = session.getCwd();
-        workingDirectory = resolveCrushRestoreWorkingDirectory(workingDirectory);
+        workingDirectory = resolveCodexRestoreWorkingDirectory(workingDirectory);
 
-        String dataDirectory = optJsonString(json, "data_dir");
-        if (TextUtils.isEmpty(dataDirectory) && existing != null) dataDirectory = existing.dataDirectory;
-        if (TextUtils.isEmpty(dataDirectory) && inferred != null) dataDirectory = inferred.dataDirectory;
+        String title = normalizeCodexTabTitle(event.title);
+        if (TextUtils.isEmpty(title)) title = defaultCodexTitle(event.threadId);
 
-        int order = getLiveSessionOrder(session);
-        String title = optJsonString(json, "title");
-        if (TextUtils.isEmpty(title)) {
-            title = buildTermuxRestoreDisplayName(session, null, order == Integer.MAX_VALUE ? 0 : order);
+        CodexSessionHostProtocol.Event normalizedEvent = new CodexSessionHostProtocol.Event(
+            event.type, event.threadId, event.processId, workingDirectory, event.rolloutPath, title);
+        TermuxSessionRestoreStore.UpdateResult result = TermuxSessionRestoreStore.applyCodexEvent(
+            handle, order, normalizedEvent);
+        if (result == TermuxSessionRestoreStore.UpdateResult.FAILED) {
+            Logger.logWarn(LOG_TAG, "Failed to persist Codex ready event; refusing an in-memory-only registration");
+        }
+        if (result != TermuxSessionRestoreStore.UpdateResult.APPLIED) {
+            Logger.logWarn(LOG_TAG, "Ignoring Codex ready event without a matching durable rollout");
+            return;
         }
 
-        CrushRestoreRecord record = new CrushRestoreRecord(
-            instanceId,
-            sessionId,
+        CodexRestoreRecord record = new CodexRestoreRecord(
+            event.threadId,
             workingDirectory,
-            dataDirectory,
+            event.rolloutPath,
             title,
-            CRUSH_RESTORE_STATE_ACTIVE,
-            findActiveCrushProcessPid(session),
+            codexPid,
             order,
             System.currentTimeMillis() / 1000L);
 
-        if (inferred != null && TextUtils.equals(inferred.instanceId, record.instanceId)) {
-            record = mergeCrushRestoreRecords(record, inferred);
-        }
-
-        rememberNativeCrushRestoreRecord(session, record);
-        syncCrushTitleToTermuxSession(session, record.title);
+        rememberNativeCodexRestoreRecord(session, record);
+        syncCodexTitleToTermuxSession(session, record.title);
+        TermuxService service = mActivity.getTermuxService();
+        if (service != null) service.getCodexSessionRecoveryController().onLeaseReady(event.threadId, session);
         persistTermuxSessionRestoreState(mActivity.getCurrentSession());
         termuxSessionListNotifyUpdated();
     }
 
-    private void syncCrushTitleToTermuxSession(@NonNull TerminalSession session,
+    @NonNull
+    private String normalizeCodexThreadId(@Nullable String rawThreadId) {
+        String value = normalizeNullableRestoreString(rawThreadId);
+        if (TextUtils.isEmpty(value)) return "";
+        try {
+            return UUID.fromString(value).toString();
+        } catch (IllegalArgumentException e) {
+            Logger.logWarn(LOG_TAG, "Invalid Codex thread ID: " + value);
+            return "";
+        }
+    }
+
+    @NonNull
+    private String defaultCodexTitle(@NonNull String threadId) {
+        int end = Math.min(8, threadId.length());
+        return CODEX_RESTORE_DEFAULT_DISPLAY_NAME + " " + threadId.substring(0, end);
+    }
+
+    private void syncCodexTitleToTermuxSession(@NonNull TerminalSession session,
                                                @Nullable String rawTitle) {
-        String title = normalizeCrushTabTitle(rawTitle);
+        String title = normalizeCodexTabTitle(rawTitle);
         if (TextUtils.isEmpty(title)) return;
         if (TextUtils.equals(title, session.mSessionName)) return;
         session.mSessionName = title;
     }
 
     @NonNull
-    private String normalizeCrushTabTitle(@Nullable String rawTitle) {
+    private String normalizeCodexTabTitle(@Nullable String rawTitle) {
         String value = normalizeNullableRestoreString(rawTitle);
         if (TextUtils.isEmpty(value)) return "";
         StringBuilder out = new StringBuilder(value.length());
@@ -679,8 +740,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @Override
     public void onTerminalHostControlCommand(@NonNull TerminalSession session, @NonNull String command, @Nullable String argument) {
-        if (CRUSH_RESTORE_HOST_COMMAND.equals(command)) {
-            handleCrushRestoreHostControlCommand(session, argument);
+        if (CodexSessionHostProtocol.COMMAND.equals(command)) {
+            handleCodexRestoreHostControlCommand(session, argument);
             return;
         }
 
@@ -784,7 +845,6 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     public void setCurrentSession(TerminalSession session) {
         if (session == null) return;
         if (mActivity.requestTerminalSessionSurfaceSelection(session, true)) {
-            persistTerminalSessionSelection(session);
             return;
         }
 
@@ -806,7 +866,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (!TextUtils.isEmpty(session.mHandle)) {
             mActivity.getPreferences().setCurrentSession(session.mHandle);
         }
-        persistTermuxSessionRestoreState(session);
+        mPendingSessionSelectionPersistence = session;
+        mSessionSelectionPersistenceHandler.removeCallbacks(mPersistPendingSessionSelection);
+        mSessionSelectionPersistenceHandler.postDelayed(
+            mPersistPendingSessionSelection,
+            SESSION_SELECTION_PERSIST_IDLE_DELAY_MS
+        );
     }
 
     void notifyOfSessionChange() {
@@ -2891,75 +2956,28 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         return c.getSharedPreferences("ui_panel_prefs", Context.MODE_PRIVATE);
     }
 
-    private static final class CrushRestoreRecord {
-        @NonNull final String instanceId;
-        @NonNull final String sessionId;
+    private static final class CodexRestoreRecord {
+        @NonNull final String threadId;
         @NonNull final String workingDirectory;
-        @NonNull final String dataDirectory;
+        @NonNull final String rolloutPath;
         @NonNull final String title;
-        @NonNull final String state;
         final int pid;
         final int order;
         final long updatedAt;
 
-        CrushRestoreRecord(@NonNull String instanceId, @NonNull String sessionId,
-                           @NonNull String workingDirectory, @NonNull String dataDirectory,
-                           @NonNull String title, @NonNull String state, int pid, int order,
+        CodexRestoreRecord(@NonNull String threadId, @NonNull String workingDirectory,
+                           @NonNull String rolloutPath,
+                           @NonNull String title, int pid, int order,
                            long updatedAt) {
-            this.instanceId = instanceId;
-            this.sessionId = sessionId;
+            this.threadId = threadId;
             this.workingDirectory = workingDirectory;
-            this.dataDirectory = dataDirectory;
+            this.rolloutPath = rolloutPath;
             this.title = title;
-            this.state = state;
             this.pid = pid;
             this.order = order;
             this.updatedAt = updatedAt;
         }
 
-        @Nullable
-        static CrushRestoreRecord fromJson(@NonNull JSONObject json) {
-            String instanceId = optJsonRestoreString(json, "instance_id");
-            String sessionId = optJsonRestoreString(json, "session_id");
-            String workingDirectory = optJsonRestoreString(json, "cwd");
-            String dataDirectory = optJsonRestoreString(json, "data_dir");
-            String title = optJsonRestoreString(json, "title");
-            String state = normalizeState(optJsonRestoreString(json, "state", CRUSH_RESTORE_STATE_ACTIVE));
-            int pid = json.optInt("pid", -1);
-            int order = json.optInt("order", Integer.MAX_VALUE);
-            long updatedAt = json.optLong("updated_at", 0L);
-            if (TextUtils.isEmpty(instanceId)) instanceId = UUID.randomUUID().toString();
-            return new CrushRestoreRecord(instanceId, sessionId, workingDirectory, dataDirectory,
-                title, state, pid, order, updatedAt);
-        }
-
-        @NonNull
-        JSONObject toJson() {
-            JSONObject json = new JSONObject();
-            try {
-                json.put("instance_id", instanceId);
-                json.put("session_id", sessionId);
-                json.put("cwd", workingDirectory);
-                json.put("data_dir", dataDirectory);
-                json.put("title", title);
-                json.put("state", state);
-                json.put("pid", pid);
-                json.put("order", order);
-                json.put("updated_at", updatedAt);
-            } catch (Exception ignored) {
-            }
-            return json;
-        }
-
-        @NonNull
-        private static String normalizeState(@Nullable String raw) {
-            String value = raw == null ? "" : raw.trim().toLowerCase(Locale.ROOT);
-            if (CRUSH_RESTORE_STATE_DETACHED.equals(value) ||
-                CRUSH_RESTORE_STATE_CLOSED.equals(value)) {
-                return value;
-            }
-            return CRUSH_RESTORE_STATE_ACTIVE;
-        }
     }
 
     private static final class TermuxRestoreState {
@@ -3008,9 +3026,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         @NonNull final String shellName;
         @NonNull final String executable;
         @Nullable final String[] arguments;
-        @Nullable final String crushInstanceId;
-        @Nullable final String crushSessionId;
-        @Nullable final String crushDataDirectory;
+        @Nullable final String codexThreadId;
+        @Nullable final String codexRolloutPath;
         @Nullable final String sshPersistRecordId;
         @Nullable final String sshCommand;
         @Nullable final String tmuxSession;
@@ -3020,8 +3037,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         TermuxRestoreRecord(@NonNull String key, @NonNull String type, @NonNull String handle,
                             @NonNull String displayName, @NonNull String workingDirectory,
                             @NonNull String shellName, @NonNull String executable,
-                            @Nullable String[] arguments, @Nullable String crushInstanceId,
-                            @Nullable String crushSessionId, @Nullable String crushDataDirectory,
+                            @Nullable String[] arguments, @Nullable String codexThreadId,
+                            @Nullable String codexRolloutPath,
                             @Nullable String sshPersistRecordId, @Nullable String sshCommand,
                             @Nullable String tmuxSession, int order, long updatedAt) {
             this.key = key;
@@ -3032,9 +3049,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             this.shellName = shellName;
             this.executable = executable;
             this.arguments = arguments == null ? null : arguments.clone();
-            this.crushInstanceId = crushInstanceId;
-            this.crushSessionId = crushSessionId;
-            this.crushDataDirectory = crushDataDirectory;
+            this.codexThreadId = codexThreadId;
+            this.codexRolloutPath = codexRolloutPath;
             this.sshPersistRecordId = sshPersistRecordId;
             this.sshCommand = sshCommand;
             this.tmuxSession = tmuxSession;
@@ -3046,7 +3062,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         static TermuxRestoreRecord fromJson(@NonNull JSONObject json) {
             String key = json.optString("key", "").trim();
             String type = json.optString("type", "").trim();
-            if (TextUtils.isEmpty(key) || TextUtils.isEmpty(type)) return null;
+            if (TextUtils.isEmpty(key) || !isSupportedTermuxRestoreType(type)) return null;
 
             JSONArray argsArray = json.optJSONArray("arguments");
             String[] args = null;
@@ -3068,9 +3084,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                 json.optString("shell_name", "").trim(),
                 json.optString("executable", "").trim(),
                 args,
-                optNonEmptyString(json, "crush_instance_id"),
-                optNonEmptyString(json, "crush_session_id"),
-                optNonEmptyString(json, "crush_data_dir"),
+                optNonEmptyString(json, "codex_thread_id"),
+                optNonEmptyString(json, "codex_rollout_path"),
                 optNonEmptyString(json, "ssh_persist_record_id"),
                 optNonEmptyString(json, "ssh_command"),
                 optNonEmptyString(json, "tmux_session"),
@@ -3094,9 +3109,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                     for (String arg : arguments) array.put(arg == null ? "" : arg);
                     json.put("arguments", array);
                 }
-                putNullableString(json, "crush_instance_id", crushInstanceId);
-                putNullableString(json, "crush_session_id", crushSessionId);
-                putNullableString(json, "crush_data_dir", crushDataDirectory);
+                putNullableString(json, "codex_thread_id", codexThreadId);
+                putNullableString(json, "codex_rollout_path", codexRolloutPath);
                 putNullableString(json, "ssh_persist_record_id", sshPersistRecordId);
                 putNullableString(json, "ssh_command", sshCommand);
                 putNullableString(json, "tmux_session", tmuxSession);
@@ -3121,72 +3135,47 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         }
     }
 
-    public boolean restoreCrushSessionsIfRequested(boolean isFailSafe) {
-        return false;
-    }
-
-    public boolean materializeDetachedCrushSessionsIfRequested(boolean isFailSafe) {
-        return false;
-    }
-
-    @Nullable
-    private TerminalSession resolveMaterializedCrushForeground(
-        @NonNull TermuxRestoreState restoreState,
-        @NonNull HashMap<String, TerminalSession> restoredByKey,
-        @NonNull HashMap<String, TerminalSession> restoredByInstance,
-        @NonNull HashMap<String, TerminalSession> restoredBySession) {
-        if (!TextUtils.isEmpty(restoreState.foregroundKey)) {
-            TerminalSession byKey = restoredByKey.get(restoreState.foregroundKey);
-            if (byKey != null) return byKey;
-            if (restoreState.foregroundKey.startsWith("crush:")) {
-                String instanceId = restoreState.foregroundKey.substring("crush:".length()).trim();
-                TerminalSession byInstance = restoredByInstance.get(instanceId);
-                if (byInstance != null) return byInstance;
-            }
-        }
-
-        SharedPreferences prefs = getCrushRestorePrefs();
-        if (prefs != null) {
-            String foregroundInstanceId = prefs.getString(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID + ".instance", "");
-            TerminalSession byInstance = restoredByInstance.get(nullToEmpty(foregroundInstanceId));
-            if (byInstance != null) return byInstance;
-
-            String foregroundSessionId = prefs.getString(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID, "");
-            TerminalSession bySession = restoredBySession.get(nullToEmpty(foregroundSessionId));
-            if (bySession != null) return bySession;
-        }
-
-        return null;
-    }
-
-    @NonNull
-    private HashSet<String> collectAttachedCrushRestoreInstances(@NonNull TermuxService service,
-                                                                 @NonNull ArrayList<CrushRestoreRecord> knownRecords) {
-        HashSet<String> attachedInstances = new HashSet<>();
-        for (TermuxSession termuxSession : service.getTermuxSessions()) {
-            if (termuxSession == null || termuxSession.getTerminalSession() == null) continue;
-            TerminalSession terminalSession = termuxSession.getTerminalSession();
-            if (!terminalSession.isRunning()) continue;
-
-            CrushRestoreRecord record = findCrushRestoreRecordForSession(terminalSession, knownRecords);
-            if (record == null) record = inferCrushRestoreRecordFromExecutionCommand(terminalSession);
-            if (record == null || TextUtils.isEmpty(record.instanceId)) continue;
-            attachedInstances.add(record.instanceId);
-        }
-        return attachedInstances;
+    private static boolean isSupportedTermuxRestoreType(@Nullable String type) {
+        return TERMUX_RESTORE_TYPE_CODEX.equals(type) ||
+            TERMUX_RESTORE_TYPE_SSH_TMUX.equals(type) ||
+            TERMUX_RESTORE_TYPE_LOCAL_TMUX.equals(type) ||
+            TERMUX_RESTORE_TYPE_SSH.equals(type) ||
+            TERMUX_RESTORE_TYPE_PROOT.equals(type) ||
+            TERMUX_RESTORE_TYPE_SHELL.equals(type);
     }
 
     @Nullable
-    private TermuxSession createCrushRestoreSession(@NonNull TermuxService service,
-                                                    @NonNull CrushRestoreRecord record) {
+    private TermuxSession createCodexRestoreSession(@NonNull TermuxService service,
+                                                    @NonNull CodexRestoreRecord record) {
         String bash = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/bash";
         if (!new File(bash).exists()) return null;
 
-        String workingDirectory = resolveCrushRestoreWorkingDirectory(record.workingDirectory);
-        String displayName = buildCrushRestoreDisplayName(record);
+        String codexPath = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/codex";
+        boolean validThreadId = TextUtils.equals(record.threadId, normalizeCodexThreadId(record.threadId));
+        CodexRestoreStateMachine.RecoveryAction action = CodexRestoreStateMachine.resolveRecovery(
+            new CodexRestoreStateMachine.RecoveryInput(
+                CodexRestoreStateMachine.RecoveryEvent.COLD_START,
+                true,
+                validThreadId,
+                new File(codexPath).canExecute()));
+        if (action != CodexRestoreStateMachine.RecoveryAction.START_CODEX) {
+            TermuxSessionRestoreStore.appendCodexAudit(
+                "cold_restore_deferred", record.threadId, "", action.name().toLowerCase(Locale.ROOT));
+            return null;
+        }
+        if (!CodexSessionHostProtocol.rolloutMatchesThread(record.rolloutPath, record.threadId)) {
+            TermuxSessionRestoreStore.appendCodexAudit(
+                "cold_restore_deferred", record.threadId, "", "rollout_identity_invalid");
+            return null;
+        }
+
+        String workingDirectory = resolveCodexRestoreWorkingDirectory(record.workingDirectory);
+        String displayName = buildCodexRestoreDisplayName(record);
+        TermuxSessionRestoreStore.appendCodexAudit(
+            "cold_restore_start", record.threadId, "", action.name().toLowerCase(Locale.ROOT));
         TermuxSession created = service.createTermuxSession(
             bash,
-            new String[]{"-lc", buildCrushRestoreCommand(record, workingDirectory)},
+            new String[]{"-lc", buildCodexRestoreCommand(record, workingDirectory)},
             null,
             workingDirectory,
             false,
@@ -3194,39 +3183,57 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (created != null && created.getTerminalSession() != null) {
             TerminalSession terminalSession = created.getTerminalSession();
             terminalSession.mSessionName = displayName;
-            markCrushRestoreRecordMaterialized(record, terminalSession);
-            scheduleCrushRestoreMaterializationValidation(record, terminalSession);
+            markCodexRestoreRecordMaterialized(record, terminalSession);
+            service.getCodexSessionRecoveryController().onSessionMaterializing(record.threadId, terminalSession);
+            scheduleCodexRestoreMaterializationValidation(record, terminalSession);
+            TermuxSessionRestoreStore.appendCodexAudit(
+                "cold_restore_created", record.threadId, nullToEmpty(terminalSession.mHandle), displayName);
+        } else {
+            TermuxSessionRestoreStore.appendCodexAudit(
+                "cold_restore_failed", record.threadId, "", "terminal session creation failed");
         }
         return created;
     }
 
-    private void markCrushRestoreRecordMaterialized(@NonNull CrushRestoreRecord record,
+    private void markCodexRestoreRecordMaterialized(@NonNull CodexRestoreRecord record,
                                                     @NonNull TerminalSession terminalSession) {
-        int pid = findActiveCrushProcessPid(terminalSession);
+        int pid = findActiveCodexProcessPid(terminalSession);
 
-        CrushRestoreRecord materialized = copyCrushRestoreRecordWithState(record, CRUSH_RESTORE_STATE_ACTIVE);
+        CodexRestoreRecord materialized = record;
         int order = getLiveSessionOrder(terminalSession);
-        if (order != Integer.MAX_VALUE) materialized = copyCrushRestoreRecordWithOrder(materialized, order);
-        materialized = pid > 0
-            ? copyCrushRestoreRecordWithPid(materialized, pid)
-            : copyCrushRestoreRecordWithoutPid(materialized);
-        rememberNativeCrushRestoreRecord(terminalSession, materialized);
+        if (order != Integer.MAX_VALUE) materialized = copyCodexRestoreRecordWithOrder(materialized, order);
+        materialized = copyCodexRestoreRecordWithPid(materialized, pid > 0 ? pid : -1);
+        rememberNativeCodexRestoreRecord(terminalSession, materialized);
     }
 
-    private void scheduleCrushRestoreMaterializationValidation(@NonNull CrushRestoreRecord record,
+    private void scheduleCodexRestoreMaterializationValidation(@NonNull CodexRestoreRecord record,
                                                                @NonNull TerminalSession terminalSession) {
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             TermuxService service = mActivity.getTermuxService();
             if (service == null || service.getTermuxSessionForTerminalSession(terminalSession) == null) return;
 
-            int pid = findActiveCrushProcessPid(terminalSession);
+            if (terminalSession.getPid() == 0) {
+                TermuxSessionRestoreStore.appendCodexAudit(
+                    "cold_restore_start_pending", record.threadId,
+                    nullToEmpty(terminalSession.mHandle), "background tab awaits first display");
+                persistTermuxSessionRestoreState();
+                termuxSessionListNotifyUpdated();
+                return;
+            }
+
+            int pid = findActiveCodexProcessPid(terminalSession);
             int order = getLiveSessionOrder(terminalSession);
-            CrushRestoreRecord validated = record;
-            if (order != Integer.MAX_VALUE) validated = copyCrushRestoreRecordWithOrder(validated, order);
+            CodexRestoreRecord validated = record;
+            if (order != Integer.MAX_VALUE) validated = copyCodexRestoreRecordWithOrder(validated, order);
 
             if (pid > 0) {
-                rememberNativeCrushRestoreRecord(terminalSession, copyCrushRestoreRecordWithState(
-                    copyCrushRestoreRecordWithPid(validated, pid), CRUSH_RESTORE_STATE_ACTIVE));
+                rememberNativeCodexRestoreRecord(terminalSession,
+                    copyCodexRestoreRecordWithPid(validated, pid));
+            } else {
+                TermuxSessionRestoreStore.appendCodexAudit(
+                    "cold_restore_process_pending", record.threadId,
+                    nullToEmpty(terminalSession.mHandle),
+                    "awaiting host-ready or recovery-watchdog verification");
             }
 
             persistTermuxSessionRestoreState();
@@ -3235,337 +3242,165 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @NonNull
-    private String buildCrushRestoreCommand(@NonNull CrushRestoreRecord record,
+    private String buildCodexRestoreCommand(@NonNull CodexRestoreRecord record,
                                             @NonNull String workingDirectory) {
-        String crushPath = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/crush";
-        String fallbackShell = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/bash";
-        StringBuilder command = new StringBuilder();
-        command.append("cd ").append(quoteArg(workingDirectory)).append(" 2>/dev/null || cd ")
-            .append(quoteArg(TermuxConstants.TERMUX_HOME_DIR_PATH)).append("; ");
-        command.append("export CRUSH_TERMUX_INSTANCE_ID=").append(quoteArg(record.instanceId)).append("; ");
-        command.append("export CRUSH_TERMUX_RESTORE=1; ");
-        command.append("export CRUSH_TERMUX_NATIVE_RESTORE=1; ");
-        command.append("crush_cmd=").append(quoteArg(crushPath)).append("; ");
-        command.append("[ -x \"$crush_cmd\" ] || crush_cmd=$(command -v crush 2>/dev/null || true); ");
-        command.append("if [ -z \"$crush_cmd\" ]; then ");
-        command.append("echo 'crush 未安装，无法恢复会话'; exec ").append(quoteArg(fallbackShell)).append(" -l; ");
-        command.append("fi; exec \"$crush_cmd\" --cwd ").append(quoteArg(workingDirectory));
-        if (!TextUtils.isEmpty(record.dataDirectory)) {
-            command.append(" --data-dir ").append(quoteArg(record.dataDirectory));
-        }
-        if (!TextUtils.isEmpty(record.sessionId)) {
-            command.append(" --session ").append(quoteArg(record.sessionId));
-        }
-        return command.toString();
-    }
-
-    private void persistCrushRestoreForegroundSession() {
-        persistCrushRestoreForegroundSession(mActivity.getCurrentSession());
-    }
-
-    private void persistCrushRestoreForegroundSession(@Nullable TerminalSession currentSession) {
-        SharedPreferences prefs = getCrushRestorePrefs();
-        if (prefs == null) return;
-
-        CrushRestoreRecord record = findOrInferCrushRestoreRecordForSession(currentSession);
-        SharedPreferences.Editor editor = prefs.edit();
-        if (record == null) {
-            editor.remove(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID)
-                .remove(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID + ".instance")
-                .apply();
-            return;
-        }
-
-        editor.putString(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID, record.sessionId)
-            .putString(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID + ".instance", record.instanceId)
-            .apply();
-    }
-
-    private void forgetCrushRestoreForSession(@Nullable TerminalSession terminalSession) {
-        CrushRestoreRecord record = findCrushRestoreRecordForSession(terminalSession);
-        if (record == null) return;
-
-        ArrayList<CrushRestoreRecord> records = loadCrushRestoreRecords();
-        boolean removed = false;
-        for (int i = records.size() - 1; i >= 0; i--) {
-            CrushRestoreRecord candidate = records.get(i);
-            if (TextUtils.equals(candidate.instanceId, record.instanceId) ||
-                (record.pid > 0 && candidate.pid == record.pid)) {
-                records.remove(i);
-                removed = true;
-            }
-        }
-        if (removed) saveCrushRestoreRecords(records);
-
-        SharedPreferences prefs = getCrushRestorePrefs();
-        if (prefs != null) {
-            String foregroundInstanceId = prefs.getString(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID + ".instance", "");
-            if (TextUtils.equals(foregroundInstanceId, record.instanceId)) {
-                prefs.edit()
-                    .remove(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID)
-                    .remove(KEY_CRUSH_RESTORE_FOREGROUND_SESSION_ID + ".instance")
-                    .apply();
-            }
-        }
-    }
-
-    private void detachCrushRestoreForSession(@Nullable TerminalSession terminalSession) {
-        CrushRestoreRecord record = findOrInferCrushRestoreRecordForSession(terminalSession);
-        if (record == null) return;
-        upsertCrushRestoreRecord(copyCrushRestoreRecordWithState(record, CRUSH_RESTORE_STATE_DETACHED));
-    }
-
-    private void closeCrushRestoreForSession(@Nullable TerminalSession terminalSession) {
-        CrushRestoreRecord record = findOrInferCrushRestoreRecordForSession(terminalSession);
-        if (record == null) return;
-        upsertCrushRestoreRecord(copyCrushRestoreRecordWithState(record, CRUSH_RESTORE_STATE_CLOSED));
-    }
-
-    private void upsertCrushRestoreRecord(@NonNull CrushRestoreRecord record) {
-        // Native Crush restore state is persisted by persistTermuxSessionRestoreState().
+        return CodexSessionRecoveryController.buildRestoreCommand(
+            record.threadId, workingDirectory, record.rolloutPath);
     }
 
     @NonNull
-    private CrushRestoreRecord copyCrushRestoreRecordWithState(@NonNull CrushRestoreRecord record,
-                                                               @NonNull String state) {
-        return new CrushRestoreRecord(
-            record.instanceId,
-            record.sessionId,
+    private CodexRestoreRecord copyCodexRestoreRecordWithPid(@NonNull CodexRestoreRecord record, int pid) {
+        return new CodexRestoreRecord(
+            record.threadId,
             record.workingDirectory,
-            record.dataDirectory,
+            record.rolloutPath,
             record.title,
-            CrushRestoreRecord.normalizeState(state),
-            record.pid,
-            record.order,
-            System.currentTimeMillis() / 1000L);
-    }
-
-    @NonNull
-    private CrushRestoreRecord copyCrushRestoreRecordWithPid(@NonNull CrushRestoreRecord record, int pid) {
-        return new CrushRestoreRecord(
-            record.instanceId,
-            record.sessionId,
-            record.workingDirectory,
-            record.dataDirectory,
-            record.title,
-            record.state,
             pid,
             record.order,
             System.currentTimeMillis() / 1000L);
     }
 
     @NonNull
-    private CrushRestoreRecord copyCrushRestoreRecordWithoutPid(@NonNull CrushRestoreRecord record) {
-        return copyCrushRestoreRecordWithPid(record, -1);
-    }
-
-    @NonNull
-    private CrushRestoreRecord copyCrushRestoreRecordWithOrder(@NonNull CrushRestoreRecord record, int order) {
-        return new CrushRestoreRecord(
-            record.instanceId,
-            record.sessionId,
+    private CodexRestoreRecord copyCodexRestoreRecordWithOrder(@NonNull CodexRestoreRecord record, int order) {
+        return new CodexRestoreRecord(
+            record.threadId,
             record.workingDirectory,
-            record.dataDirectory,
+            record.rolloutPath,
             record.title,
-            record.state,
             record.pid,
             normalizeRestoreOrder(order),
             System.currentTimeMillis() / 1000L);
     }
 
     @Nullable
-    private CrushRestoreRecord findCrushRestoreRecordForSession(@Nullable TerminalSession terminalSession) {
-        CrushRestoreRecord nativeRecord = findNativeCrushRestoreRecordForSession(terminalSession);
+    private CodexRestoreRecord findCodexRestoreRecordForSession(@Nullable TerminalSession terminalSession) {
+        CodexRestoreRecord nativeRecord = findNativeCodexRestoreRecordForSession(terminalSession);
         if (nativeRecord != null) return nativeRecord;
-        CrushRestoreRecord persistedRecord = findPersistedCrushRestoreRecordForSession(terminalSession);
+        CodexRestoreRecord persistedRecord = findPersistedCodexRestoreRecordForSession(terminalSession);
         if (persistedRecord != null) return persistedRecord;
 
-        int crushPid = findActiveCrushProcessPid(terminalSession);
-        if (crushPid <= 0) return null;
-        ArrayList<CrushRestoreRecord> records = loadCrushRestoreRecords();
-        String instanceId = readProcessEnvironmentValue(crushPid, "CRUSH_TERMUX_INSTANCE_ID");
-        if (!TextUtils.isEmpty(instanceId)) {
-            for (CrushRestoreRecord record : records) {
-                if (TextUtils.equals(record.instanceId, instanceId)) return record;
-            }
-        }
-        for (CrushRestoreRecord record : records) {
-            if (record.pid == crushPid) return record;
+        int codexPid = findActiveCodexProcessPid(terminalSession);
+        if (codexPid <= 0) return null;
+        ArrayList<CodexRestoreRecord> records = loadCodexRestoreRecords();
+        for (CodexRestoreRecord record : records) {
+            if (record.pid == codexPid) return record;
         }
         return null;
     }
 
-    private void rememberNativeCrushRestoreRecord(@Nullable TerminalSession terminalSession,
-                                                  @Nullable CrushRestoreRecord record) {
-        if (terminalSession == null || record == null || TextUtils.isEmpty(record.instanceId)) return;
+    private void rememberNativeCodexRestoreRecord(@Nullable TerminalSession terminalSession,
+                                                  @Nullable CodexRestoreRecord record) {
+        if (terminalSession == null || record == null || TextUtils.isEmpty(record.threadId)) return;
         String handle = nullToEmpty(terminalSession.mHandle);
-        synchronized (mNativeCrushRestoreLock) {
-            mNativeCrushRestoreByInstance.put(record.instanceId, normalizeCrushRestoreRecord(record));
+        synchronized (mNativeCodexRestoreLock) {
+            mNativeCodexRestoreByThread.put(record.threadId, normalizeCodexRestoreRecord(record));
             if (!TextUtils.isEmpty(handle)) {
-                mNativeCrushRestoreInstanceByHandle.put(handle, record.instanceId);
-                mNativeCrushRestoreSuppressedHandles.remove(handle);
+                mNativeCodexRestoreThreadByHandle.put(handle, record.threadId);
+                mNativeCodexRestoreSuppressedHandles.remove(handle);
             }
         }
     }
 
-    private void forgetNativeCrushRestoreForSession(@Nullable TerminalSession terminalSession) {
+    private void forgetNativeCodexRestoreForSession(@Nullable TerminalSession terminalSession) {
         if (terminalSession == null) return;
         String handle = nullToEmpty(terminalSession.mHandle);
-        synchronized (mNativeCrushRestoreLock) {
-            if (!TextUtils.isEmpty(handle)) mNativeCrushRestoreSuppressedHandles.add(handle);
-            String instanceId = TextUtils.isEmpty(handle) ? null : mNativeCrushRestoreInstanceByHandle.remove(handle);
-            if (!TextUtils.isEmpty(instanceId)) {
-                mNativeCrushRestoreByInstance.remove(instanceId);
+        synchronized (mNativeCodexRestoreLock) {
+            if (!TextUtils.isEmpty(handle)) mNativeCodexRestoreSuppressedHandles.add(handle);
+            String threadId = TextUtils.isEmpty(handle) ? null : mNativeCodexRestoreThreadByHandle.remove(handle);
+            if (!TextUtils.isEmpty(threadId)) {
+                mNativeCodexRestoreByThread.remove(threadId);
                 return;
             }
         }
 
-        CrushRestoreRecord inferred = inferCrushRestoreRecordFromExecutionCommand(terminalSession);
-        if (inferred != null && !TextUtils.isEmpty(inferred.instanceId)) {
-            synchronized (mNativeCrushRestoreLock) {
-                mNativeCrushRestoreByInstance.remove(inferred.instanceId);
+        CodexRestoreRecord inferred = inferCodexRestoreRecordFromExecutionCommand(terminalSession);
+        if (inferred != null && !TextUtils.isEmpty(inferred.threadId)) {
+            synchronized (mNativeCodexRestoreLock) {
+                mNativeCodexRestoreByThread.remove(inferred.threadId);
             }
         }
     }
 
     @Nullable
-    private CrushRestoreRecord findNativeCrushRestoreRecordForSession(@Nullable TerminalSession terminalSession) {
+    private CodexRestoreRecord findNativeCodexRestoreRecordForSession(@Nullable TerminalSession terminalSession) {
         if (terminalSession == null) return null;
         String handle = nullToEmpty(terminalSession.mHandle);
-        synchronized (mNativeCrushRestoreLock) {
-            if (!TextUtils.isEmpty(handle) && mNativeCrushRestoreSuppressedHandles.contains(handle)) {
+        synchronized (mNativeCodexRestoreLock) {
+            if (!TextUtils.isEmpty(handle) && mNativeCodexRestoreSuppressedHandles.contains(handle)) {
                 return null;
             }
             if (!TextUtils.isEmpty(handle)) {
-                String instanceId = mNativeCrushRestoreInstanceByHandle.get(handle);
-                CrushRestoreRecord record = TextUtils.isEmpty(instanceId) ? null : mNativeCrushRestoreByInstance.get(instanceId);
+                String threadId = mNativeCodexRestoreThreadByHandle.get(handle);
+                CodexRestoreRecord record = TextUtils.isEmpty(threadId) ? null : mNativeCodexRestoreByThread.get(threadId);
                 if (record != null) return record;
             }
         }
 
-        CrushRestoreRecord inferred = inferCrushRestoreRecordFromExecutionCommand(terminalSession);
-        if (inferred == null || TextUtils.isEmpty(inferred.instanceId)) return null;
-        synchronized (mNativeCrushRestoreLock) {
-            return mNativeCrushRestoreByInstance.get(inferred.instanceId);
+        CodexRestoreRecord inferred = inferCodexRestoreRecordFromExecutionCommand(terminalSession);
+        if (inferred == null || TextUtils.isEmpty(inferred.threadId)) return null;
+        synchronized (mNativeCodexRestoreLock) {
+            return mNativeCodexRestoreByThread.get(inferred.threadId);
         }
     }
 
     @Nullable
-    private CrushRestoreRecord findPersistedCrushRestoreRecordForSession(@Nullable TerminalSession terminalSession) {
+    private CodexRestoreRecord findPersistedCodexRestoreRecordForSession(@Nullable TerminalSession terminalSession) {
         if (terminalSession == null) return null;
         String handle = nullToEmpty(terminalSession.mHandle);
         if (TextUtils.isEmpty(handle)) return null;
 
         TermuxRestoreState state = loadTermuxRestoreState();
         for (TermuxRestoreRecord record : state.records) {
-            if (!TERMUX_RESTORE_TYPE_CRUSH.equals(record.type)) continue;
+            if (!TERMUX_RESTORE_TYPE_CODEX.equals(record.type)) continue;
             if (!TextUtils.equals(handle, record.handle)) continue;
-            return buildCrushRestoreRecordFromTermuxRestoreRecord(record);
+            return buildCodexRestoreRecordFromTermuxRestoreRecord(record);
         }
         return null;
     }
 
-    private void clearNativeCrushRestoreSuppression(@Nullable TerminalSession terminalSession) {
+    private void clearNativeCodexRestoreSuppression(@Nullable TerminalSession terminalSession) {
         if (terminalSession == null) return;
         String handle = nullToEmpty(terminalSession.mHandle);
         if (TextUtils.isEmpty(handle)) return;
-        synchronized (mNativeCrushRestoreLock) {
-            mNativeCrushRestoreSuppressedHandles.remove(handle);
+        synchronized (mNativeCodexRestoreLock) {
+            mNativeCodexRestoreSuppressedHandles.remove(handle);
         }
     }
 
-    private boolean isNativeCrushRestoreSuppressed(@Nullable TerminalSession terminalSession) {
+    private boolean isNativeCodexRestoreSuppressed(@Nullable TerminalSession terminalSession) {
         if (terminalSession == null) return false;
         String handle = nullToEmpty(terminalSession.mHandle);
         if (TextUtils.isEmpty(handle)) return false;
-        synchronized (mNativeCrushRestoreLock) {
-            return mNativeCrushRestoreSuppressedHandles.contains(handle);
+        synchronized (mNativeCodexRestoreLock) {
+            return mNativeCodexRestoreSuppressedHandles.contains(handle);
         }
-    }
-
-    @NonNull
-    private CrushRestoreStateMachine.Authority resolveCrushRestoreAuthorityForSession(
-        @Nullable TerminalSession terminalSession) {
-        int crushPid = findActiveCrushProcessPid(terminalSession);
-        CrushRestoreRecord stateRecord = null;
-        ArrayList<CrushRestoreRecord> allRecords = loadAllCrushRestoreRecords();
-        if (crushPid > 0) {
-            stateRecord = findCrushRestoreRecordForSession(terminalSession, allRecords);
-        }
-
-        CrushRestoreRecord inferredRecord = inferCrushRestoreRecordFromExecutionCommand(terminalSession);
-        if (stateRecord == null && inferredRecord != null) {
-            stateRecord = findCrushRestoreRecordByInstance(allRecords, inferredRecord.instanceId);
-        }
-
-        boolean hasCrushState = stateRecord != null && isRestorableCrushState(stateRecord.state);
-        boolean hasTermuxProjection = hasTermuxRestoreProjectionForCrushSession(terminalSession,
-            stateRecord != null ? stateRecord : inferredRecord);
-        boolean hasExecutionIntent = inferredRecord != null;
-        return CrushRestoreStateMachine.resolveAuthority(new CrushRestoreStateMachine.AuthorityInput(
-            crushPid > 0,
-            hasCrushState,
-            hasTermuxProjection,
-            hasExecutionIntent));
     }
 
     @Nullable
-    private CrushRestoreRecord findOrInferCrushRestoreRecordForSession(@Nullable TerminalSession terminalSession) {
-        ArrayList<CrushRestoreRecord> allRecords = loadAllCrushRestoreRecords();
-        CrushRestoreRecord stateRecord = findCrushRestoreRecordForSession(terminalSession, allRecords);
-        CrushRestoreRecord inferredRecord = inferCrushRestoreRecordFromExecutionCommand(terminalSession);
-
-        if (stateRecord != null && inferredRecord != null) {
-            return mergeCrushRestoreRecords(stateRecord, inferredRecord);
-        }
-        if (stateRecord != null) return stateRecord;
-        if (inferredRecord == null) return null;
-
-        CrushRestoreRecord byInstance = findCrushRestoreRecordByInstance(allRecords, inferredRecord.instanceId);
-        return byInstance == null ? inferredRecord : mergeCrushRestoreRecords(byInstance, inferredRecord);
-    }
-
-    @Nullable
-    private CrushRestoreRecord findCrushRestoreRecordByInstance(@NonNull ArrayList<CrushRestoreRecord> records,
-                                                                @Nullable String instanceId) {
-        if (TextUtils.isEmpty(instanceId)) return null;
-        for (CrushRestoreRecord record : records) {
-            if (TextUtils.equals(record.instanceId, instanceId)) return record;
+    private CodexRestoreRecord findCodexRestoreRecordByThread(@NonNull ArrayList<CodexRestoreRecord> records,
+                                                                @Nullable String threadId) {
+        if (TextUtils.isEmpty(threadId)) return null;
+        for (CodexRestoreRecord record : records) {
+            if (TextUtils.equals(record.threadId, threadId)) return record;
         }
         return null;
     }
 
     @NonNull
-    private CrushRestoreRecord mergeCrushRestoreRecords(@NonNull CrushRestoreRecord primary,
-                                                        @NonNull CrushRestoreRecord fallback) {
-        String sessionId = TextUtils.isEmpty(primary.sessionId) ? fallback.sessionId : primary.sessionId;
+    private CodexRestoreRecord mergeCodexRestoreRecords(@NonNull CodexRestoreRecord primary,
+                                                        @NonNull CodexRestoreRecord fallback) {
         String workingDirectory = TextUtils.isEmpty(primary.workingDirectory) ? fallback.workingDirectory : primary.workingDirectory;
-        String dataDirectory = TextUtils.isEmpty(primary.dataDirectory) ? fallback.dataDirectory : primary.dataDirectory;
+        String rolloutPath = TextUtils.isEmpty(primary.rolloutPath) ? fallback.rolloutPath : primary.rolloutPath;
         String title = TextUtils.isEmpty(primary.title) ? fallback.title : primary.title;
         int pid = fallback.pid > 0 ? fallback.pid : primary.pid;
         int order = fallback.order != Integer.MAX_VALUE ? fallback.order : primary.order;
         long updatedAt = Math.max(primary.updatedAt, fallback.updatedAt);
-        return new CrushRestoreRecord(primary.instanceId, sessionId, workingDirectory, dataDirectory,
-            title, primary.state, pid, order, updatedAt);
-    }
-
-    private boolean hasTermuxRestoreProjectionForCrushSession(@Nullable TerminalSession terminalSession,
-                                                              @Nullable CrushRestoreRecord crushRecord) {
-        String handle = terminalSession == null ? "" : nullToEmpty(terminalSession.mHandle);
-        TermuxRestoreState state = loadTermuxRestoreState();
-        for (TermuxRestoreRecord record : state.records) {
-            if (!TERMUX_RESTORE_TYPE_CRUSH.equals(record.type)) continue;
-            if (!TextUtils.isEmpty(handle) && TextUtils.equals(handle, record.handle)) return true;
-            if (crushRecord != null && !TextUtils.isEmpty(crushRecord.instanceId) &&
-                TextUtils.equals(crushRecord.instanceId, record.crushInstanceId)) {
-                return true;
-            }
-        }
-        return false;
+        return new CodexRestoreRecord(primary.threadId, workingDirectory, rolloutPath,
+            title, pid, order, updatedAt);
     }
 
     @Nullable
-    private CrushRestoreRecord inferCrushRestoreRecordFromExecutionCommand(@Nullable TerminalSession terminalSession) {
+    private CodexRestoreRecord inferCodexRestoreRecordFromExecutionCommand(@Nullable TerminalSession terminalSession) {
         if (terminalSession == null) return null;
         TermuxService service = mActivity.getTermuxService();
         if (service == null) return null;
@@ -3574,69 +3409,29 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
         ExecutionCommand command = termuxSession.getExecutionCommand();
         String script = command == null ? null : extractShellScriptFromExecutionArgs(command.arguments);
-        if (!looksLikeCrushRestoreCommand(command, script)) return null;
+        if (!looksLikeCodexRestoreCommand(command, script)) return null;
 
-        String instanceId = extractShellAssignmentValue(script, "CRUSH_TERMUX_INSTANCE_ID");
-        if (TextUtils.isEmpty(instanceId)) {
-            int crushPid = findActiveCrushProcessPid(terminalSession);
-            if (crushPid > 0) instanceId = readProcessEnvironmentValue(crushPid, "CRUSH_TERMUX_INSTANCE_ID");
-        }
-        if (TextUtils.isEmpty(instanceId)) return null;
+        String threadId = normalizeCodexThreadId(extractShellOptionValue(script, "resume"));
+        if (TextUtils.isEmpty(threadId)) return null;
 
-        String sessionId = extractShellOptionValue(script, "--session");
-        String dataDirectory = extractShellOptionValue(script, "--data-dir");
-        String workingDirectory = extractShellOptionValue(script, "--cwd");
-        if (TextUtils.isEmpty(workingDirectory)) workingDirectory = terminalSession.getCwd();
-        workingDirectory = resolveCrushRestoreWorkingDirectory(workingDirectory);
+        String workingDirectory = terminalSession.getCwd();
+        workingDirectory = resolveCodexRestoreWorkingDirectory(workingDirectory);
 
         int order = service.getIndexOfSession(terminalSession);
         if (order < 0) order = Integer.MAX_VALUE;
         String title = buildTermuxRestoreDisplayName(terminalSession, command, order == Integer.MAX_VALUE ? 0 : order);
-        int crushPid = findActiveCrushProcessPid(terminalSession);
-        return new CrushRestoreRecord(instanceId.trim(), nullToEmpty(sessionId), workingDirectory,
-            nullToEmpty(dataDirectory), title, CRUSH_RESTORE_STATE_ACTIVE, crushPid, order,
+        int codexPid = findActiveCodexProcessPid(terminalSession);
+        return new CodexRestoreRecord(threadId, workingDirectory, "", title,
+            codexPid, order,
             System.currentTimeMillis() / 1000L);
     }
 
-    private boolean looksLikeCrushRestoreCommand(@Nullable ExecutionCommand command, @Nullable String script) {
-        if (command != null && isCrushExecutable(command.executable)) return true;
+    private boolean looksLikeCodexRestoreCommand(@Nullable ExecutionCommand command, @Nullable String script) {
+        if (command != null && isCodexExecutable(command.executable)) return true;
         if (TextUtils.isEmpty(script)) return false;
-        return script.contains("CRUSH_TERMUX_INSTANCE_ID=") ||
-            script.contains("CRUSH_TERMUX_RESTORE=1") ||
-            script.contains("crush_cmd=") ||
-            script.contains("exec \"$crush_cmd\"") ||
-            script.contains(" --session ") && script.contains("crush");
-    }
-
-    private boolean isCrushRestoreLauncherProcess(@Nullable TerminalSession terminalSession,
-                                                  @Nullable CrushRestoreRecord inferredCrush) {
-        if (terminalSession == null || inferredCrush == null || TextUtils.isEmpty(inferredCrush.instanceId)) {
-            return false;
-        }
-
-        int rootPid = terminalSession.getPid();
-        if (rootPid <= 0 || !isProcessAlive(rootPid)) return false;
-        String[] argv = readCmdlineArguments(rootPid);
-        String script = extractShellScriptFromExecutionArgs(argv);
-        if (!looksLikeCrushRestoreCommand(null, script)) return false;
-
-        String instanceId = extractShellAssignmentValue(script, "CRUSH_TERMUX_INSTANCE_ID");
-        return TextUtils.equals(inferredCrush.instanceId, instanceId);
-    }
-
-    @Nullable
-    private String extractShellAssignmentValue(@Nullable String script, @NonNull String key) {
-        if (TextUtils.isEmpty(script) || TextUtils.isEmpty(key)) return null;
-        String exportMarker = "export " + key + "=";
-        int start = script.indexOf(exportMarker);
-        if (start >= 0) {
-            return readShellTokenValue(script, start + exportMarker.length());
-        }
-
-        String marker = key + "=";
-        start = script.indexOf(marker);
-        if (start < 0) return null;
-        return readShellTokenValue(script, start + marker.length());
+        return (script.contains("codex_cmd=") &&
+            script.contains("exec \"$codex_cmd\" resume ")) ||
+            (script.contains("codexctl_cmd=") && script.contains(" -- resume "));
     }
 
     @Nullable
@@ -3723,110 +3518,18 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         return result.isEmpty() ? null : result;
     }
 
-    private int findActiveCrushProcessPid(@Nullable TerminalSession terminalSession) {
+    private int findActiveCodexProcessPid(@Nullable TerminalSession terminalSession) {
         if (terminalSession == null) return -1;
-        int rootPid = terminalSession.getPid();
-        if (rootPid <= 0) return -1;
-
-        Set<Integer> visited = new HashSet<>();
-        ArrayDeque<Integer> stack = new ArrayDeque<>();
-        stack.add(rootPid);
-
-        int found = -1;
-        while (!stack.isEmpty()) {
-            Integer pidObj = stack.pollLast();
-            if (pidObj == null) continue;
-            int pid = pidObj;
-            if (pid <= 0 || !visited.add(pid)) continue;
-            if (!isProcessAlive(pid)) continue;
-
-            if (isCrushProcess(pid)) {
-                found = pid;
-            }
-
-            int[] children = readChildPids(pid);
-            for (int childPid : children) {
-                if (childPid > 0) stack.add(childPid);
-            }
-        }
-
-        return found;
+        TermuxSessionRestoreStore.CodexLease lease =
+            TermuxSessionRestoreStore.findCodexLeaseByHandle(nullToEmpty(terminalSession.mHandle));
+        return CodexProcessIdentity.findLiveCodexProcessForSession(
+            terminalSession, lease == null ? -1 : lease.processId);
     }
 
-    private int findLiveCrushProcessPidForRecord(@NonNull CrushRestoreRecord record) {
-        if (TextUtils.isEmpty(record.instanceId) && TextUtils.isEmpty(record.sessionId)) return -1;
-        if (matchesCrushRestoreRecord(record.pid, record)) return record.pid;
-
-        File procRoot = new File("/proc");
-        File[] entries = procRoot.listFiles();
-        if (entries == null || entries.length == 0) return -1;
-
-        for (File entry : entries) {
-            if (entry == null || !entry.isDirectory()) continue;
-            int pid;
-            try {
-                pid = Integer.parseInt(entry.getName());
-            } catch (NumberFormatException ignored) {
-                continue;
-            }
-            if (pid == record.pid) continue;
-            if (matchesCrushRestoreRecord(pid, record)) return pid;
-        }
-
-        return -1;
-    }
-
-    private boolean matchesCrushRestoreRecord(int pid, @NonNull CrushRestoreRecord record) {
-        if (pid <= 0 || !isProcessAlive(pid) || !isCrushProcess(pid)) return false;
-
-        String instanceId = readProcessEnvironmentValue(pid, "CRUSH_TERMUX_INSTANCE_ID");
-        if (!TextUtils.isEmpty(record.instanceId) && TextUtils.equals(record.instanceId, instanceId)) {
-            return true;
-        }
-        if (!TextUtils.isEmpty(record.instanceId) && !TextUtils.isEmpty(instanceId)) return false;
-
-        String[] argv = readCmdlineArguments(pid);
-        return argvContainsOptionValue(argv, "--session", record.sessionId);
-    }
-
-    private boolean argvContainsOptionValue(@Nullable String[] argv,
-                                            @NonNull String option,
-                                            @Nullable String expectedValue) {
-        if (argv == null || argv.length == 0 || TextUtils.isEmpty(option) || TextUtils.isEmpty(expectedValue)) {
-            return false;
-        }
-
-        String expected = expectedValue.trim();
-        for (int i = 0; i < argv.length; i++) {
-            String arg = argv[i] == null ? "" : argv[i].trim();
-            if (arg.isEmpty()) continue;
-            if (TextUtils.equals(option, arg)) {
-                return i + 1 < argv.length && TextUtils.equals(expected, nullToEmpty(argv[i + 1]).trim());
-            }
-            String prefix = option + "=";
-            if (arg.startsWith(prefix) && TextUtils.equals(expected, arg.substring(prefix.length()).trim())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean isCrushProcess(int pid) {
-        String processName = readProcessName(pid);
-        if (isCrushExecutable(processName)) return true;
-
-        String[] argv = readCmdlineArguments(pid);
-        if (argv == null || argv.length == 0) return false;
-        for (String token : argv) {
-            if (isCrushExecutable(token)) return true;
-        }
-        return false;
-    }
-
-    private boolean isCrushExecutable(@Nullable String executable) {
+    private boolean isCodexExecutable(@Nullable String executable) {
         if (TextUtils.isEmpty(executable)) return false;
         String name = new File(executable).getName().toLowerCase(Locale.ROOT);
-        return "crush".equals(name);
+        return "codex".equals(name);
     }
 
     @Nullable
@@ -3862,160 +3565,90 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @NonNull
-    private ArrayList<CrushRestoreRecord> loadCrushRestoreRecords() {
-        ArrayList<CrushRestoreRecord> all = loadAllCrushRestoreRecords();
-        ArrayList<CrushRestoreRecord> restorable = new ArrayList<>();
-        for (CrushRestoreRecord record : all) {
-            if (isRestorableCrushState(record.state)) restorable.add(record);
-        }
-        return restorable;
+    private ArrayList<CodexRestoreRecord> loadCodexRestoreRecords() {
+        return buildCodexRestoreRecordsFromTermuxRestoreState(loadTermuxRestoreState());
     }
 
     @NonNull
-    private ArrayList<CrushRestoreRecord> loadAllCrushRestoreRecords() {
-        return buildCrushRestoreRecordsFromTermuxRestoreState(loadTermuxRestoreState());
-    }
-
-    @NonNull
-    private ArrayList<CrushRestoreRecord> buildCrushRestoreRecordsFromTermuxRestoreState(
+    private ArrayList<CodexRestoreRecord> buildCodexRestoreRecordsFromTermuxRestoreState(
         @NonNull TermuxRestoreState state) {
-        ArrayList<CrushRestoreRecord> records = new ArrayList<>();
+        ArrayList<CodexRestoreRecord> records = new ArrayList<>();
         long now = System.currentTimeMillis() / 1000L;
         for (TermuxRestoreRecord record : state.records) {
-            if (!TERMUX_RESTORE_TYPE_CRUSH.equals(record.type)) continue;
-            CrushRestoreRecord crush = buildCrushRestoreRecordFromTermuxRestoreRecord(record, now);
-            if (crush != null) records.add(crush);
+            if (!TERMUX_RESTORE_TYPE_CODEX.equals(record.type)) continue;
+            CodexRestoreRecord codex = buildCodexRestoreRecordFromTermuxRestoreRecord(record, now);
+            if (codex != null) records.add(codex);
         }
-        return dedupeCrushRestoreRecords(records);
+        return dedupeCodexRestoreRecords(records);
     }
 
     @Nullable
-    private CrushRestoreRecord buildCrushRestoreRecordFromTermuxRestoreRecord(@NonNull TermuxRestoreRecord record) {
-        return buildCrushRestoreRecordFromTermuxRestoreRecord(record, System.currentTimeMillis() / 1000L);
+    private CodexRestoreRecord buildCodexRestoreRecordFromTermuxRestoreRecord(@NonNull TermuxRestoreRecord record) {
+        return buildCodexRestoreRecordFromTermuxRestoreRecord(record, System.currentTimeMillis() / 1000L);
     }
 
     @Nullable
-    private CrushRestoreRecord buildCrushRestoreRecordFromTermuxRestoreRecord(@NonNull TermuxRestoreRecord record,
+    private CodexRestoreRecord buildCodexRestoreRecordFromTermuxRestoreRecord(@NonNull TermuxRestoreRecord record,
                                                                               long fallbackUpdatedAt) {
-        String instanceId = resolveCrushInstanceIdFromRestoreRecord(record);
-        if (TextUtils.isEmpty(instanceId)) return null;
-        String sessionId = nullToEmpty(record.crushSessionId);
-        return new CrushRestoreRecord(
-            instanceId,
-            sessionId,
-            resolveCrushRestoreWorkingDirectory(record.workingDirectory),
-            nullToEmpty(record.crushDataDirectory),
+        String threadId = resolveCodexThreadIdFromRestoreRecord(record);
+        if (TextUtils.isEmpty(threadId)) return null;
+        return new CodexRestoreRecord(
+            threadId,
+            resolveCodexRestoreWorkingDirectory(record.workingDirectory),
+            nullToEmpty(record.codexRolloutPath),
             nullToEmpty(record.displayName),
-            CRUSH_RESTORE_STATE_ACTIVE,
             -1,
             normalizeRestoreOrder(record.order),
             record.updatedAt > 0 ? record.updatedAt : fallbackUpdatedAt);
     }
 
-    private boolean isRestorableCrushState(@Nullable String state) {
-        String normalized = CrushRestoreRecord.normalizeState(state);
-        return CRUSH_RESTORE_STATE_ACTIVE.equals(normalized) ||
-            CRUSH_RESTORE_STATE_DETACHED.equals(normalized);
-    }
-
     @NonNull
-    private CrushRestoreStateMachine.StoredRecordState toCrushStoredRecordState(@Nullable String state) {
-        String normalized = CrushRestoreRecord.normalizeState(state);
-        if (CRUSH_RESTORE_STATE_ACTIVE.equals(normalized)) {
-            return CrushRestoreStateMachine.StoredRecordState.ACTIVE;
-        }
-        if (CRUSH_RESTORE_STATE_DETACHED.equals(normalized)) {
-            return CrushRestoreStateMachine.StoredRecordState.DETACHED;
-        }
-        if (CRUSH_RESTORE_STATE_CLOSED.equals(normalized)) {
-            return CrushRestoreStateMachine.StoredRecordState.CLOSED;
-        }
-        return CrushRestoreStateMachine.StoredRecordState.NONE;
-    }
-
-    @Nullable
-    private ArrayList<CrushRestoreRecord> parseCrushRestoreRecords(@Nullable String raw, @NonNull String label) {
-        ArrayList<CrushRestoreRecord> records = new ArrayList<>();
-        if (TextUtils.isEmpty(raw)) return records;
-
-        try {
-            Object parsed = new org.json.JSONTokener(raw).nextValue();
-            JSONArray array = null;
-            if (parsed instanceof JSONObject) {
-                array = ((JSONObject) parsed).optJSONArray("instances");
-            } else if (parsed instanceof JSONArray) {
-                array = (JSONArray) parsed;
-            }
-
-            if (array == null) return records;
-            for (int i = 0; i < array.length(); i++) {
-                JSONObject item = array.optJSONObject(i);
-                if (item == null) continue;
-                CrushRestoreRecord record = CrushRestoreRecord.fromJson(item);
-                if (record == null) continue;
-                records.add(normalizeCrushRestoreRecord(record));
-            }
-        } catch (Exception e) {
-            Logger.logWarn(LOG_TAG, "Failed to parse Crush restore " + label + ": " + e.getMessage());
-            return null;
-        }
-
-        return dedupeCrushRestoreRecords(records);
-    }
-
-    private void saveCrushRestoreRecords(@NonNull ArrayList<CrushRestoreRecord> records) {
-        // Crush restore is now projected from Android's Termux restore snapshot.
-    }
-
-    @NonNull
-    private CrushRestoreRecord normalizeCrushRestoreRecord(@NonNull CrushRestoreRecord record) {
-        String instanceId = record.instanceId.trim();
-        if (instanceId.isEmpty()) instanceId = UUID.randomUUID().toString();
-        return new CrushRestoreRecord(
-            instanceId,
-            record.sessionId.trim(),
+    private CodexRestoreRecord normalizeCodexRestoreRecord(@NonNull CodexRestoreRecord record) {
+        String threadId = record.threadId.trim();
+        if (threadId.isEmpty()) threadId = UUID.randomUUID().toString();
+        return new CodexRestoreRecord(
+            threadId,
             record.workingDirectory.trim(),
-            record.dataDirectory.trim(),
+            record.rolloutPath.trim(),
             record.title.trim(),
-            CrushRestoreRecord.normalizeState(record.state),
             record.pid,
             record.order,
             record.updatedAt);
     }
 
     @NonNull
-    private ArrayList<CrushRestoreRecord> dedupeCrushRestoreRecords(
-        @NonNull ArrayList<CrushRestoreRecord> records) {
-        HashMap<String, CrushRestoreRecord> byInstance = new HashMap<>();
-        for (CrushRestoreRecord raw : records) {
-            CrushRestoreRecord record = normalizeCrushRestoreRecord(raw);
-            CrushRestoreRecord existing = byInstance.get(record.instanceId);
+    private ArrayList<CodexRestoreRecord> dedupeCodexRestoreRecords(
+        @NonNull ArrayList<CodexRestoreRecord> records) {
+        HashMap<String, CodexRestoreRecord> byThread = new HashMap<>();
+        for (CodexRestoreRecord raw : records) {
+            CodexRestoreRecord record = normalizeCodexRestoreRecord(raw);
+            CodexRestoreRecord existing = byThread.get(record.threadId);
             if (existing == null || record.updatedAt >= existing.updatedAt) {
-                byInstance.put(record.instanceId, record);
+                byThread.put(record.threadId, record);
             }
         }
 
-        ArrayList<CrushRestoreRecord> result = new ArrayList<>(byInstance.values());
+        ArrayList<CodexRestoreRecord> result = new ArrayList<>(byThread.values());
         result.sort((a, b) -> {
             int orderCompare = Integer.compare(a.order, b.order);
             if (orderCompare != 0) return orderCompare;
             int updatedCompare = Long.compare(a.updatedAt, b.updatedAt);
             if (updatedCompare != 0) return updatedCompare;
-            return a.instanceId.compareTo(b.instanceId);
+            return a.threadId.compareTo(b.threadId);
         });
         return result;
     }
 
     @NonNull
-    private String buildCrushRestoreDisplayName(@NonNull CrushRestoreRecord record) {
+    private String buildCodexRestoreDisplayName(@NonNull CodexRestoreRecord record) {
         String title = record.title.trim();
         if (!TextUtils.isEmpty(title)) return title;
         int index = record.order == Integer.MAX_VALUE ? 0 : record.order;
-        return CRUSH_RESTORE_DEFAULT_DISPLAY_NAME + " " + (Math.max(0, index) + 1);
+        return CODEX_RESTORE_DEFAULT_DISPLAY_NAME + " " + (Math.max(0, index) + 1);
     }
 
     @NonNull
-    private String resolveCrushRestoreWorkingDirectory(@Nullable String workingDirectory) {
+    private String resolveCodexRestoreWorkingDirectory(@Nullable String workingDirectory) {
         String value = workingDirectory == null ? "" : workingDirectory.trim();
         if (TextUtils.isEmpty(value) || !new File(value).isDirectory()) {
             value = mActivity.getProperties().getDefaultWorkingDirectory();
@@ -4024,85 +3657,6 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             value = TermuxConstants.TERMUX_HOME_DIR_PATH;
         }
         return value;
-    }
-
-    @Nullable
-    private SharedPreferences getCrushRestorePrefs() {
-        Context c = mActivity.getApplicationContext();
-        return c.getSharedPreferences(CRUSH_RESTORE_PREFS, Context.MODE_PRIVATE);
-    }
-
-    @Nullable
-    private String readFileText(@NonNull File file) {
-        if (!file.exists()) return null;
-        try (InputStream in = new FileInputStream(file);
-             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[1024];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                if (read > 0) out.write(buffer, 0, read);
-            }
-            return out.toString(StandardCharsets.UTF_8.name());
-        } catch (Exception ignored) {
-            return null;
-        }
-    }
-
-    @Nullable
-    private String readFileTextWithBackup(@NonNull File file) {
-        String raw = readFileText(file);
-        if (!TextUtils.isEmpty(raw)) return raw;
-        return readFileText(new File(file.getAbsolutePath() + ".bak"));
-    }
-
-    private void writeSyncedFile(@NonNull File target, @NonNull byte[] bytes) throws Exception {
-        try (FileOutputStream out = new FileOutputStream(target)) {
-            out.write(bytes);
-            out.flush();
-            try {
-                out.getFD().sync();
-            } catch (Exception ignored) {
-            }
-        }
-    }
-
-    private void writeBackupAtomically(@NonNull File backup, @NonNull byte[] bytes) {
-        File tmp = new File(backup.getAbsolutePath() + ".tmp");
-        try {
-            writeSyncedFile(tmp, bytes);
-            if (!tmp.renameTo(backup)) {
-                writeSyncedFile(backup, bytes);
-                tmp.delete();
-            }
-        } catch (Exception ignored) {
-            tmp.delete();
-        }
-    }
-
-    private void writeFileAtomically(@NonNull File target, @NonNull String content) {
-        File parent = target.getParentFile();
-        if (parent != null && !parent.exists()) parent.mkdirs();
-        File tmp = new File(target.getAbsolutePath() + ".tmp");
-        File backup = new File(target.getAbsolutePath() + ".bak");
-        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
-        try {
-            String current = target.exists() ? readFileText(target) : null;
-            if (TextUtils.equals(current, content)) return;
-            if (target.exists()) {
-                if (!TextUtils.isEmpty(current)) {
-                    writeBackupAtomically(backup, current.getBytes(StandardCharsets.UTF_8));
-                }
-            }
-            writeSyncedFile(tmp, bytes);
-            if (!tmp.renameTo(target)) {
-                writeSyncedFile(target, bytes);
-                tmp.delete();
-            }
-            writeBackupAtomically(backup, bytes);
-        } catch (Exception e) {
-            tmp.delete();
-            Logger.logWarn(LOG_TAG, "Failed to atomically write " + target + ": " + e.getMessage());
-        }
     }
 
     public void onTerminalTabLongPress(int index) {
@@ -4163,21 +3717,26 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     public void forgetSessionRestoreForUserAction(@Nullable TerminalSession terminalSession) {
-        applyCrushRestoreTabCloseDecision(terminalSession, true);
+        applyCodexRestoreTabCloseDecision(terminalSession);
         disableSshPersistenceForSession(terminalSession);
         forgetSshBootstrapCommand(terminalSession);
     }
 
-    public void destroySessionRestoreForUserAction(@Nullable TerminalSession terminalSession) {
-        applyCrushRestoreTabCloseDecision(terminalSession, true);
-        disableSshPersistenceForSession(terminalSession);
-        forgetSshBootstrapCommand(terminalSession);
-    }
-
-    private void applyCrushRestoreTabCloseDecision(@Nullable TerminalSession terminalSession,
-                                                   boolean destroyRequested) {
+    private void applyCodexRestoreTabCloseDecision(@Nullable TerminalSession terminalSession) {
+        CodexRestoreRecord record = findCodexRestoreRecordForSession(terminalSession);
+        String threadId = record == null ? "" : record.threadId;
+        String handle = terminalSession == null ? "" : nullToEmpty(terminalSession.mHandle);
+        String detail = "explicit_tab_close";
+        if (record != null || TermuxSessionRestoreStore.findCodexLeaseByHandle(handle) != null) {
+            TermuxService service = mActivity.getTermuxService();
+            if (service != null) {
+                service.getCodexSessionRecoveryController().revokeLease(threadId, handle, detail);
+            } else {
+                TermuxSessionRestoreStore.revokeCodexLease(threadId, handle, detail);
+            }
+        }
         forgetTermuxRestoreForSession(terminalSession);
-        forgetNativeCrushRestoreForSession(terminalSession);
+        forgetNativeCodexRestoreForSession(terminalSession);
     }
 
     private void closeTerminalSessionFromTabAction(@Nullable TerminalSession terminalSession) {
@@ -5067,10 +4626,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (service == null || !service.isTermuxSessionsEmpty()) return false;
 
         TermuxRestoreState state = pruneDisposableGeneratedShellRestoreState(loadTermuxRestoreState());
-        HashMap<String, CrushRestoreRecord> crushByInstance = new HashMap<>();
-        for (CrushRestoreRecord crushRecord : buildCrushRestoreRecordsFromTermuxRestoreState(state)) {
-            if (!TextUtils.isEmpty(crushRecord.instanceId)) {
-                crushByInstance.put(crushRecord.instanceId, crushRecord);
+        HashMap<String, CodexRestoreRecord> codexByThread = new HashMap<>();
+        for (CodexRestoreRecord codexRecord : buildCodexRestoreRecordsFromTermuxRestoreState(state)) {
+            if (!TextUtils.isEmpty(codexRecord.threadId)) {
+                codexByThread.put(codexRecord.threadId, codexRecord);
             }
         }
 
@@ -5091,7 +4650,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         try {
             for (TermuxRestoreRecord record : records) {
                 if (service.getTermuxSessionsSize() >= MAX_SESSIONS) break;
-                TermuxSession created = createTermuxRestoreSession(service, record, crushByInstance, sshRecordsById);
+                TermuxSession created = createTermuxRestoreSession(service, record, codexByThread, sshRecordsById);
                 if (created == null || created.getTerminalSession() == null) continue;
 
                 TerminalSession session = created.getTerminalSession();
@@ -5134,14 +4693,14 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         String droppedForegroundHandle = "";
         ArrayList<TermuxRestoreRecord> records = new ArrayList<>();
         HashSet<String> restoreIdentities = new HashSet<>();
-        ArrayList<CrushRestoreRecord> crushRecords = loadCrushRestoreRecords();
+        ArrayList<CodexRestoreRecord> codexRecords = loadCodexRestoreRecords();
         ArrayList<SshPersistenceRecord> sshRecords = loadSshPersistenceRecords();
         long now = System.currentTimeMillis() / 1000L;
 
         ArrayList<TermuxSession> sessions = new ArrayList<>(service.getTermuxSessions());
         for (int i = 0; i < sessions.size() && records.size() < MAX_SESSIONS; i++) {
             TermuxSession termuxSession = sessions.get(i);
-            TermuxRestoreRecord record = buildTermuxRestoreRecord(termuxSession, i, now, crushRecords, sshRecords, true);
+            TermuxRestoreRecord record = buildTermuxRestoreRecord(termuxSession, i, now, codexRecords, sshRecords);
             TerminalSession terminalSession = termuxSession.getTerminalSession();
             if (record == null) {
                 if (current != null && terminalSession == current) {
@@ -5158,13 +4717,19 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
         sortTermuxRestoreRecordsForMaterialization(records);
 
-        if (records.isEmpty()) return;
+        if (records.isEmpty()) {
+            persistEmptyTermuxRestoreState();
+            return;
+        }
         PrunedTermuxRestoreRecords pruned = pruneDisposableGeneratedShellRestoreRecords(records, foregroundRecord);
         if (pruned.removedForeground) {
             foregroundRecord = pruned.foregroundReplacement;
             foregroundOrder = pruned.removedForegroundOrder;
         }
-        if (records.isEmpty()) return;
+        if (records.isEmpty()) {
+            persistEmptyTermuxRestoreState();
+            return;
+        }
         if (foregroundRecord == null && droppedForegroundOrder != Integer.MAX_VALUE) {
             foregroundRecord = findForegroundReplacementByExactOrder(records, droppedForegroundOrder);
             foregroundOrder = droppedForegroundOrder;
@@ -5182,197 +4747,11 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         saveTermuxRestoreState(new TermuxRestoreState(records, foregroundKey, foregroundHandle, foregroundOrder), signature);
     }
 
-    private void reconcileStaleActiveCrushAuthorityAfterSnapshot(@NonNull ArrayList<TermuxRestoreRecord> records,
-                                                                 @NonNull ArrayList<CrushRestoreRecord> crushRecords) {
-        HashSet<String> attachedInstances = new HashSet<>();
-        for (TermuxRestoreRecord record : records) {
-            if (!TERMUX_RESTORE_TYPE_CRUSH.equals(record.type)) continue;
-            String instanceId = resolveCrushInstanceIdFromRestoreRecord(record);
-            if (!TextUtils.isEmpty(instanceId)) attachedInstances.add(instanceId);
-        }
-
-        for (int i = 0; i < crushRecords.size(); i++) {
-            CrushRestoreRecord crush = crushRecords.get(i);
-            if (!CRUSH_RESTORE_STATE_ACTIVE.equals(CrushRestoreRecord.normalizeState(crush.state))) continue;
-            if (TextUtils.isEmpty(crush.instanceId) || attachedInstances.contains(crush.instanceId)) continue;
-
-            int livePid = findLiveCrushProcessPidForRecord(crush);
-            if (livePid > 0) {
-                if (crush.pid != livePid) {
-                    CrushRestoreRecord refreshed = copyCrushRestoreRecordWithPid(crush, livePid);
-                    crushRecords.set(i, refreshed);
-                    upsertCrushRestoreRecord(refreshed);
-                }
-                continue;
-            }
-
-            CrushRestoreStateMachine.SnapshotAction action = CrushRestoreStateMachine.resolveSnapshot(
-                new CrushRestoreStateMachine.SnapshotInput(
-                    CrushRestoreStateMachine.Authority.CRUSH_STATE_FILE,
-                    false,
-                    false,
-                    true,
-                    toCrushStoredRecordState(crush.state)));
-            if (action != CrushRestoreStateMachine.SnapshotAction.DETACH_STALE_CRUSH_RECORD) continue;
-
-            CrushRestoreRecord detached = copyCrushRestoreRecordWithState(crush, CRUSH_RESTORE_STATE_DETACHED);
-            crushRecords.set(i, detached);
-            upsertCrushRestoreRecord(detached);
-        }
-    }
-
-    private void materializeDetachedCrushRecords(@NonNull ArrayList<TermuxRestoreRecord> records,
-                                                 @NonNull ArrayList<CrushRestoreRecord> crushRecords,
-                                                 long now) {
-        HashSet<String> projectedInstances = new HashSet<>();
-        for (TermuxRestoreRecord record : records) {
-            if (!TextUtils.isEmpty(record.crushInstanceId)) {
-                projectedInstances.add(record.crushInstanceId);
-            }
-        }
-
-        for (CrushRestoreRecord crush : crushRecords) {
-            if (records.size() >= MAX_SESSIONS) return;
-            if (TextUtils.isEmpty(crush.instanceId) || projectedInstances.contains(crush.instanceId)) continue;
-            CrushRestoreStateMachine.SnapshotAction action = CrushRestoreStateMachine.resolveSnapshot(
-                new CrushRestoreStateMachine.SnapshotInput(
-                    CrushRestoreStateMachine.Authority.CRUSH_STATE_FILE,
-                    false,
-                    false,
-                    true,
-                    toCrushStoredRecordState(crush.state)));
-            if (action != CrushRestoreStateMachine.SnapshotAction.MATERIALIZE_DETACHED_CRUSH_RECORD) continue;
-            records.add(buildTermuxRestoreRecord(crush, records.size(), now));
-            projectedInstances.add(crush.instanceId);
-        }
-    }
-
-    @NonNull
-    private TermuxRestoreRecord buildTermuxRestoreRecord(@NonNull CrushRestoreRecord crush, int order, long now) {
-        return buildTermuxRestoreRecord(crush, order, now, "");
-    }
-
-    @NonNull
-    private TermuxRestoreRecord buildTermuxRestoreRecord(@NonNull CrushRestoreRecord crush, int order, long now,
-                                                         @Nullable String handle) {
-        int safeOrder = crush.order == Integer.MAX_VALUE ? order : crush.order;
-        String key = "crush:" + crush.instanceId;
-        String displayName = buildCrushRestoreDisplayName(crush);
-        return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_CRUSH, nullToEmpty(handle), displayName,
-            resolveCrushRestoreWorkingDirectory(crush.workingDirectory), "", "", null,
-            crush.instanceId, crush.sessionId, crush.dataDirectory, null, null, null, safeOrder, now);
-    }
-
-    @NonNull
-    private TermuxRestoreState reconcileTermuxRestoreStateWithCrushAuthority(
-        @NonNull TermuxRestoreState state,
-        @NonNull HashMap<String, CrushRestoreRecord> allCrushByInstance) {
-        ArrayList<TermuxRestoreRecord> reconciled = new ArrayList<>();
-        HashSet<String> projectedCrushInstances = new HashSet<>();
-        HashSet<String> restoreIdentities = new HashSet<>();
-        boolean droppedForeground = false;
-        int droppedForegroundOrder = Integer.MAX_VALUE;
-        TermuxRestoreRecord foregroundReplacement = null;
-
-        for (TermuxRestoreRecord record : state.records) {
-            if (reconciled.size() >= MAX_SESSIONS) break;
-
-            if (!TERMUX_RESTORE_TYPE_CRUSH.equals(record.type)) {
-                if (shouldDropStaleCrushShellRestoreRecord(record)) {
-                    if (isForegroundRestoreRecord(state, record)) {
-                        droppedForeground = true;
-                        droppedForegroundOrder = record.order;
-                    }
-                    continue;
-                }
-                if (!appendUniqueTermuxRestoreRecord(reconciled, record, restoreIdentities) &&
-                    isForegroundRestoreRecord(state, record)) {
-                    droppedForeground = true;
-                    droppedForegroundOrder = record.order;
-                    foregroundReplacement = findEquivalentTermuxRestoreRecord(reconciled, record);
-                }
-                continue;
-            }
-
-            String instanceId = resolveCrushInstanceIdFromRestoreRecord(record);
-            if (TextUtils.isEmpty(instanceId)) continue;
-            if (projectedCrushInstances.contains(instanceId)) {
-                if (isForegroundRestoreRecord(state, record)) {
-                    droppedForeground = true;
-                    droppedForegroundOrder = record.order;
-                    foregroundReplacement = findEquivalentTermuxRestoreRecord(reconciled, record);
-                }
-                continue;
-            }
-
-            CrushRestoreRecord authorityRecord = allCrushByInstance.get(instanceId);
-            if (authorityRecord == null || !isRestorableCrushState(authorityRecord.state)) continue;
-            CrushRestoreStateMachine.RestoreAction restoreAction = CrushRestoreStateMachine.resolveRestore(
-                new CrushRestoreStateMachine.RestoreInput(
-                    CrushRestoreStateMachine.Authority.CRUSH_STATE_FILE,
-                    true,
-                    !TextUtils.isEmpty(authorityRecord.instanceId)));
-            if (restoreAction == CrushRestoreStateMachine.RestoreAction.SKIP) continue;
-
-            TermuxRestoreRecord projected = buildTermuxRestoreRecord(authorityRecord, record.order,
-                Math.max(record.updatedAt, authorityRecord.updatedAt), record.handle);
-            if (appendUniqueTermuxRestoreRecord(reconciled, projected, restoreIdentities)) {
-                projectedCrushInstances.add(authorityRecord.instanceId);
-            } else if (isForegroundRestoreRecord(state, record)) {
-                droppedForeground = true;
-                droppedForegroundOrder = record.order;
-                foregroundReplacement = findEquivalentTermuxRestoreRecord(reconciled, projected);
-            }
-        }
-
-        ArrayList<CrushRestoreRecord> authorityRecords = new ArrayList<>(allCrushByInstance.values());
-        authorityRecords.sort((a, b) -> {
-            int orderCompare = Integer.compare(a.order, b.order);
-            if (orderCompare != 0) return orderCompare;
-            int updatedCompare = Long.compare(a.updatedAt, b.updatedAt);
-            if (updatedCompare != 0) return updatedCompare;
-            return a.instanceId.compareTo(b.instanceId);
-        });
-
-        for (CrushRestoreRecord authorityRecord : authorityRecords) {
-            if (reconciled.size() >= MAX_SESSIONS) break;
-            if (TextUtils.isEmpty(authorityRecord.instanceId)) continue;
-            if (projectedCrushInstances.contains(authorityRecord.instanceId)) continue;
-            if (!isRestorableCrushState(authorityRecord.state)) continue;
-            CrushRestoreStateMachine.RestoreAction restoreAction = CrushRestoreStateMachine.resolveRestore(
-                new CrushRestoreStateMachine.RestoreInput(
-                    CrushRestoreStateMachine.Authority.CRUSH_STATE_FILE,
-                    true,
-                    !TextUtils.isEmpty(authorityRecord.instanceId)));
-            if (restoreAction == CrushRestoreStateMachine.RestoreAction.SKIP) continue;
-
-            TermuxRestoreRecord projected = buildTermuxRestoreRecord(authorityRecord,
-                reconciled.size(), authorityRecord.updatedAt);
-            if (appendUniqueTermuxRestoreRecord(reconciled, projected, restoreIdentities)) {
-                projectedCrushInstances.add(authorityRecord.instanceId);
-            }
-        }
-
-        sortTermuxRestoreRecordsForMaterialization(reconciled);
-
-        HashSet<String> keys = new HashSet<>();
-        HashSet<String> handles = new HashSet<>();
-        collectRestoreForegroundCandidates(reconciled, keys, handles);
-        String foregroundKey = keys.contains(state.foregroundKey) ? state.foregroundKey : "";
-        String foregroundHandle = handles.contains(state.foregroundHandle) ? state.foregroundHandle : "";
-        int foregroundOrder = state.foregroundOrder;
-        if (TextUtils.isEmpty(foregroundKey) && TextUtils.isEmpty(foregroundHandle) && droppedForeground) {
-            TermuxRestoreRecord replacement = foregroundReplacement != null ? foregroundReplacement :
-                findForegroundReplacementByExactOrder(reconciled, droppedForegroundOrder);
-            if (replacement != null) {
-                foregroundKey = replacement.key;
-                foregroundHandle = replacement.handle;
-                foregroundOrder = replacement.order;
-            } else {
-                foregroundOrder = droppedForegroundOrder;
-            }
-        }
-        return new TermuxRestoreState(reconciled, foregroundKey, foregroundHandle, foregroundOrder);
+    private void persistEmptyTermuxRestoreState() {
+        ArrayList<TermuxRestoreRecord> records = new ArrayList<>();
+        String signature = buildTermuxRestoreStateSignature(records, "", "", Integer.MAX_VALUE);
+        if (TextUtils.equals(signature, mLastTermuxRestoreStateSignature)) return;
+        saveTermuxRestoreState(new TermuxRestoreState(records, "", "", Integer.MAX_VALUE), signature);
     }
 
     private boolean appendUniqueTermuxRestoreRecord(@NonNull ArrayList<TermuxRestoreRecord> records,
@@ -5397,8 +4776,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @NonNull
     private String buildTermuxRestoreRecordIdentity(@NonNull TermuxRestoreRecord record) {
-        String instanceId = resolveCrushInstanceIdFromRestoreRecord(record);
-        if (!TextUtils.isEmpty(instanceId)) return TERMUX_RESTORE_TYPE_CRUSH + ":" + instanceId;
+        String threadId = resolveCodexThreadIdFromRestoreRecord(record);
+        if (!TextUtils.isEmpty(threadId)) return TERMUX_RESTORE_TYPE_CODEX + ":" + threadId;
         if (TERMUX_RESTORE_TYPE_SSH_TMUX.equals(record.type) && !TextUtils.isEmpty(record.sshPersistRecordId)) {
             return TERMUX_RESTORE_TYPE_SSH_TMUX + ":" + record.sshPersistRecordId;
         }
@@ -5432,27 +4811,22 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     private boolean isForegroundTermuxRestoreRecord(@NonNull TermuxRestoreState state,
                                                     @NonNull TermuxRestoreRecord record,
-                                                    @Nullable String foregroundInstanceId,
+                                                    @Nullable String foregroundThreadId,
                                                     @Nullable String foregroundSessionId) {
         if (!TextUtils.isEmpty(state.foregroundKey) && TextUtils.equals(state.foregroundKey, record.key)) {
             return true;
         }
 
-        String instanceId = resolveCrushInstanceIdFromRestoreRecord(record);
-        if (!TextUtils.isEmpty(state.foregroundKey) && state.foregroundKey.startsWith("crush:")) {
-            String foregroundKeyInstanceId = state.foregroundKey.substring("crush:".length()).trim();
-            if (!TextUtils.isEmpty(instanceId) && TextUtils.equals(foregroundKeyInstanceId, instanceId)) {
+        String threadId = resolveCodexThreadIdFromRestoreRecord(record);
+        if (!TextUtils.isEmpty(state.foregroundKey) && state.foregroundKey.startsWith("codex:")) {
+            String foregroundKeyThreadId = state.foregroundKey.substring("codex:".length()).trim();
+            if (!TextUtils.isEmpty(threadId) && TextUtils.equals(foregroundKeyThreadId, threadId)) {
                 return true;
             }
         }
 
-        if (!TextUtils.isEmpty(foregroundInstanceId) && !TextUtils.isEmpty(instanceId) &&
-            TextUtils.equals(foregroundInstanceId, instanceId)) {
-            return true;
-        }
-
-        if (!TextUtils.isEmpty(foregroundSessionId) && !TextUtils.isEmpty(record.crushSessionId) &&
-            TextUtils.equals(foregroundSessionId, record.crushSessionId)) {
+        if (!TextUtils.isEmpty(foregroundThreadId) && !TextUtils.isEmpty(threadId) &&
+            TextUtils.equals(foregroundThreadId, threadId)) {
             return true;
         }
 
@@ -5560,16 +4934,15 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     private boolean shouldDropDisposableGeneratedShellRestoreRecord(@NonNull TermuxRestoreRecord record,
                                                                     int maxManagedOrder) {
-        return CrushRestoreStateMachine.shouldDropDisposableGeneratedShellProjection(
-            new CrushRestoreStateMachine.DisposableShellProjectionInput(
+        return CodexRestoreStateMachine.shouldDropDisposableGeneratedShellProjection(
+            new CodexRestoreStateMachine.DisposableShellProjectionInput(
                 record.type,
                 record.displayName,
                 record.shellName,
                 record.executable,
                 record.arguments,
-                !TextUtils.isEmpty(record.crushInstanceId) ||
-                    !TextUtils.isEmpty(record.crushSessionId) ||
-                    !TextUtils.isEmpty(record.crushDataDirectory),
+                !TextUtils.isEmpty(record.codexThreadId) ||
+                    !TextUtils.isEmpty(record.codexRolloutPath),
                 !TextUtils.isEmpty(record.sshPersistRecordId) ||
                     !TextUtils.isEmpty(record.sshCommand),
                 !TextUtils.isEmpty(record.tmuxSession),
@@ -5580,9 +4953,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     private boolean isManagedRestoreRecord(@NonNull TermuxRestoreRecord record) {
         return !TERMUX_RESTORE_TYPE_SHELL.equals(record.type) ||
-            !TextUtils.isEmpty(record.crushInstanceId) ||
-            !TextUtils.isEmpty(record.crushSessionId) ||
-            !TextUtils.isEmpty(record.crushDataDirectory) ||
+            !TextUtils.isEmpty(record.codexThreadId) ||
+            !TextUtils.isEmpty(record.codexRolloutPath) ||
             !TextUtils.isEmpty(record.sshPersistRecordId) ||
             !TextUtils.isEmpty(record.sshCommand) ||
             !TextUtils.isEmpty(record.tmuxSession);
@@ -5644,28 +5016,22 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @Nullable
-    private String resolveCrushInstanceIdFromRestoreRecord(@NonNull TermuxRestoreRecord record) {
-        if (!TextUtils.isEmpty(record.crushInstanceId)) return record.crushInstanceId;
-        if (!TextUtils.isEmpty(record.key) && record.key.startsWith("crush:")) {
-            String value = record.key.substring("crush:".length()).trim();
-            if (!value.isEmpty()) return value;
+    private String resolveCodexThreadIdFromRestoreRecord(@NonNull TermuxRestoreRecord record) {
+        if (!TextUtils.isEmpty(record.codexThreadId)) {
+            return normalizeCodexThreadId(record.codexThreadId);
+        }
+        if (!TextUtils.isEmpty(record.key) && record.key.startsWith("codex:")) {
+            String value = record.key.substring("codex:".length()).trim();
+            if (!value.isEmpty()) return normalizeCodexThreadId(value);
         }
         String script = extractShellScriptFromExecutionArgs(record.arguments);
-        return extractShellAssignmentValue(script, "CRUSH_TERMUX_INSTANCE_ID");
+        return normalizeCodexThreadId(extractShellOptionValue(script, "resume"));
     }
 
     @Nullable
     private TermuxRestoreRecord buildTermuxRestoreRecord(@Nullable TermuxSession termuxSession, int order, long now,
-                                                         @NonNull ArrayList<CrushRestoreRecord> crushRecords,
+                                                         @NonNull ArrayList<CodexRestoreRecord> codexRecords,
                                                          @NonNull ArrayList<SshPersistenceRecord> sshRecords) {
-        return buildTermuxRestoreRecord(termuxSession, order, now, crushRecords, sshRecords, false);
-    }
-
-    @Nullable
-    private TermuxRestoreRecord buildTermuxRestoreRecord(@Nullable TermuxSession termuxSession, int order, long now,
-                                                         @NonNull ArrayList<CrushRestoreRecord> crushRecords,
-                                                         @NonNull ArrayList<SshPersistenceRecord> sshRecords,
-                                                         boolean writeCrushAuthority) {
         if (termuxSession == null || termuxSession.getTerminalSession() == null) return null;
         TerminalSession terminalSession = termuxSession.getTerminalSession();
         if (!terminalSession.isRunning()) return null;
@@ -5680,32 +5046,28 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         String executable = command == null || command.executable == null ? "" : command.executable.trim();
         String[] args = command == null || command.arguments == null ? null : command.arguments.clone();
 
-        CrushRestoreRecord inferredCrush = inferCrushRestoreRecordFromExecutionCommand(terminalSession);
-        boolean liveCrushProcess = findActiveCrushProcessPid(terminalSession) > 0;
-        if (isNativeCrushRestoreSuppressed(terminalSession)) {
-            if (liveCrushProcess || inferredCrush != null || findPersistedCrushRestoreRecordForSession(terminalSession) != null) {
+        CodexRestoreRecord inferredCodex = inferCodexRestoreRecordFromExecutionCommand(terminalSession);
+        boolean liveCodexProcess = findActiveCodexProcessPid(terminalSession) > 0;
+        if (isNativeCodexRestoreSuppressed(terminalSession)) {
+            if (liveCodexProcess || inferredCodex != null || findPersistedCodexRestoreRecordForSession(terminalSession) != null) {
                 return null;
             }
-            clearNativeCrushRestoreSuppression(terminalSession);
+            clearNativeCodexRestoreSuppression(terminalSession);
         }
 
-        CrushRestoreRecord crush = findCrushRestoreRecordForSession(terminalSession, crushRecords);
-        boolean pendingCrushLauncher = !liveCrushProcess &&
-            isCrushRestoreLauncherProcess(terminalSession, inferredCrush);
-        if (crush == null && inferredCrush != null) {
-            CrushRestoreRecord existing = findCrushRestoreRecordByInstance(crushRecords, inferredCrush.instanceId);
-            if (existing != null && isRestorableCrushState(existing.state)) {
-                crush = mergeCrushRestoreRecords(existing, inferredCrush);
-            } else if (liveCrushProcess || pendingCrushLauncher || writeCrushAuthority) {
-                crush = inferredCrush;
+        CodexRestoreRecord codex = findCodexRestoreRecordForSession(terminalSession, codexRecords);
+        if (codex == null && inferredCodex != null) {
+            CodexRestoreRecord existing = findCodexRestoreRecordByThread(codexRecords, inferredCodex.threadId);
+            if (existing != null) {
+                codex = mergeCodexRestoreRecords(existing, inferredCodex);
             }
         }
-        if (crush == null && inferredCrush != null && !pendingCrushLauncher && !writeCrushAuthority) return null;
-        if (crush != null) {
-            String key = "crush:" + crush.instanceId;
-            return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_CRUSH, handle, displayName,
-                resolveCrushRestoreWorkingDirectory(crush.workingDirectory), shellName, executable, args,
-                crush.instanceId, crush.sessionId, crush.dataDirectory, null, null, null, order, now);
+        if (codex == null && inferredCodex != null) return null;
+        if (codex != null) {
+            String key = "codex:" + codex.threadId;
+            return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_CODEX, handle, displayName,
+                resolveCodexRestoreWorkingDirectory(codex.workingDirectory), shellName, executable, args,
+                codex.threadId, codex.rolloutPath, null, null, null, order, now);
         }
 
         SshPersistenceRecord sshRecord = findSshPersistenceRecordForSession(terminalSession, sshRecords);
@@ -5714,7 +5076,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             String key = "ssh-tmux:" + normalized.id;
             return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_SSH_TMUX, handle,
                 normalizeDisplayName(normalized.displayName, normalized.tmuxSession), workingDirectory,
-                normalized.shellName, executable, args, null, null, null, normalized.id,
+                normalized.shellName, executable, args, null, null, normalized.id,
                 normalized.sshCommand, normalized.tmuxSession, order, now);
         }
 
@@ -5723,7 +5085,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             String normalizedTmux = normalizeTmuxSessionName(localTmuxSession);
             String key = "local-tmux:" + normalizedTmux + ":" + order;
             return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_LOCAL_TMUX, handle, displayName,
-                workingDirectory, shellName, executable, args, null, null, null, null, null,
+                workingDirectory, shellName, executable, args, null, null, null, null,
                 normalizedTmux, order, now);
         }
 
@@ -5731,7 +5093,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (!TextUtils.isEmpty(sshCommand)) {
             String key = "ssh:" + Integer.toHexString(sshCommand.hashCode()) + ":" + order;
             return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_SSH, handle, displayName,
-                workingDirectory, shellName, executable, args, null, null, null, null,
+                workingDirectory, shellName, executable, args, null, null, null,
                 sanitizeSshBootstrapCommand(sshCommand), null, order, now);
         }
 
@@ -5740,38 +5102,38 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             String normalizedDistro = TextUtils.isEmpty(distro) ? getProotDefaultDistro() : distro;
             String key = "proot:" + normalizedDistro + ":" + order;
             return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_PROOT, handle, displayName,
-                workingDirectory, shellName, executable, args, null, null, null, null, null,
+                workingDirectory, shellName, executable, args, null, null, null, null,
                 normalizedDistro, order, now);
         }
 
-        if (shouldDropStaleCrushShellRestoreProjection(displayName, shellName, executable, args)) {
+        if (shouldDropStaleCodexShellRestoreProjection(displayName, shellName, executable, args)) {
             return null;
         }
 
         String key = "shell:" + order + ":" + handle;
         return new TermuxRestoreRecord(key, TERMUX_RESTORE_TYPE_SHELL, handle, displayName,
-            workingDirectory, shellName, executable, args, null, null, null, null, null, null,
+            workingDirectory, shellName, executable, args, null, null, null, null, null,
             order, now);
     }
 
     @Nullable
     private TermuxSession createTermuxRestoreSession(@NonNull TermuxService service,
                                                      @NonNull TermuxRestoreRecord record,
-                                                     @NonNull HashMap<String, CrushRestoreRecord> crushByInstance,
+                                                     @NonNull HashMap<String, CodexRestoreRecord> codexByThread,
                                                      @NonNull HashMap<String, SshPersistenceRecord> sshRecordsById) {
         String type = record.type;
-        if (TERMUX_RESTORE_TYPE_CRUSH.equals(type)) {
-            CrushRestoreRecord crushRecord = null;
-            String instanceId = resolveCrushInstanceIdFromRestoreRecord(record);
-            if (!TextUtils.isEmpty(instanceId)) {
-                crushRecord = crushByInstance.get(instanceId);
+        if (TERMUX_RESTORE_TYPE_CODEX.equals(type)) {
+            CodexRestoreRecord codexRecord = null;
+            String threadId = resolveCodexThreadIdFromRestoreRecord(record);
+            if (!TextUtils.isEmpty(threadId)) {
+                codexRecord = codexByThread.get(threadId);
             }
-            if (crushRecord == null) crushRecord = buildCrushRestoreRecordFromTermuxRestoreRecord(record);
-            if (crushRecord == null) return null;
+            if (codexRecord == null) codexRecord = buildCodexRestoreRecordFromTermuxRestoreRecord(record);
+            if (codexRecord == null) return null;
             if (record.order != Integer.MAX_VALUE) {
-                crushRecord = copyCrushRestoreRecordWithOrder(crushRecord, record.order);
+                codexRecord = copyCodexRestoreRecordWithOrder(codexRecord, record.order);
             }
-            return createCrushRestoreSession(service, crushRecord);
+            return createCodexRestoreSession(service, codexRecord);
         }
 
         if (TERMUX_RESTORE_TYPE_SSH_TMUX.equals(type)) {
@@ -5811,33 +5173,32 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             return createProotRestoreSession(service, record);
         }
 
-        if (shouldDropStaleCrushShellRestoreRecord(record)) return null;
+        if (shouldDropStaleCodexShellRestoreRecord(record)) return null;
         return createShellRestoreSession(service, record);
     }
 
-    private boolean shouldDropStaleCrushShellRestoreRecord(@NonNull TermuxRestoreRecord record) {
+    private boolean shouldDropStaleCodexShellRestoreRecord(@NonNull TermuxRestoreRecord record) {
         if (!TERMUX_RESTORE_TYPE_SHELL.equals(record.type)) return false;
-        return CrushRestoreStateMachine.shouldDropStaleCrushShellProjection(
-            new CrushRestoreStateMachine.ShellProjectionInput(
+        return CodexRestoreStateMachine.shouldDropStaleCodexShellProjection(
+            new CodexRestoreStateMachine.ShellProjectionInput(
                 record.type,
                 record.displayName,
                 record.shellName,
                 record.executable,
                 record.arguments,
-                !TextUtils.isEmpty(record.crushInstanceId) ||
-                    !TextUtils.isEmpty(record.crushSessionId) ||
-                    !TextUtils.isEmpty(record.crushDataDirectory),
+                !TextUtils.isEmpty(record.codexThreadId) ||
+                    !TextUtils.isEmpty(record.codexRolloutPath),
                 !TextUtils.isEmpty(record.sshPersistRecordId) ||
                     !TextUtils.isEmpty(record.sshCommand),
                 !TextUtils.isEmpty(record.tmuxSession)));
     }
 
-    private boolean shouldDropStaleCrushShellRestoreProjection(@Nullable String displayName,
+    private boolean shouldDropStaleCodexShellRestoreProjection(@Nullable String displayName,
                                                                @Nullable String shellName,
                                                                @Nullable String executable,
                                                                @Nullable String[] arguments) {
-        return CrushRestoreStateMachine.shouldDropStaleCrushShellProjection(
-            new CrushRestoreStateMachine.ShellProjectionInput(
+        return CodexRestoreStateMachine.shouldDropStaleCodexShellProjection(
+            new CodexRestoreStateMachine.ShellProjectionInput(
                 TERMUX_RESTORE_TYPE_SHELL,
                 displayName,
                 shellName,
@@ -5846,46 +5207,6 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                 false,
                 false,
                 false));
-    }
-
-    private void closeFailedCrushRestoreProjection(@NonNull CrushRestoreRecord record,
-                                                   @Nullable CrushRestoreRecord inferredCrush) {
-        CrushRestoreRecord source = inferredCrush == null ? record : mergeCrushRestoreRecords(record, inferredCrush);
-        upsertCrushRestoreRecord(copyCrushRestoreRecordWithState(
-            copyCrushRestoreRecordWithoutPid(source), CRUSH_RESTORE_STATE_CLOSED));
-    }
-
-    private void maybePersistCrushAuthorityFromSnapshot(@NonNull TerminalSession terminalSession,
-                                                        @NonNull CrushRestoreRecord crush,
-                                                        @NonNull ArrayList<CrushRestoreRecord> knownCrushRecords,
-                                                        boolean inferredFromExecutionCommand) {
-        CrushRestoreRecord existing = findCrushRestoreRecordByInstance(knownCrushRecords, crush.instanceId);
-        int crushPid = findActiveCrushProcessPid(terminalSession);
-        CrushRestoreStateMachine.Authority authority = CrushRestoreStateMachine.resolveAuthority(
-            new CrushRestoreStateMachine.AuthorityInput(
-                crushPid > 0,
-                existing != null && isRestorableCrushState(existing.state),
-                false,
-                inferredFromExecutionCommand));
-        CrushRestoreStateMachine.SnapshotAction action = CrushRestoreStateMachine.resolveSnapshot(
-            new CrushRestoreStateMachine.SnapshotInput(
-                authority,
-                true,
-                terminalSession.isRunning(),
-                existing != null));
-        boolean materializedLauncher = existing != null && inferredFromExecutionCommand && terminalSession.isRunning();
-        if (action != CrushRestoreStateMachine.SnapshotAction.WRITE_CRUSH_RECORD && !materializedLauncher) return;
-        if (crushPid <= 0 && existing == null && !inferredFromExecutionCommand) return;
-
-        CrushRestoreRecord source = existing == null ? crush : mergeCrushRestoreRecords(existing, crush);
-        int order = getLiveSessionOrder(terminalSession);
-        if (order != Integer.MAX_VALUE) source = copyCrushRestoreRecordWithOrder(source, order);
-        if (crushPid > 0) {
-            source = copyCrushRestoreRecordWithPid(source, crushPid);
-        } else {
-            source = copyCrushRestoreRecordWithoutPid(source);
-        }
-        upsertCrushRestoreRecord(copyCrushRestoreRecordWithState(source, CRUSH_RESTORE_STATE_ACTIVE));
     }
 
     @Nullable
@@ -5950,46 +5271,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @NonNull
     private TermuxRestoreState loadTermuxRestoreState() {
-        ArrayList<TermuxRestoreRecord> records = new ArrayList<>();
-        File stateFile = new File(TERMUX_RESTORE_STATE_PATH);
-        String raw = readFileTextWithBackup(stateFile);
-        if (TextUtils.isEmpty(raw)) return new TermuxRestoreState(records, "", "");
-
-        String foregroundKey = "";
-        String foregroundHandle = "";
-        int foregroundOrder = Integer.MAX_VALUE;
-        try {
-            Object parsed = new org.json.JSONTokener(raw).nextValue();
-            if (!(parsed instanceof JSONObject)) return new TermuxRestoreState(records, "", "");
-            JSONObject root = (JSONObject) parsed;
-            foregroundKey = root.optString("foreground_key", "").trim();
-            foregroundHandle = root.optString("foreground_handle", "").trim();
-            foregroundOrder = root.optInt("foreground_order", Integer.MAX_VALUE);
-            JSONArray array = root.optJSONArray("sessions");
-            if (array != null) {
-                for (int i = 0; i < array.length(); i++) {
-                    JSONObject item = array.optJSONObject(i);
-                    if (item == null) continue;
-                    TermuxRestoreRecord record = TermuxRestoreRecord.fromJson(item);
-                    if (record != null) records.add(record);
-                }
-            }
-        } catch (Exception e) {
-            Logger.logWarn(LOG_TAG, "Failed to parse Termux restore state: " + e.getMessage());
-            String backupRaw = readFileText(new File(stateFile.getAbsolutePath() + ".bak"));
-            if (!TextUtils.isEmpty(backupRaw) && !TextUtils.equals(raw, backupRaw)) {
-                return parseTermuxRestoreState(backupRaw);
-            }
-        }
-
-        records.sort((a, b) -> {
-            int orderCompare = Integer.compare(a.order, b.order);
-            if (orderCompare != 0) return orderCompare;
-            int updatedCompare = Long.compare(a.updatedAt, b.updatedAt);
-            if (updatedCompare != 0) return updatedCompare;
-            return a.key.compareTo(b.key);
-        });
-        return new TermuxRestoreState(records, foregroundKey, foregroundHandle, foregroundOrder);
+        return parseTermuxRestoreState(TermuxSessionRestoreStore.readStateJson());
     }
 
     @NonNull
@@ -6016,7 +5298,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
                 }
             }
         } catch (Exception e) {
-            Logger.logWarn(LOG_TAG, "Failed to parse Termux restore backup: " + e.getMessage());
+            Logger.logWarn(LOG_TAG, "Failed to parse Termux restore state: " + e.getMessage());
         }
         records.sort((a, b) -> {
             int orderCompare = Integer.compare(a.order, b.order);
@@ -6052,9 +5334,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             appendSignatureField(signature, record.workingDirectory);
             appendSignatureField(signature, record.shellName);
             appendSignatureField(signature, record.executable);
-            appendSignatureField(signature, record.crushInstanceId);
-            appendSignatureField(signature, record.crushSessionId);
-            appendSignatureField(signature, record.crushDataDirectory);
+            appendSignatureField(signature, record.codexThreadId);
+            appendSignatureField(signature, record.codexRolloutPath);
             appendSignatureField(signature, record.sshPersistRecordId);
             appendSignatureField(signature, record.sshCommand);
             appendSignatureField(signature, record.tmuxSession);
@@ -6092,9 +5373,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             root.put("sessions", array);
             String json = root.toString();
             if (TextUtils.equals(json, mLastTermuxRestoreStateJson)) return;
-            writeFileAtomically(new File(TERMUX_RESTORE_STATE_PATH), json);
-            mLastTermuxRestoreStateSignature = signature;
-            mLastTermuxRestoreStateJson = json;
+            if (TermuxSessionRestoreStore.writeStateJson(json)) {
+                mLastTermuxRestoreStateSignature = signature;
+                mLastTermuxRestoreStateJson = json;
+            }
         } catch (Exception e) {
             Logger.logWarn(LOG_TAG, "Failed to write Termux restore state: " + e.getMessage());
         }
@@ -6113,8 +5395,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             boolean match = !TextUtils.isEmpty(handle) && TextUtils.equals(handle, record.handle);
             if (!match && active != null) {
                 match = TextUtils.equals(active.key, record.key) ||
-                    (!TextUtils.isEmpty(active.crushInstanceId) &&
-                        TextUtils.equals(active.crushInstanceId, record.crushInstanceId)) ||
+                    (!TextUtils.isEmpty(active.codexThreadId) &&
+                        TextUtils.equals(active.codexThreadId, record.codexThreadId)) ||
                     (!TextUtils.isEmpty(active.sshPersistRecordId) &&
                         TextUtils.equals(active.sshPersistRecordId, record.sshPersistRecordId));
             }
@@ -6142,7 +5424,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         int order = service.getIndexOfSession(terminalSession);
         if (order < 0) order = 0;
         return buildTermuxRestoreRecord(termuxSession, order, System.currentTimeMillis() / 1000L,
-            loadCrushRestoreRecords(), loadSshPersistenceRecords());
+            loadCodexRestoreRecords(), loadSshPersistenceRecords());
     }
 
     @NonNull
@@ -6174,25 +5456,18 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @Nullable
-    private CrushRestoreRecord findCrushRestoreRecordForSession(@Nullable TerminalSession terminalSession,
-                                                                @NonNull ArrayList<CrushRestoreRecord> records) {
-        CrushRestoreRecord nativeRecord = findNativeCrushRestoreRecordForSession(terminalSession);
+    private CodexRestoreRecord findCodexRestoreRecordForSession(@Nullable TerminalSession terminalSession,
+                                                                @NonNull ArrayList<CodexRestoreRecord> records) {
+        CodexRestoreRecord nativeRecord = findNativeCodexRestoreRecordForSession(terminalSession);
         if (nativeRecord != null) return nativeRecord;
-        CrushRestoreRecord persistedRecord = findPersistedCrushRestoreRecordForSession(terminalSession);
+        CodexRestoreRecord persistedRecord = findPersistedCodexRestoreRecordForSession(terminalSession);
         if (persistedRecord != null) return persistedRecord;
 
-        int crushPid = findActiveCrushProcessPid(terminalSession);
-        if (crushPid <= 0) return null;
+        int codexPid = findActiveCodexProcessPid(terminalSession);
+        if (codexPid <= 0) return null;
 
-        String instanceId = readProcessEnvironmentValue(crushPid, "CRUSH_TERMUX_INSTANCE_ID");
-        if (!TextUtils.isEmpty(instanceId)) {
-            for (CrushRestoreRecord record : records) {
-                if (TextUtils.equals(record.instanceId, instanceId)) return record;
-            }
-        }
-
-        for (CrushRestoreRecord record : records) {
-            if (record.pid == crushPid) return record;
+        for (CodexRestoreRecord record : records) {
+            if (record.pid == codexPid) return record;
         }
         return null;
     }
@@ -6989,9 +6264,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (service == null) return null;
 
         TermuxRestoreState state = loadTermuxRestoreState();
-        String foregroundInstanceId = "";
-        if (!TextUtils.isEmpty(state.foregroundKey) && state.foregroundKey.startsWith("crush:")) {
-            foregroundInstanceId = state.foregroundKey.substring("crush:".length()).trim();
+        String foregroundThreadId = "";
+        if (!TextUtils.isEmpty(state.foregroundKey) && state.foregroundKey.startsWith("codex:")) {
+            foregroundThreadId = state.foregroundKey.substring("codex:".length()).trim();
         }
 
         for (TermuxSession termuxSession : service.getTermuxSessions()) {
@@ -7002,8 +6277,8 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             if (!TextUtils.isEmpty(state.foregroundKey) && TextUtils.equals(state.foregroundKey, record.key)) {
                 return terminalSession;
             }
-            if (!TextUtils.isEmpty(foregroundInstanceId) &&
-                TextUtils.equals(foregroundInstanceId, resolveCrushInstanceIdFromRestoreRecord(record))) {
+            if (!TextUtils.isEmpty(foregroundThreadId) &&
+                TextUtils.equals(foregroundThreadId, resolveCodexThreadIdFromRestoreRecord(record))) {
                 return terminalSession;
             }
         }
@@ -7043,7 +6318,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         TermuxService service = mActivity.getTermuxService();
         if (service == null) return;
 
+        if (service.getCodexSessionRecoveryController().handleFinishedSession(finishedSession)) return;
+
         forgetTermuxRestoreForSession(finishedSession);
+        forgetNativeCodexRestoreForSession(finishedSession);
         if (service.getTermuxSessionsSize() <= 1 && !ensureSessionBeforeClosingLastTab(finishedSession)) {
             return;
         }
@@ -7078,6 +6356,7 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (termuxSessionsListView == null) return;
 
         termuxSessionsListView.setItemChecked(indexOfSession, true);
+        if (!termuxSessionsListView.isShown() || !termuxSessionsListView.isAttachedToWindow()) return;
         // Delay is necessary otherwise sometimes scroll to newly added session does not happen
         termuxSessionsListView.postDelayed(() -> termuxSessionsListView.smoothScrollToPosition(indexOfSession), 1000);
     }

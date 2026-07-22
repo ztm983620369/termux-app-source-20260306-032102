@@ -231,6 +231,7 @@ final class TermuxInstaller {
                     TermuxShellEnvironment.writeEnvironmentToFile(activity);
 
                     installPostBootstrapLaunchersIfPossible();
+                    ShadowPluginToolingInstaller.installIfPresent(activity);
 
                     activity.runOnUiThread(whenDone);
 

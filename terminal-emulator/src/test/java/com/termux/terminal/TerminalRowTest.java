@@ -317,6 +317,26 @@ public class TerminalRowTest extends TestCase {
 		assertEquals('3', self.mText[4]);
 	}
 
+	public void testCopyIntervalFastPathMovesAndClearsHyperlinkMetadata() {
+		TerminalRow src = new TerminalRow(8, TextStyle.NORMAL);
+		TerminalRow dst = new TerminalRow(8, TextStyle.NORMAL);
+		String target = "https://example.com/path";
+		for (int i = 0; i < 8; i++) {
+			src.setChar(i, 'A' + i, TextStyle.NORMAL, i >= 2 && i < 5 ? target : null);
+			dst.setChar(i, '.', TextStyle.NORMAL, "https://stale.example/path");
+		}
+
+		dst.copyInterval(src, 1, 6, 2);
+		assertNull(dst.getHyperlink(2));
+		assertEquals(target, dst.getHyperlink(3));
+		assertEquals(target, dst.getHyperlink(4));
+		assertEquals(target, dst.getHyperlink(5));
+		assertNull(dst.getHyperlink(6));
+
+		dst.clear(TextStyle.NORMAL);
+		for (int i = 0; i < 8; i++) assertNull(dst.getHyperlink(i));
+	}
+
 	public void testOverwritingDoubleDisplayWidthWithSelf() {
 		row.setChar(0, ONE_JAVA_CHAR_DISPLAY_WIDTH_TWO_1, 0);
 		row.setChar(0, ONE_JAVA_CHAR_DISPLAY_WIDTH_TWO_1, 0);

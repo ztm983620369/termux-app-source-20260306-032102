@@ -154,6 +154,17 @@
     <string name="action_cancel_select_url_dialog">取消</string>
 
     <string name="action_share_transcript">Share transcript</string>
+    <string name="action_attach_image_to_codex">Image</string>
+    <string name="msg_codex_image_target_unavailable">The original terminal session is unavailable.</string>
+    <string name="msg_codex_image_picker_failed">Could not open the image picker.</string>
+    <string name="msg_codex_image_processing_progress">Processing %1$d/%2$d</string>
+    <string name="msg_codex_image_processing_complete">Complete</string>
+    <string name="msg_codex_image_processing_failed">Processing failed</string>
+    <plurals name="msg_codex_images_attached">
+        <item quantity="one">Added %d image to Codex</item>
+        <item quantity="other">Added %d images to Codex</item>
+    </plurals>
+    <string name="msg_codex_images_attached_with_reuse">Added %1$d; batch duplicates %2$d, local reuse %3$d, remote reuse %4$d</string>
     <string name="title_share_transcript">Terminal transcript</string>
     <string name="title_share_transcript_with">Send transcript to:</string>
 

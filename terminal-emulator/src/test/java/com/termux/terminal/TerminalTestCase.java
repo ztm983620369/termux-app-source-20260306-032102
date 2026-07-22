@@ -57,6 +57,10 @@ public abstract class TerminalTestCase extends TestCase {
 		public void onColorsChanged() {
 			colorsChanged++;
 		}
+
+		@Override
+		public void onTerminalHostControlCommand(String command, String argument) {
+		}
 	}
 
 	public TerminalEmulator mTerminal;

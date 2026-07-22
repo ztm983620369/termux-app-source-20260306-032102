@@ -1,0 +1,52 @@
+plugins {
+    id 'com.android.library'
+}
+
+android {
+    namespace 'com.luck.lib.camerax'
+    compileSdkVersion rootProject.properties.compileSdkVersion.toInteger()
+
+    defaultConfig {
+        minSdkVersion rootProject.properties.minSdkVersion.toInteger()
+        targetSdkVersion rootProject.properties.targetSdkVersion.toInteger()
+
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'src/main/AndroidManifest-tindroid.xml'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+    def camerax_version = '1.2.1'
+    api "androidx.camera:camera-core:${camerax_version}"
+    api "androidx.camera:camera-camera2:${camerax_version}"
+    implementation "androidx.camera:camera-view:${camerax_version}"
+    implementation "androidx.camera:camera-lifecycle:${camerax_version}"
+    implementation 'androidx.appcompat:appcompat:1.3.1'
+    implementation 'androidx.transition:transition:1.4.1'
+    implementation 'androidx.concurrent:concurrent-futures:1.1.0'
+}

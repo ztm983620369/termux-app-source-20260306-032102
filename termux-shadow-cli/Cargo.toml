@@ -1,0 +1,31 @@
+[package]
+name = "termux-shadow-cli"
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Native Termux Shadow plugin workflow CLI"
+license = "Apache-2.0"
+
+[[bin]]
+name = "shadow-plugin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive", "env", "wrap_help"] }
+regex = "1.12.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+walkdir = "2.5.0"
+libc = "0.2.186"
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"

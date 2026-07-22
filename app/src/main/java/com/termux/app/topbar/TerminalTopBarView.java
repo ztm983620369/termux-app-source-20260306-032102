@@ -26,8 +26,15 @@ import com.termux.R;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Objects;
 
 public class TerminalTopBarView extends LinearLayout {
+
+    private static final int CHROME_BACKGROUND_COLOR = 0xFF000000;
+    private static final int SELECTED_TAB_FILL_COLOR = 0xFF24262A;
+    private static final int SELECTED_TAB_STROKE_COLOR = 0xFF565B64;
+    private static final int UNSELECTED_TAB_FILL_COLOR = 0xFF111315;
+    private static final int UNSELECTED_TAB_STROKE_COLOR = 0xFF272B30;
 
     public interface OnTabSelectedListener {
         void onTabSelected(int index, @NonNull Item item);
@@ -67,6 +74,18 @@ public class TerminalTopBarView extends LinearLayout {
             this.badgeText = badgeText;
             this.contentDescription = contentDescription;
         }
+
+        public boolean hasSameVisualState(@Nullable Item other) {
+            return other != null &&
+                Objects.equals(key, other.key) &&
+                Objects.equals(title, other.title) &&
+                selected == other.selected &&
+                locked == other.locked &&
+                closable == other.closable &&
+                tone == other.tone &&
+                Objects.equals(badgeText, other.badgeText) &&
+                Objects.equals(contentDescription, other.contentDescription);
+        }
     }
 
     private HorizontalScrollView mScrollView;
@@ -102,10 +121,21 @@ public class TerminalTopBarView extends LinearLayout {
 
     private void init(Context context) {
         setOrientation(HORIZONTAL);
-        setBackgroundColor(0xFF121212);
+        setGravity(Gravity.CENTER_VERTICAL);
+        setMinimumHeight(dp(36));
+        setPadding(dp(4), dp(3), dp(4), dp(3));
+        setClipToPadding(false);
+        setBackgroundColor(CHROME_BACKGROUND_COLOR);
         LayoutInflater.from(context).inflate(R.layout.view_terminal_top_bar, this, true);
         mScrollView = findViewById(R.id.terminal_top_bar_scroll);
         mTabsContainer = findViewById(R.id.terminal_top_bar_container);
+        mScrollView.setBackgroundColor(CHROME_BACKGROUND_COLOR);
+        mScrollView.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        mScrollView.setHorizontalFadingEdgeEnabled(false);
+        mScrollView.setClipToPadding(false);
+        mTabsContainer.setGravity(Gravity.CENTER_VERTICAL);
+        mTabsContainer.setMinimumHeight(dp(30));
+        mTabsContainer.setBackgroundColor(CHROME_BACKGROUND_COLOR);
         LayoutTransition layoutTransition = new LayoutTransition();
         layoutTransition.setDuration(180L);
         layoutTransition.setAnimateParentHierarchy(false);
@@ -136,9 +166,18 @@ public class TerminalTopBarView extends LinearLayout {
     }
 
     public void setItems(@NonNull List<Item> items) {
+        if (hasSameItems(items)) return;
         mItems.clear();
         mItems.addAll(items);
         updateItems();
+    }
+
+    private boolean hasSameItems(@NonNull List<Item> items) {
+        if (mItems.size() != items.size()) return false;
+        for (int i = 0; i < items.size(); i++) {
+            if (!mItems.get(i).hasSameVisualState(items.get(i))) return false;
+        }
+        return true;
     }
 
     public void setAddButtonSelected(boolean selected) {
@@ -224,8 +263,6 @@ public class TerminalTopBarView extends LinearLayout {
             }
             mTabsContainer.addView(mAddButton, createAddButtonLayoutParams());
         }
-        applyAddButtonState();
-
         if (selectedIndex >= 0 && selectedIndex != mLastSelectedIndex) {
             int indexToScroll = selectedIndex;
             post(() -> scrollToTab(indexToScroll));
@@ -244,15 +281,22 @@ public class TerminalTopBarView extends LinearLayout {
     private void bindTabView(@NonNull TabViewHolder holder, @NonNull Item item, int index) {
         holder.index = index;
         holder.key = item.key;
+        if (item.hasSameVisualState(holder.boundItem)) {
+            holder.boundItem = item;
+            return;
+        }
         holder.titleView.setText(item.title);
         holder.root.setBackground(createTabBackground(item.selected, item.tone));
         holder.root.setAlpha(item.selected ? 1.0f : 0.88f);
+        holder.root.setElevation(item.selected ? dp(3) : dp(1));
+        holder.root.setTranslationZ(item.selected ? dp(2) : 0f);
         holder.root.setContentDescription(TextUtils.isEmpty(item.contentDescription) ? item.title : item.contentDescription);
         holder.titleView.setTextColor(item.selected ? Color.WHITE : 0xFFE6E6E6);
         holder.statusDot.setBackground(createStatusDotBackground(item.tone));
         bindBadgeView(holder.badgeView, item);
         holder.closeBtn.setVisibility(item.closable ? View.VISIBLE : View.GONE);
         holder.closeBtn.setTextColor(item.selected ? 0xFFF2F2F2 : 0xFFBDBDBD);
+        holder.boundItem = item;
     }
 
     @NonNull
@@ -261,6 +305,7 @@ public class TerminalTopBarView extends LinearLayout {
         tabLayout.setOrientation(HORIZONTAL);
         tabLayout.setGravity(Gravity.CENTER_VERTICAL);
         tabLayout.setMinimumWidth(dp(80));
+        tabLayout.setClipToOutline(false);
 
         View statusDot = new View(getContext());
         LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(8), dp(8));
@@ -378,13 +423,15 @@ public class TerminalTopBarView extends LinearLayout {
             mAddButtonSelected ? TerminalTopBarStateMachine.Tone.ACTIVE : TerminalTopBarStateMachine.Tone.NEUTRAL
         ));
         mAddButton.setAlpha(mAddButtonSelected ? 1.0f : 0.88f);
+        mAddButton.setElevation(mAddButtonSelected ? dp(3) : dp(1));
+        mAddButton.setTranslationZ(mAddButtonSelected ? dp(2) : 0f);
     }
 
     @NonNull
     private LinearLayout.LayoutParams createTabLayoutParams() {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(30));
         lp.weight = 1f;
-        lp.setMargins(dp(1), dp(2), dp(1), dp(2));
+        lp.setMargins(dp(2), 0, dp(2), 0);
         return lp;
     }
 
@@ -392,7 +439,7 @@ public class TerminalTopBarView extends LinearLayout {
     private LinearLayout.LayoutParams createAddButtonLayoutParams() {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(30));
         lp.weight = 1f;
-        lp.setMargins(dp(1), dp(2), dp(1), dp(2));
+        lp.setMargins(dp(2), 0, dp(2), 0);
         return lp;
     }
 
@@ -437,11 +484,11 @@ public class TerminalTopBarView extends LinearLayout {
     }
 
     private int getToneFillColor(@NonNull TerminalTopBarStateMachine.Tone tone, boolean selected) {
-        return selected ? 0xFF2A2A2A : 0xFF1A1A1A;
+        return selected ? SELECTED_TAB_FILL_COLOR : UNSELECTED_TAB_FILL_COLOR;
     }
 
     private int getToneStrokeColor(@NonNull TerminalTopBarStateMachine.Tone tone, boolean selected) {
-        return selected ? 0xFF545454 : 0xFF2F2F2F;
+        return selected ? SELECTED_TAB_STROKE_COLOR : UNSELECTED_TAB_STROKE_COLOR;
     }
 
     private int getToneColor(@NonNull TerminalTopBarStateMachine.Tone tone) {
@@ -467,6 +514,9 @@ public class TerminalTopBarView extends LinearLayout {
     private void scrollToTab(int index) {
         View child = mTabsContainer.getChildAt(index);
         if (child == null) return;
+        int viewportLeft = mScrollView.getScrollX();
+        int viewportRight = viewportLeft + mScrollView.getWidth();
+        if (child.getLeft() >= viewportLeft && child.getRight() <= viewportRight) return;
         int scrollX = child.getLeft() - dp(16);
         mScrollView.smoothScrollTo(Math.max(scrollX, 0), 0);
     }
@@ -489,6 +539,7 @@ public class TerminalTopBarView extends LinearLayout {
         @NonNull final TextView closeBtn;
         int index = -1;
         @Nullable String key;
+        @Nullable Item boundItem;
         @NonNull final TerminalTopBarTouchStateMachine touchStateMachine;
         @NonNull final Runnable longPressRunnable;
 

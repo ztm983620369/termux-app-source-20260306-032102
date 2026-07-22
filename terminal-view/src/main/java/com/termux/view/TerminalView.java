@@ -96,6 +96,8 @@ public final class TerminalView extends View {
     private int mPendingInvalidateTop = Integer.MAX_VALUE;
     private int mPendingInvalidateBottom = Integer.MIN_VALUE;
     private int mLastRenderedCursorRow = -1;
+    private int mLastRenderedCursorCol = -1;
+    private int mLastRenderedCursorStyle = -1;
     private boolean mLastRenderedCursorVisible;
 
     /**
@@ -314,6 +316,8 @@ public final class TerminalView extends View {
         if (session == mTermSession) return false;
         mTopRow = 0;
         mLastRenderedCursorRow = -1;
+        mLastRenderedCursorCol = -1;
+        mLastRenderedCursorStyle = -1;
         mLastRenderedCursorVisible = false;
 
         mTermSession = session;
@@ -324,6 +328,7 @@ public final class TerminalView extends View {
 
         // Wait with enabling the scrollbar until we have a terminal to get scroll position from.
         setVerticalScrollBarEnabled(true);
+        invalidate();
 
         return true;
     }
@@ -486,13 +491,14 @@ public final class TerminalView extends View {
         int rowsInHistory = screen.getActiveTranscriptRows();
         if (mTopRow < -rowsInHistory) mTopRow = -rowsInHistory;
         boolean requireFullInvalidate = mEmulator.isFullRedrawRequired();
+        final int scrolledRows = mEmulator.getScrollCounter();
 
         // Only follow output when we are already at the bottom. If the user has scrolled up (mTopRow != 0),
         // keep their scroll position stable while new output is appended.
         final boolean selectingText = isSelectingText();
         final boolean followOutput = (mTopRow == 0) && !selectingText && !mEmulator.isAutoScrollDisabled();
         if (!followOutput) {
-            int rowShift = mEmulator.getScrollCounter();
+            int rowShift = scrolledRows;
             if (rowShift != 0) {
                 if (-mTopRow + rowShift > rowsInHistory) {
                     // We're hitting the end of the history transcript, clamp to the oldest available row.
@@ -525,14 +531,22 @@ public final class TerminalView extends View {
             dirtyStart = screen.getDirtyStartRow();
             dirtyEnd = screen.getDirtyEndRow();
         }
-        if (mLastRenderedCursorRow >= 0) {
-            dirtyStart = Math.min(dirtyStart, mLastRenderedCursorRow);
-            dirtyEnd = Math.max(dirtyEnd, mLastRenderedCursorRow + 1);
-        }
-        if (mEmulator.shouldCursorBeVisible()) {
-            int cursorRow = mEmulator.getCursorRow();
-            dirtyStart = Math.min(dirtyStart, cursorRow);
-            dirtyEnd = Math.max(dirtyEnd, cursorRow + 1);
+        boolean cursorVisible = mEmulator.shouldCursorBeVisible();
+        int cursorRow = mEmulator.getCursorRow();
+        int cursorCol = mEmulator.getCursorCol();
+        int cursorStyle = mEmulator.getCursorStyle();
+        boolean cursorChanged = mLastRenderedCursorVisible != cursorVisible ||
+            (cursorVisible && (mLastRenderedCursorRow != cursorRow ||
+                mLastRenderedCursorCol != cursorCol || mLastRenderedCursorStyle != cursorStyle));
+        if (cursorChanged) {
+            if (mLastRenderedCursorVisible && mLastRenderedCursorRow >= 0) {
+                dirtyStart = Math.min(dirtyStart, mLastRenderedCursorRow);
+                dirtyEnd = Math.max(dirtyEnd, mLastRenderedCursorRow + 1);
+            }
+            if (cursorVisible) {
+                dirtyStart = Math.min(dirtyStart, cursorRow);
+                dirtyEnd = Math.max(dirtyEnd, cursorRow + 1);
+            }
         }
 
         mEmulator.clearScrollCounter();
@@ -569,11 +583,14 @@ public final class TerminalView extends View {
      * @param textSize the new font size, in density-independent pixels.
      */
     public void setTextSize(int textSize) {
+        if (mRenderer != null && mRenderer.mTextSize == textSize) return;
         mRenderer = new TerminalRenderer(textSize, mRenderer == null ? Typeface.MONOSPACE : mRenderer.mTypeface);
+        invalidate();
         updateSize();
     }
 
     public void setTypeface(Typeface newTypeface) {
+        if (mRenderer != null && mRenderer.mTypeface == newTypeface) return;
         mRenderer = new TerminalRenderer(mRenderer.mTextSize, newTypeface);
         updateSize();
         invalidate();
@@ -694,15 +711,14 @@ public final class TerminalView extends View {
             mAccessibilityContentDescriptionDirty = true;
         }
 
-        if (screenRowStart < 0 || screenRowEndExclusive <= screenRowStart || mRenderer == null || getWidth() <= 0) {
+        if (screenRowStart < 0 || screenRowEndExclusive <= screenRowStart ||
+            mRenderer == null || mEmulator == null || getWidth() <= 0) {
             mPendingFullInvalidation = true;
         } else {
             screenRowStart = Math.max(0, screenRowStart);
-            if (mEmulator != null) {
-                screenRowEndExclusive = Math.min(mEmulator.mRows, screenRowEndExclusive);
-            }
+            screenRowEndExclusive = Math.min(mEmulator.mRows, screenRowEndExclusive);
             if (screenRowEndExclusive <= screenRowStart) return;
-            if (mEmulator != null && screenRowStart == 0 && screenRowEndExclusive == mEmulator.mRows) {
+            if (screenRowStart == 0 && screenRowEndExclusive == mEmulator.mRows) {
                 mPendingFullInvalidation = true;
             } else if (!mPendingFullInvalidation) {
                 int top = getScreenRowTopPx(screenRowStart);
@@ -756,11 +772,13 @@ public final class TerminalView extends View {
     }
 
     private int getScreenRowTopPx(int screenRow) {
-        return Math.max(0, screenRow * mRenderer.mFontLineSpacing);
+        return Math.max(0, mRenderer.mFontLineSpacingAndAscent +
+            screenRow * mRenderer.mFontLineSpacing);
     }
 
     private int getScreenRowBottomPx(int screenRowExclusive) {
-        return Math.min(getHeight(), screenRowExclusive * mRenderer.mFontLineSpacing);
+        return Math.min(getHeight(), mRenderer.mFontLineSpacingAndAscent +
+            screenRowExclusive * mRenderer.mFontLineSpacing);
     }
 
     /** Overriding {@link View#onGenericMotionEvent(MotionEvent)}. */
@@ -1181,9 +1199,16 @@ public final class TerminalView extends View {
 
     @Override
     protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+        drawTerminalFrame(canvas);
+    }
+
+    private void drawTerminalFrame(Canvas canvas) {
         if (mEmulator == null) {
             canvas.drawColor(0XFF000000);
             mLastRenderedCursorRow = -1;
+            mLastRenderedCursorCol = -1;
+            mLastRenderedCursorStyle = -1;
             mLastRenderedCursorVisible = false;
         } else {
             // render the terminal view and highlight any selected text
@@ -1194,6 +1219,8 @@ public final class TerminalView extends View {
 
             mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3]);
             mLastRenderedCursorRow = mEmulator.getCursorRow();
+            mLastRenderedCursorCol = mEmulator.getCursorCol();
+            mLastRenderedCursorStyle = mEmulator.getCursorStyle();
             mLastRenderedCursorVisible = mEmulator.shouldCursorBeVisible();
 
             // render the text selection handles
@@ -1506,10 +1533,8 @@ public final class TerminalView extends View {
         public void run() {
             try {
                 if (mEmulator != null) {
-                    // Toggle the blink state and then invalidate() the view so
-                    // that onDraw() is called, which then calls TerminalRenderer.render()
-                    // which checks with TerminalEmulator.shouldCursorBeVisible() to decide whether
-                    // to draw the cursor or not
+                    // Toggle the blink state and schedule only the old/new cursor rows. The active
+                    // renderer checks TerminalEmulator.shouldCursorBeVisible() for the final state.
                     mCursorVisible = !mCursorVisible;
                     //mClient.logVerbose(LOG_TAG, "Toggling cursor blink state to " + mCursorVisible);
                     mEmulator.setCursorBlinkState(mCursorVisible);

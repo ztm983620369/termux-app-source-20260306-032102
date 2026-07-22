@@ -64,6 +64,25 @@ public class DecSetTest extends TerminalTestCase {
 		assertEquals("Terminal reset() should disable bracketed paste mode", "a", mOutput.getOutputAndClear());
 	}
 
+	/** DECSET 2026 keeps screen changes hidden until the synchronized update is complete. */
+	public void testSynchronizedOutputMode() {
+		withTerminalSized(3, 3);
+
+		assertFalse(mTerminal.isSynchronizedOutputActive());
+		assertEnteringStringGivesResponse("\033[?2026$p", "\033[?2026;2$y");
+
+		enterString("\033[?2026h");
+		assertTrue(mTerminal.isSynchronizedOutputActive());
+		assertEnteringStringGivesResponse("\033[?2026$p", "\033[?2026;1$y");
+
+		enterString("abc\033[?2026l").assertLinesAre("abc", "   ", "   ");
+		assertFalse(mTerminal.isSynchronizedOutputActive());
+
+		enterString("\033[?2026h");
+		mTerminal.reset();
+		assertFalse("Terminal reset() should release synchronized output", mTerminal.isSynchronizedOutputActive());
+	}
+
 	/** DECSET 7, DECAWM, controls wraparound mode. */
 	public void testWrapAroundMode() {
 		// Default with wraparound:

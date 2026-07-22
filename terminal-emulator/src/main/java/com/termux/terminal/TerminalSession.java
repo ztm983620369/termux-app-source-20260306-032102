@@ -3,7 +3,6 @@ package com.termux.terminal;
 import android.annotation.SuppressLint;
 import android.os.Handler;
 import android.os.Message;
-import android.os.SystemClock;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -34,6 +33,8 @@ public final class TerminalSession extends TerminalOutput {
 
     private static final int MSG_NEW_INPUT = 1;
     private static final int MSG_PROCESS_EXITED = 4;
+    private static final int MSG_SYNCHRONIZED_OUTPUT_TIMEOUT = 5;
+    private static final long SYNCHRONIZED_OUTPUT_TIMEOUT_MS = 250L;
 
     /**
      * Main-thread processing budget for terminal output.
@@ -42,10 +43,10 @@ public final class TerminalSession extends TerminalOutput {
      * one go on the UI thread, we risk jank and input lag. Instead we drain the queue in bounded
      * slices and reschedule immediately if more work remains.
      */
-    private static final int PROCESS_INPUT_TIME_SLICE_MS = 8;
-    private static final int PROCESS_INPUT_MAX_BYTES_PER_SLICE = 256 * 1024;
+    private static final int PROCESS_INPUT_MAX_BYTES_PER_SLICE = 64 * 1024;
     private static final int PROCESS_INPUT_BUFFER_SIZE = 32 * 1024;
-    private static final int IO_QUEUE_CAPACITY_BYTES = 64 * 1024;
+    private static final int PROCESS_TO_TERMINAL_IO_QUEUE_CAPACITY_BYTES = 1024 * 1024;
+    private static final int TERMINAL_TO_PROCESS_IO_QUEUE_CAPACITY_BYTES = 64 * 1024;
 
     public final String mHandle = UUID.randomUUID().toString();
 
@@ -55,12 +56,12 @@ public final class TerminalSession extends TerminalOutput {
      * A queue written to from a separate thread when the process outputs, and read by main thread to process by
      * terminal emulator.
      */
-    final ByteQueue mProcessToTerminalIOQueue = new ByteQueue(IO_QUEUE_CAPACITY_BYTES);
+    final ByteQueue mProcessToTerminalIOQueue = new ByteQueue(PROCESS_TO_TERMINAL_IO_QUEUE_CAPACITY_BYTES);
     /**
      * A queue written to from the main thread due to user interaction, and read by another thread which forwards by
      * writing to the {@link #mTerminalFileDescriptor}.
      */
-    final ByteQueue mTerminalToProcessIOQueue = new ByteQueue(IO_QUEUE_CAPACITY_BYTES);
+    final ByteQueue mTerminalToProcessIOQueue = new ByteQueue(TERMINAL_TO_PROCESS_IO_QUEUE_CAPACITY_BYTES);
     /** Buffer to write translate code points into utf8 before writing to mTerminalToProcessIOQueue */
     private final byte[] mUtf8InputBuffer = new byte[5];
 
@@ -82,7 +83,7 @@ public final class TerminalSession extends TerminalOutput {
     /** Set by the application for user identification of session, not by terminal. */
     public String mSessionName;
 
-    final Handler mMainThreadHandler = new MainThreadHandler();
+    final MainThreadHandler mMainThreadHandler = new MainThreadHandler();
     private final AtomicBoolean mNewInputScheduled = new AtomicBoolean(false);
 
     private final String mShellPath;
@@ -248,19 +249,36 @@ public final class TerminalSession extends TerminalOutput {
 
     /** Reset state for terminal emulator state. */
     public void reset() {
+        mMainThreadHandler.cancelSynchronizedOutputTimeout();
         mEmulator.reset();
         notifyScreenUpdate();
     }
 
     /** Finish this terminal session by sending SIGKILL to the shell. */
     public void finishIfRunning() {
-        if (isRunning()) {
-            try {
-                Os.kill(mShellPid, OsConstants.SIGKILL);
-            } catch (ErrnoException e) {
-                Logger.logWarn(mClient, LOG_TAG, "Failed sending SIGKILL: " + e.getMessage());
-            }
+        final int shellPid;
+        synchronized (this) {
+            shellPid = mShellPid;
         }
+        final int hostPid = android.os.Process.myPid();
+        if (!isSafeSignalTarget(shellPid, hostPid)) {
+            if (shellPid == hostPid) {
+                Logger.logError(mClient, LOG_TAG,
+                    "Refusing to send SIGKILL to the Termux host process: pid=" + shellPid);
+            }
+            return;
+        }
+
+        try {
+            Os.kill(shellPid, OsConstants.SIGKILL);
+        } catch (ErrnoException e) {
+            Logger.logWarn(mClient, LOG_TAG, "Failed sending SIGKILL: " + e.getMessage());
+        }
+    }
+
+    static boolean isSafeSignalTarget(int targetPid, int hostPid) {
+        // kill(0, signal) targets the caller's whole process group.
+        return targetPid > 0 && targetPid != hostPid;
     }
 
     /** Cleanup resources when the process exits. */
@@ -282,7 +300,7 @@ public final class TerminalSession extends TerminalOutput {
     }
 
     public synchronized boolean isRunning() {
-        return mShellPid != -1;
+        return mShellPid > 0;
     }
 
     /** Only valid if not {@link #isRunning()}. */
@@ -315,7 +333,7 @@ public final class TerminalSession extends TerminalOutput {
         mClient.onColorsChanged(this);
     }
 
-    public int getPid() {
+    public synchronized int getPid() {
         return mShellPid;
     }
 
@@ -363,15 +381,32 @@ public final class TerminalSession extends TerminalOutput {
     class MainThreadHandler extends Handler {
 
         final byte[] mReceiveBuffer = new byte[PROCESS_INPUT_BUFFER_SIZE];
+        private boolean mSynchronizedOutputTimeoutScheduled;
 
         @Override
         public void handleMessage(Message msg) {
+            if (msg.what == MSG_SYNCHRONIZED_OUTPUT_TIMEOUT) {
+                handleSynchronizedOutputTimeout();
+                return;
+            }
+
             // Allow the reader thread to schedule another message while we're processing.
             mNewInputScheduled.set(false);
+            processPendingInput();
 
+            if (msg.what == MSG_PROCESS_EXITED) {
+                handleProcessExited((Integer) msg.obj);
+            }
+        }
+
+        private void processPendingInput() {
             int totalBytesRead = 0;
             boolean appended = false;
-            long startUptimeMs = SystemClock.uptimeMillis();
+            TerminalBuffer screenBefore = mEmulator.getScreen();
+            int cursorRowBefore = mEmulator.getCursorRow();
+            int cursorColBefore = mEmulator.getCursorCol();
+            int cursorStyleBefore = mEmulator.getCursorStyle();
+            boolean cursorVisibleBefore = mEmulator.shouldCursorBeVisible();
 
             while (true) {
                 int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
@@ -381,36 +416,75 @@ public final class TerminalSession extends TerminalOutput {
                 totalBytesRead += bytesRead;
                 appended = true;
 
-                if (totalBytesRead >= PROCESS_INPUT_MAX_BYTES_PER_SLICE ||
-                    SystemClock.uptimeMillis() - startUptimeMs >= PROCESS_INPUT_TIME_SLICE_MS) {
+                if (totalBytesRead >= PROCESS_INPUT_MAX_BYTES_PER_SLICE) {
                     // Yield to keep UI responsive; reschedule immediately to continue draining.
                     scheduleProcessNewInput();
                     break;
                 }
             }
 
-            if (appended) notifyScreenUpdate();
+            if (!appended) return;
 
-            if (msg.what == MSG_PROCESS_EXITED) {
-                int exitCode = (Integer) msg.obj;
-                cleanupResources(exitCode);
-
-                String exitDescription = "\r\n[Process completed";
-                if (exitCode > 0) {
-                    // Non-zero process exit.
-                    exitDescription += " (code " + exitCode + ")";
-                } else if (exitCode < 0) {
-                    // Negated signal.
-                    exitDescription += " (signal " + (-exitCode) + ")";
-                }
-                exitDescription += " - press Enter]";
-
-                byte[] bytesToWrite = exitDescription.getBytes(StandardCharsets.UTF_8);
-                mEmulator.append(bytesToWrite, bytesToWrite.length);
-                notifyScreenUpdate();
-
-                mClient.onSessionFinished(TerminalSession.this);
+            if (mEmulator.isSynchronizedOutputActive()) {
+                scheduleSynchronizedOutputTimeout();
+            } else {
+                cancelSynchronizedOutputTimeout();
+                TerminalBuffer screenAfter = mEmulator.getScreen();
+                boolean cursorVisibleAfter = mEmulator.shouldCursorBeVisible();
+                boolean cursorChanged = cursorVisibleBefore != cursorVisibleAfter ||
+                    (cursorVisibleAfter && (cursorRowBefore != mEmulator.getCursorRow() ||
+                        cursorColBefore != mEmulator.getCursorCol() ||
+                        cursorStyleBefore != mEmulator.getCursorStyle()));
+                boolean screenChanged = screenBefore != screenAfter || screenAfter.hasDirtyRows() ||
+                    mEmulator.isFullRedrawRequired() || mEmulator.getScrollCounter() != 0 || cursorChanged;
+                if (screenChanged) notifyScreenUpdate();
             }
+        }
+
+        private void scheduleSynchronizedOutputTimeout() {
+            if (mSynchronizedOutputTimeoutScheduled) return;
+            mSynchronizedOutputTimeoutScheduled = true;
+            sendEmptyMessageDelayed(MSG_SYNCHRONIZED_OUTPUT_TIMEOUT, SYNCHRONIZED_OUTPUT_TIMEOUT_MS);
+        }
+
+        private void cancelSynchronizedOutputTimeout() {
+            if (!mSynchronizedOutputTimeoutScheduled) return;
+            removeMessages(MSG_SYNCHRONIZED_OUTPUT_TIMEOUT);
+            mSynchronizedOutputTimeoutScheduled = false;
+        }
+
+        private void handleSynchronizedOutputTimeout() {
+            mSynchronizedOutputTimeoutScheduled = false;
+            if (mEmulator == null || !mEmulator.isSynchronizedOutputActive()) return;
+
+            // A crashed or blocked child must not leave the terminal permanently frozen.
+            mEmulator.forceFinishSynchronizedOutput();
+            if (mEmulator.getScreen().hasDirtyRows() || mEmulator.isFullRedrawRequired() ||
+                mEmulator.getScrollCounter() != 0) {
+                notifyScreenUpdate();
+            }
+        }
+
+        private void handleProcessExited(int exitCode) {
+            cancelSynchronizedOutputTimeout();
+            if (mEmulator != null) mEmulator.forceFinishSynchronizedOutput();
+            cleanupResources(exitCode);
+
+            String exitDescription = "\r\n[Process completed";
+            if (exitCode > 0) {
+                // Non-zero process exit.
+                exitDescription += " (code " + exitCode + ")";
+            } else if (exitCode < 0) {
+                // Negated signal.
+                exitDescription += " (signal " + (-exitCode) + ")";
+            }
+            exitDescription += " - press Enter]";
+
+            byte[] bytesToWrite = exitDescription.getBytes(StandardCharsets.UTF_8);
+            mEmulator.append(bytesToWrite, bytesToWrite.length);
+            notifyScreenUpdate();
+
+            mClient.onSessionFinished(TerminalSession.this);
         }
 
     }

@@ -26,6 +26,10 @@ public class TermuxTerminalViewClientBase implements TerminalViewClient {
     }
 
     @Override
+    public void onOpenUrl(String url) {
+    }
+
+    @Override
     public boolean shouldTerminalViewRequestFocusOnTap() {
         return true;
     }

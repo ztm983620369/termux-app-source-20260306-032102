@@ -16,6 +16,7 @@ import com.termux.shared.termux.shell.command.environment.TermuxShellEnvironment
 import com.termux.shared.termux.shell.am.TermuxAmSocketServer;
 import com.termux.shared.termux.shell.TermuxShellManager;
 import com.termux.shared.termux.theme.TermuxThemeUtils;
+import com.tencent.shadow.sample.host.HostApplication;
 
 public class TermuxApplication extends Application {
 
@@ -25,9 +26,14 @@ public class TermuxApplication extends Application {
         super.onCreate();
 
         Context context = getApplicationContext();
+        HostApplication.init(this);
+        if (HostApplication.isShadowPluginProcess(context)) {
+            return;
+        }
 
         // Set crash handler for the app
         TermuxCrashUtils.setDefaultCrashHandler(this);
+        HostApplication.getApp().installCrashHandler();
 
         // Set log config for the app
         setLogConfig(context);
@@ -74,6 +80,8 @@ public class TermuxApplication extends Application {
 
         if (isTermuxFilesDirectoryAccessible) {
             new Thread(TermuxInstaller::installPostBootstrapLaunchersIfPossible).start();
+            new Thread(() -> ShadowPluginToolingInstaller.installIfPresent(this),
+                    "shadow-plugin-tooling-installer").start();
         }
 
         tuneLeakCanaryIfPresent();

@@ -71,6 +71,8 @@ public final class SftpProtocolManager {
     private static final long FULL_DIGEST_VERIFY_MAX_BYTES = 2L * 1024L * 1024L;
     private static final int SAMPLE_DIGEST_VERIFY_BYTES = 256 * 1024;
     private static final int TRANSFER_DIGEST_BUFFER_BYTES = 32 * 1024;
+    private static final String CODEX_ATTACHMENT_REMOTE_RELATIVE_DIR = ".codex/termux-images";
+    private static final long CODEX_ATTACHMENT_TEMP_RETENTION_MS = 24L * 60L * 60L * 1000L;
     private static final long DOWNLOAD_PROGRESS_MIN_INTERVAL_MS = 120L;
     private static final ThreadLocal<Integer> SUPPRESS_TRANSFER_JOURNAL_DEPTH = new ThreadLocal<Integer>() {
         @Override
@@ -1821,6 +1823,160 @@ public final class SftpProtocolManager {
             remoteSizeHolder[0],
             new ArrayList<>()
         );
+    }
+
+    /**
+     * Uploads one content-addressed image to the HOME of the SSH session backing the active terminal.
+     * This endpoint deliberately does not depend on the file manager's selected virtual target.
+     */
+    @NonNull
+    public CodexAttachmentUploadResult uploadCodexAttachment(@NonNull Context context,
+                                                             @NonNull SessionEntry entry,
+                                                             @NonNull String operationId,
+                                                             @NonNull String localFilePath,
+                                                             @NonNull String expectedSha256,
+                                                             @NonNull String extension,
+                                                             @Nullable UploadControl control) {
+        String safeOperationId = trimToEmpty(operationId);
+        String digest = trimToEmpty(expectedSha256).toLowerCase(Locale.US);
+        String safeExtension = normalizeCodexAttachmentExtension(extension);
+        File localFile = new File(localFilePath);
+        if (entry.transport == SessionTransport.LOCAL || TextUtils.isEmpty(entry.sshCommand)) {
+            return CodexAttachmentUploadResult.fail("当前终端没有可用于附件上传的 SSH 连接。");
+        }
+        if (!localFile.isFile() || localFile.length() <= 0L) {
+            return CodexAttachmentUploadResult.fail("待上传的本地图片不存在或为空。");
+        }
+        if (!isSha256Hex(digest) || safeExtension.isEmpty()) {
+            return CodexAttachmentUploadResult.fail("附件内容标识或图片格式无效。");
+        }
+        try {
+            String actualLocalDigest = computeLocalSha256(
+                localFile, control == null ? null : control::isCancelled);
+            if (!digest.equals(actualLocalDigest)) {
+                return CodexAttachmentUploadResult.fail("本地图片 SHA-256 与内容标识不一致。");
+            }
+        } catch (OperationCanceledException e) {
+            return CodexAttachmentUploadResult.cancelled();
+        } catch (Exception e) {
+            return CodexAttachmentUploadResult.fail("本地图片完整性校验失败：" + classifyExceptionMessage(e));
+        }
+
+        SessionSyncTracer.getInstance().info(context, "SftpProtocolManager", "codexAttachmentStart",
+            safeOperationId, "开始上传 Codex 图片附件",
+            "bytes=" + localFile.length() + " digest=" + digest.substring(0, 12));
+
+        final String[] committedPath = new String[]{""};
+        final boolean[] reused = new boolean[]{false};
+        try {
+            withReconnectRetry(context, entry, channel -> {
+                if (isCancelled(control)) throw new OperationCanceledException();
+                String targetPath = buildCodexAttachmentRemotePath(channel.pwd(), digest, safeExtension);
+                if (TextUtils.isEmpty(targetPath)) {
+                    throw new IllegalStateException("无法解析远端 Codex 附件目录。");
+                }
+                String targetDirectory = parentRemotePath(targetPath);
+                ensureRemoteDirectoryExists(channel, targetDirectory);
+                tryChmod(channel, 0700, targetDirectory);
+                cleanupStaleCodexAttachmentTemps(channel, targetDirectory);
+
+                SftpATTRS existing = statRemoteFileIfPresent(channel, targetPath);
+                if (existing != null) {
+                    if (existing.isDir()) {
+                        throw new IllegalStateException("远端附件路径不是普通文件。");
+                    }
+                    if (existing.isLink()) {
+                        quarantineRemoteCodexAttachment(channel, targetPath);
+                        existing = null;
+                    }
+                }
+                if (existing != null) {
+                    String existingDigest = computeRemoteSha256PreferNative(
+                        context, entry, channel, targetPath, control == null ? null : control::isCancelled);
+                    if (digest.equals(existingDigest) && existing.getSize() == localFile.length()) {
+                        tryChmod(channel, 0600, targetPath);
+                        committedPath[0] = targetPath;
+                        reused[0] = true;
+                        return null;
+                    }
+                    String corruptPath = targetPath + ".corrupt-" + System.currentTimeMillis();
+                    channel.rename(targetPath, corruptPath);
+                }
+
+                String fileName = targetPath.substring(targetPath.lastIndexOf('/') + 1);
+                String tempPath = joinRemotePath(
+                    targetDirectory,
+                    "." + fileName + ".termux-codex-" + TRANSFER_TEMP_COUNTER.getAndIncrement() + ".part");
+                deleteRemoteFileIfExists(channel, tempPath);
+                try {
+                    try (InputStream input = new FileInputStream(localFile);
+                         OutputStream output = channel.put(tempPath, ChannelSftp.OVERWRITE)) {
+                        byte[] buffer = new byte[64 * 1024];
+                        while (true) {
+                            if (isCancelled(control)) throw new OperationCanceledException();
+                            int read = input.read(buffer);
+                            if (read < 0) break;
+                            if (read == 0) continue;
+                            output.write(buffer, 0, read);
+                        }
+                        output.flush();
+                    }
+
+                    SftpATTRS stagedAttrs = channel.stat(tempPath);
+                    if (stagedAttrs == null || stagedAttrs.isDir() || stagedAttrs.getSize() != localFile.length()) {
+                        throw new IllegalStateException("远端附件大小校验失败。");
+                    }
+                    String stagedDigest = computeRemoteSha256PreferNative(
+                        context, entry, channel, tempPath, control == null ? null : control::isCancelled);
+                    if (!digest.equals(stagedDigest)) {
+                        throw new IllegalStateException("远端附件 SHA-256 校验失败。");
+                    }
+                    replaceRemoteFile(channel, tempPath, targetPath);
+                    tryChmod(channel, 0600, targetPath);
+                    SftpATTRS committedAttrs = channel.lstat(targetPath);
+                    if (committedAttrs == null || committedAttrs.isDir() || committedAttrs.isLink() ||
+                        committedAttrs.getSize() != localFile.length()) {
+                        quarantineRemoteCodexAttachment(channel, targetPath);
+                        throw new IllegalStateException("远端附件提交后大小校验失败。");
+                    }
+                    String committedDigest = computeRemoteSha256PreferNative(
+                        context, entry, channel, targetPath, control == null ? null : control::isCancelled);
+                    if (!digest.equals(committedDigest)) {
+                        quarantineRemoteCodexAttachment(channel, targetPath);
+                        throw new IllegalStateException("远端附件提交后 SHA-256 校验失败。");
+                    }
+                    committedPath[0] = targetPath;
+                } catch (Exception e) {
+                    try {
+                        deleteRemoteFileIfExists(channel, tempPath);
+                    } catch (Throwable ignored) {
+                    }
+                    throw e;
+                }
+                return null;
+            });
+        } catch (OperationCanceledException e) {
+            SessionSyncTracer.getInstance().warn(context, "SftpProtocolManager", "codexAttachmentCancelled",
+                safeOperationId, "Codex 图片附件上传已取消", null);
+            return CodexAttachmentUploadResult.cancelled();
+        } catch (Exception e) {
+            clearSessionByEntry(entry);
+            String message = classifyExceptionMessage(e);
+            SessionSyncTracer.getInstance().error(context, "SftpProtocolManager", "codexAttachmentFailed",
+                safeOperationId, "Codex 图片附件上传失败", message);
+            return CodexAttachmentUploadResult.fail("远端图片上传失败：" + message);
+        }
+
+        if (TextUtils.isEmpty(committedPath[0])) {
+            return CodexAttachmentUploadResult.fail("远端图片提交完成但未返回可用路径。");
+        }
+        SessionSyncTracer.getInstance().info(context, "SftpProtocolManager", "codexAttachmentCommitted",
+            safeOperationId, "Codex 图片附件已原子提交",
+            "reused=" + reused[0] +
+                " uploaded_bytes=" + codexAttachmentUploadedBytes(reused[0], localFile.length()) +
+                " digest=" + digest.substring(0, 12));
+        return CodexAttachmentUploadResult.ok(
+            committedPath[0], reused[0], codexAttachmentUploadedBytes(reused[0], localFile.length()));
     }
 
     @NonNull
@@ -3726,6 +3882,100 @@ public final class SftpProtocolManager {
         int slash = normalized.lastIndexOf('/');
         if (slash <= 0) return "/";
         return normalized.substring(0, slash);
+    }
+
+    @Nullable
+    private static SftpATTRS statRemoteFileIfPresent(@NonNull ChannelSftp channel,
+                                                     @NonNull String remotePath) throws Exception {
+        try {
+            return channel.lstat(normalizeRemotePath(remotePath));
+        } catch (SftpException e) {
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) return null;
+            throw e;
+        }
+    }
+
+    private static void tryChmod(@NonNull ChannelSftp channel, int permissions,
+                                 @NonNull String remotePath) {
+        try {
+            channel.chmod(permissions, normalizeRemotePath(remotePath));
+        } catch (Throwable ignored) {
+            // Some SFTP servers do not expose POSIX modes. Their account boundary remains authoritative.
+        }
+    }
+
+    private static void cleanupStaleCodexAttachmentTemps(@NonNull ChannelSftp channel,
+                                                         @NonNull String remoteDirectory) {
+        long cutoff = System.currentTimeMillis() - CODEX_ATTACHMENT_TEMP_RETENTION_MS;
+        try {
+            Vector<?> entries = channel.ls(normalizeRemotePath(remoteDirectory));
+            for (Object row : entries) {
+                if (!(row instanceof ChannelSftp.LsEntry)) continue;
+                ChannelSftp.LsEntry entry = (ChannelSftp.LsEntry) row;
+                String name = entry.getFilename();
+                SftpATTRS attrs = entry.getAttrs();
+                if (TextUtils.isEmpty(name) || attrs == null || attrs.isDir()) continue;
+                if (!name.startsWith(".") || !name.contains(".termux-codex-") || !name.endsWith(".part")) {
+                    continue;
+                }
+                long modifiedMs = Math.max(0L, attrs.getMTime()) * 1000L;
+                if (modifiedMs > 0L && modifiedMs < cutoff) {
+                    channel.rm(joinRemotePath(normalizeRemotePath(remoteDirectory), name));
+                }
+            }
+        } catch (Throwable ignored) {
+            // Cleanup is best-effort and must never block a new verified attachment commit.
+        }
+    }
+
+    private static void quarantineRemoteCodexAttachment(@NonNull ChannelSftp channel,
+                                                        @NonNull String remotePath) {
+        try {
+            String corruptPath = normalizeRemotePath(remotePath) +
+                ".corrupt-" + System.currentTimeMillis() + "-" + TRANSFER_TEMP_COUNTER.getAndIncrement();
+            channel.rename(normalizeRemotePath(remotePath), corruptPath);
+        } catch (Throwable ignored) {
+            try {
+                deleteRemoteFileIfExists(channel, remotePath);
+            } catch (Throwable ignoredAgain) {
+            }
+        }
+    }
+
+    @NonNull
+    static String buildCodexAttachmentRemotePath(@Nullable String remoteHome,
+                                                 @Nullable String sha256,
+                                                 @Nullable String extension) {
+        String digest = trimToEmpty(sha256).toLowerCase(Locale.US);
+        String safeExtension = normalizeCodexAttachmentExtension(extension);
+        if (!isSha256Hex(digest) || safeExtension.isEmpty()) return "";
+        String home = normalizeRemotePath(remoteHome);
+        String directory = home;
+        for (String component : CODEX_ATTACHMENT_REMOTE_RELATIVE_DIR.split("/")) {
+            directory = joinRemotePath(directory, component);
+        }
+        return joinRemotePath(directory, digest + "." + safeExtension);
+    }
+
+    @NonNull
+    private static String normalizeCodexAttachmentExtension(@Nullable String extension) {
+        String value = trimToEmpty(extension).toLowerCase(Locale.US);
+        if ("jpeg".equals(value)) value = "jpg";
+        return "png".equals(value) || "jpg".equals(value) ||
+            "gif".equals(value) || "webp".equals(value) ? value : "";
+    }
+
+    private static boolean isSha256Hex(@Nullable String value) {
+        if (value == null || value.length() != 64) return false;
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+        }
+        return true;
+    }
+
+    static long codexAttachmentUploadedBytes(boolean reused, long contentBytes) {
+        return reused ? 0L : Math.max(0L, contentBytes);
     }
 
     private static void ensureRemoteDirectoryExists(@NonNull ChannelSftp channel,
@@ -6097,6 +6347,42 @@ public final class SftpProtocolManager {
                                           @NonNull ArrayList<String> uploadedVirtualPaths) {
             return new UploadResult(false, totalFiles, uploadedFiles, failedFiles,
                 totalBytes, uploadedBytes, uploadedVirtualPaths, messageCn);
+        }
+    }
+
+    public static final class CodexAttachmentUploadResult {
+        public final boolean success;
+        public final boolean cancelled;
+        public final boolean reused;
+        public final long uploadedBytes;
+        @NonNull public final String remotePath;
+        @NonNull public final String messageCn;
+
+        private CodexAttachmentUploadResult(boolean success, boolean cancelled, boolean reused,
+                                            long uploadedBytes, @NonNull String remotePath,
+                                            @NonNull String messageCn) {
+            this.success = success;
+            this.cancelled = cancelled;
+            this.reused = reused;
+            this.uploadedBytes = Math.max(0L, uploadedBytes);
+            this.remotePath = remotePath;
+            this.messageCn = messageCn;
+        }
+
+        @NonNull
+        static CodexAttachmentUploadResult ok(@NonNull String remotePath, boolean reused,
+                                              long uploadedBytes) {
+            return new CodexAttachmentUploadResult(true, false, reused, uploadedBytes, remotePath, "");
+        }
+
+        @NonNull
+        static CodexAttachmentUploadResult fail(@NonNull String messageCn) {
+            return new CodexAttachmentUploadResult(false, false, false, 0L, "", messageCn);
+        }
+
+        @NonNull
+        static CodexAttachmentUploadResult cancelled() {
+            return new CodexAttachmentUploadResult(false, true, false, 0L, "", "图片上传已取消。");
         }
     }
 

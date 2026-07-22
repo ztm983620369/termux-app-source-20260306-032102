@@ -4,7 +4,9 @@ import android.util.Base64;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Stack;
 
@@ -87,12 +89,17 @@ public final class TerminalEmulator {
     private static final int ESC_CSI_UNSUPPORTED_PARAMETER_BYTE = 22;
     /** Escape processing: ESC [ <parameter bytes> <intermediate bytes> */
     private static final int ESC_CSI_UNSUPPORTED_INTERMEDIATE_BYTE = 23;
+    /** Discard an oversized OSC payload until BEL or ST without rendering its tail. */
+    private static final int ESC_OSC_DISCARD = 24;
+    /** ESC received while discarding an oversized OSC payload. */
+    private static final int ESC_OSC_DISCARD_ESC = 25;
 
     /** The number of parameter arguments including colon separated sub-parameters. */
     private static final int MAX_ESCAPE_PARAMETERS = 32;
 
     /** Needs to be large enough to contain reasonable OSC 52 pastes. */
     private static final int MAX_OSC_STRING_LENGTH = 8192;
+    private static final int MAX_HYPERLINK_CACHE_ENTRIES = 256;
     private static final int OSC_TERMUX_HOST_CONTROL = 8900;
 
     /** DECSET 1 - application cursor keys. */
@@ -130,6 +137,8 @@ public final class TerminalEmulator {
     private static final int DECSET_BIT_LEFTRIGHT_MARGIN_MODE = 1 << 11;
     /** Not really DECSET bit... - http://www.vt100.net/docs/vt510-rm/DECSACE */
     private static final int DECSET_BIT_RECTANGULAR_CHANGEATTRIBUTE = 1 << 12;
+    /** DECSET 2026 - defer presenting screen updates until the mode is reset. */
+    private static final int DECSET_BIT_SYNCHRONIZED_OUTPUT = 1 << 13;
 
 
     private String mTitle;
@@ -188,6 +197,16 @@ public final class TerminalEmulator {
 
     /** Holds OSC and device control arguments, which can be strings. */
     private final StringBuilder mOSCOrDeviceControlArgs = new StringBuilder();
+    /** Current validated OSC 8 target; null outside a semantic hyperlink. */
+    private String mCurrentHyperlink;
+    /** Reuses destinations emitted once per TUI cell without creating one String per cell. */
+    private final LinkedHashMap<String, String> mHyperlinkCache =
+        new LinkedHashMap<String, String>(MAX_HYPERLINK_CACHE_ENTRIES, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                return size() > MAX_HYPERLINK_CACHE_ENTRIES;
+            }
+        };
 
     /**
      * True if the current escape sequence should continue, false if the current escape sequence should be terminated.
@@ -262,8 +281,14 @@ public final class TerminalEmulator {
      * with the scrolling text.
      */
     private int mScrollCounter = 0;
+    private boolean mScrollCounterFullScreen = true;
     /** Set when a state change requires a full viewport redraw rather than dirty-row repaint. */
     private boolean mFullRedrawRequired = true;
+    private TerminalBuffer mSynchronizedOutputBuffer;
+    private int mSynchronizedOutputCursorRow;
+    private int mSynchronizedOutputCursorCol;
+    private int mSynchronizedOutputCursorStyle;
+    private boolean mSynchronizedOutputCursorVisible;
 
     /** If automatic scrolling of terminal is disabled */
     private boolean mAutoScrollDisabled;
@@ -322,6 +347,8 @@ public final class TerminalEmulator {
                 return DECSET_BIT_MOUSE_PROTOCOL_SGR;
             case 2004:
                 return DECSET_BIT_BRACKETED_PASTE_MODE;
+            case 2026:
+                return DECSET_BIT_SYNCHRONIZED_OUTPUT;
             default:
                 return -1;
             // throw new IllegalArgumentException("Unsupported decset: " + decsetBit);
@@ -494,6 +521,51 @@ public final class TerminalEmulator {
         return isDecsetInternalBitSet(DECSET_BIT_SEND_FOCUS_EVENTS);
     }
 
+    /** Whether the child process has suspended visible updates with DECSET 2026. */
+    public boolean isSynchronizedOutputActive() {
+        return isDecsetInternalBitSet(DECSET_BIT_SYNCHRONIZED_OUTPUT);
+    }
+
+    /** Release a synchronized update that exceeded the presentation timeout. */
+    void forceFinishSynchronizedOutput() {
+        finishSynchronizedOutput();
+        setDecsetinternalBit(DECSET_BIT_SYNCHRONIZED_OUTPUT, false);
+    }
+
+    private void beginSynchronizedOutput() {
+        mSynchronizedOutputBuffer = mScreen;
+        mSynchronizedOutputBuffer.beginSynchronizedOutput();
+        mSynchronizedOutputCursorRow = mCursorRow;
+        mSynchronizedOutputCursorCol = mCursorCol;
+        mSynchronizedOutputCursorStyle = mCursorStyle;
+        mSynchronizedOutputCursorVisible = shouldCursorBeVisible();
+    }
+
+    private void finishSynchronizedOutput() {
+        TerminalBuffer synchronizedBuffer = mSynchronizedOutputBuffer;
+        if (synchronizedBuffer == null) return;
+        mSynchronizedOutputBuffer = null;
+
+        if (synchronizedBuffer == mScreen) {
+            synchronizedBuffer.finishSynchronizedOutput();
+        } else {
+            synchronizedBuffer.cancelSynchronizedOutputSnapshot();
+            mScreen.markAllScreenRowsDirty();
+        }
+
+        boolean cursorVisible = shouldCursorBeVisible();
+        boolean cursorChanged = mSynchronizedOutputCursorVisible != cursorVisible ||
+            (cursorVisible && (mSynchronizedOutputCursorRow != mCursorRow ||
+                mSynchronizedOutputCursorCol != mCursorCol ||
+                mSynchronizedOutputCursorStyle != mCursorStyle));
+        if (cursorChanged && synchronizedBuffer == mScreen) {
+            if (mSynchronizedOutputCursorVisible) {
+                mScreen.markDirtyRows(mSynchronizedOutputCursorRow, mSynchronizedOutputCursorRow + 1);
+            }
+            if (cursorVisible) mScreen.markDirtyRows(mCursorRow, mCursorRow + 1);
+        }
+    }
+
     public void onHostWindowFocusChanged(boolean hasFocus) {
         if (!shouldSendFocusEvents()) return;
         mSession.write(hasFocus ? "\033[I" : "\033[O");
@@ -511,8 +583,62 @@ public final class TerminalEmulator {
      * @param length the number of bytes in the array to process
      */
     public void append(byte[] buffer, int length) {
-        for (int i = 0; i < length; i++)
+        for (int i = 0; i < length; ) {
+            int asciiRunLength = findSafeAsciiRun(buffer, i, length);
+            if (asciiRunLength > 0 && emitSafeAsciiRun(buffer, i, asciiRunLength)) {
+                i += asciiRunLength;
+                continue;
+            }
             processByte(buffer[i]);
+            i++;
+        }
+    }
+
+    /** Scalar parser used by differential tests as the semantic reference for batch fast paths. */
+    void appendByteWiseForTesting(byte[] buffer, int length) {
+        for (int i = 0; i < length; i++) {
+            processByte(buffer[i]);
+        }
+    }
+
+    private int findSafeAsciiRun(byte[] buffer, int offset, int length) {
+        if (!canEmitSafeAsciiRun()) return 0;
+
+        int maxRunLength = Math.min(length - offset, mRightMargin - 1 - mCursorCol);
+        int runLength = 0;
+        while (runLength < maxRunLength) {
+            int b = buffer[offset + runLength] & 0xff;
+            if (b < 0x20 || b >= 0x7f) break;
+            runLength++;
+        }
+        return runLength;
+    }
+
+    private boolean canEmitSafeAsciiRun() {
+        return mEscapeState == ESC_NONE
+            && mUtf8ToFollow == 0
+            && !mInsertMode
+            && !mAboutToAutoWrap
+            && mCursorCol < mRightMargin - 1
+            && mLeftMargin == 0
+            && mRightMargin == mColumns
+            && isDecsetInternalBitSet(DECSET_BIT_AUTOWRAP)
+            && !(mUseLineDrawingUsesG0 ? mUseLineDrawingG0 : mUseLineDrawingG1);
+    }
+
+    private boolean emitSafeAsciiRun(byte[] buffer, int offset, int length) {
+        if (length <= 0) return false;
+        if (!mScreen.setAsciiRunIfSimple(
+            mCursorCol, mCursorRow, buffer, offset, length, getStyle(), mCurrentHyperlink)) {
+            return false;
+        }
+        // processCodePoint() clears this before every printable scalar character. Keep the batch
+        // path bit-for-bit equivalent so a preceding escape parser continuation cannot leak.
+        mContinueSequence = false;
+        mLastEmittedCodePoint = buffer[offset + length - 1] & 0x7f;
+        mCursorCol += length;
+        mAboutToAutoWrap = false;
+        return true;
     }
 
     private void processByte(byte byteToProcess) {
@@ -588,6 +714,9 @@ public final class TerminalEmulator {
         } else if (mEscapeState == ESC_APC_ESCAPE) {
             doApcEscape(b);
             return;
+        } else if (mEscapeState == ESC_OSC_DISCARD || mEscapeState == ESC_OSC_DISCARD_ESC) {
+            doOscDiscard(b);
+            return;
         }
 
         switch (b) {
@@ -607,7 +736,7 @@ public final class TerminalEmulator {
                         mScreen.clearLineWrap(previousRow);
                         setCursorRowCol(previousRow, mRightMargin - 1);
                     }
-                } else {
+                } else if (mCursorCol > 0) {
                     setCursorCol(mCursorCol - 1);
                 }
                 break;
@@ -1198,6 +1327,11 @@ public final class TerminalEmulator {
 
     public void doDecSetOrReset(boolean setting, int externalBit) {
         int internalBit = mapDecSetBitToInternalBit(externalBit);
+        if (externalBit == 2026) {
+            boolean wasActive = isSynchronizedOutputActive();
+            if (setting && !wasActive) beginSynchronizedOutput();
+            else if (!setting && wasActive) finishSynchronizedOutput();
+        }
         if (internalBit != -1) {
             setDecsetinternalBit(internalBit, setting);
         }
@@ -1291,6 +1425,9 @@ public final class TerminalEmulator {
             }
             case 2004:
                 // Bracketed paste mode - setting bit is enough.
+                break;
+            case 2026:
+                // Synchronized output - TerminalSession defers screen notifications while set.
                 break;
             default:
                 unknownParameter(externalBit);
@@ -2020,6 +2157,16 @@ public final class TerminalEmulator {
         }
     }
 
+    private void doOscDiscard(int b) {
+        if (b == 7 || (mEscapeState == ESC_OSC_DISCARD_ESC && b == '\\')) {
+            finishSequence();
+        } else if (b == 27) {
+            continueSequence(ESC_OSC_DISCARD_ESC);
+        } else {
+            continueSequence(ESC_OSC_DISCARD);
+        }
+    }
+
     private void doOscEsc(int b) {
         switch (b) {
             case '\\':
@@ -2096,6 +2243,9 @@ public final class TerminalEmulator {
                     }
                     if (endOfInput) break;
                 }
+                break;
+            case 8: // OSC 8 ; params ; URI ST - semantic terminal hyperlink.
+                setOsc8Hyperlink(textParameter);
                 break;
             case 10: // Set foreground color.
             case 11: // Set background color.
@@ -2183,6 +2333,25 @@ public final class TerminalEmulator {
         finishSequence();
     }
 
+    private void setOsc8Hyperlink(String textParameter) {
+        // Every OSC 8 command replaces the previous state. Malformed or unsafe targets close it,
+        // preventing a stale destination from leaking onto later terminal output.
+        mCurrentHyperlink = null;
+        int separator = textParameter.indexOf(';');
+        if (separator < 0 || separator + 1 >= textParameter.length()) return;
+
+        String normalized = TerminalLinkResolver.normalizeSemanticUrl(
+            textParameter.substring(separator + 1));
+        if (normalized == null) return;
+
+        String cached = mHyperlinkCache.get(normalized);
+        if (cached == null) {
+            mHyperlinkCache.put(normalized, normalized);
+            cached = normalized;
+        }
+        mCurrentHyperlink = cached;
+    }
+
     private void blockClear(int sx, int sy, int w) {
         blockClear(sx, sy, w, 1);
     }
@@ -2250,6 +2419,8 @@ public final class TerminalEmulator {
     }
 
     private void scrollDownOneLine() {
+        boolean fullScreenScroll = mTopMargin == 0 && mBottomMargin == mRows && mLeftMargin == 0 && mRightMargin == mColumns;
+        mScrollCounterFullScreen &= fullScreenScroll;
         mScrollCounter++;
         long currentStyle = getStyle();
         if (mLeftMargin != 0 || mRightMargin != mColumns) {
@@ -2329,11 +2500,13 @@ public final class TerminalEmulator {
     }
 
     private void collectOSCArgs(int b) {
-        if (mOSCOrDeviceControlArgs.length() < MAX_OSC_STRING_LENGTH) {
+        if (mOSCOrDeviceControlArgs.length() + Character.charCount(b) <= MAX_OSC_STRING_LENGTH) {
             mOSCOrDeviceControlArgs.appendCodePoint(b);
             continueSequence(mEscapeState);
         } else {
-            unknownSequence(b);
+            if (mOSCOrDeviceControlArgs.indexOf("8;") == 0) mCurrentHyperlink = null;
+            mOSCOrDeviceControlArgs.setLength(0);
+            continueSequence(ESC_OSC_DISCARD);
         }
     }
 
@@ -2533,7 +2706,7 @@ public final class TerminalEmulator {
         // so was mCursorCol changed after the offsetDueToCombiningChar conditional by another thread?
         // TODO: Check if there are thread synchronization issues with mCursorCol and mCursorRow, possibly causing others bugs too.
         if (column < 0) column = 0;
-        mScreen.setChar(column, mCursorRow, codePoint, getStyle());
+        mScreen.setChar(column, mCursorRow, codePoint, getStyle(), mCurrentHyperlink);
 
         if (autoWrap && displayWidth > 0)
             mAboutToAutoWrap = (mCursorCol == mRightMargin - displayWidth);
@@ -2547,7 +2720,7 @@ public final class TerminalEmulator {
     }
 
     private void setCursorCol(int col) {
-        mCursorCol = col;
+        mCursorCol = Math.max(0, Math.min(col, mColumns - 1));
         mAboutToAutoWrap = false;
     }
 
@@ -2567,8 +2740,13 @@ public final class TerminalEmulator {
         return mScrollCounter;
     }
 
+    public boolean isScrollCounterFullScreen() {
+        return mScrollCounterFullScreen;
+    }
+
     public void clearScrollCounter() {
         mScrollCounter = 0;
+        mScrollCounterFullScreen = true;
     }
 
     public boolean isFullRedrawRequired() {
@@ -2590,10 +2768,13 @@ public final class TerminalEmulator {
 
     /** Reset terminal state so user can interact with it regardless of present state. */
     public void reset() {
+        if (isSynchronizedOutputActive()) forceFinishSynchronizedOutput();
         setCursorStyle();
         mArgIndex = 0;
         mContinueSequence = false;
         mEscapeState = ESC_NONE;
+        mCurrentHyperlink = null;
+        mHyperlinkCache.clear();
         mInsertMode = false;
         mTopMargin = mLeftMargin = 0;
         mBottomMargin = mRows;

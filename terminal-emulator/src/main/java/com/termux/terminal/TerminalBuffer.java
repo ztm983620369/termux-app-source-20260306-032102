@@ -1,6 +1,7 @@
 package com.termux.terminal;
 
 import java.util.Arrays;
+import java.util.Objects;
 
 /**
  * A circular buffer of {@link TerminalRow}:s which keeps notes about what is visible on a logical screen and the scroll
@@ -25,6 +26,13 @@ public final class TerminalBuffer {
     /** Dirty visible screen rows tracked as [start, end). */
     private int mDirtyStartRow = Integer.MAX_VALUE;
     private int mDirtyEndRow = Integer.MIN_VALUE;
+    private volatile long mContentRevision;
+    private long[] mSynchronizedOutputRowHashes;
+    private int mSynchronizedOutputRows;
+    private int mSynchronizedOutputColumns;
+    private int mDirtyStartBeforeSynchronizedOutput;
+    private int mDirtyEndBeforeSynchronizedOutput;
+    private boolean mSynchronizedOutputSnapshotActive;
 
     /**
      * Create a transcript screen.
@@ -190,6 +198,11 @@ public final class TerminalBuffer {
         return hasDirtyRows() ? mDirtyEndRow : 0;
     }
 
+    /** Monotonic signal for text, style, row-order, or wrapping changes in this buffer. */
+    public long getContentRevision() {
+        return mContentRevision;
+    }
+
     public void clearDirtyRows() {
         mDirtyStartRow = Integer.MAX_VALUE;
         mDirtyEndRow = Integer.MIN_VALUE;
@@ -204,8 +217,48 @@ public final class TerminalBuffer {
         if (startRow < 0) startRow = 0;
         if (endRow > mScreenRows) endRow = mScreenRows;
         if (endRow <= startRow) return;
+        mContentRevision++;
         if (startRow < mDirtyStartRow) mDirtyStartRow = startRow;
         if (endRow > mDirtyEndRow) mDirtyEndRow = endRow;
+    }
+
+    void beginSynchronizedOutput() {
+        if (mSynchronizedOutputSnapshotActive) return;
+        if (mSynchronizedOutputRowHashes == null || mSynchronizedOutputRowHashes.length < mScreenRows) {
+            mSynchronizedOutputRowHashes = new long[mScreenRows];
+        }
+        mSynchronizedOutputRows = mScreenRows;
+        mSynchronizedOutputColumns = mColumns;
+        mDirtyStartBeforeSynchronizedOutput = mDirtyStartRow;
+        mDirtyEndBeforeSynchronizedOutput = mDirtyEndRow;
+        for (int row = 0; row < mScreenRows; row++) {
+            TerminalRow line = allocateFullLineIfNecessary(externalToInternalRow(row));
+            mSynchronizedOutputRowHashes[row] = line.getContentHash();
+        }
+        mSynchronizedOutputSnapshotActive = true;
+    }
+
+    void finishSynchronizedOutput() {
+        if (!mSynchronizedOutputSnapshotActive) return;
+        mSynchronizedOutputSnapshotActive = false;
+
+        clearDirtyRows();
+        markDirtyRows(mDirtyStartBeforeSynchronizedOutput, mDirtyEndBeforeSynchronizedOutput);
+        if (mScreenRows != mSynchronizedOutputRows || mColumns != mSynchronizedOutputColumns) {
+            markAllScreenRowsDirty();
+            return;
+        }
+
+        for (int row = 0; row < mScreenRows; row++) {
+            TerminalRow line = allocateFullLineIfNecessary(externalToInternalRow(row));
+            if (line.getContentHash() != mSynchronizedOutputRowHashes[row]) {
+                markDirtyRows(row, row + 1);
+            }
+        }
+    }
+
+    void cancelSynchronizedOutputSnapshot() {
+        mSynchronizedOutputSnapshotActive = false;
     }
 
     /**
@@ -237,7 +290,11 @@ public final class TerminalBuffer {
     }
 
     public void setLineWrap(int row) {
-        mLines[externalToInternalRow(row)].mLineWrap = true;
+        TerminalRow line = mLines[externalToInternalRow(row)];
+        if (!line.mLineWrap) {
+            line.mLineWrap = true;
+            mContentRevision++;
+        }
     }
 
     public boolean getLineWrap(int row) {
@@ -245,7 +302,11 @@ public final class TerminalBuffer {
     }
 
     public void clearLineWrap(int row) {
-        mLines[externalToInternalRow(row)].mLineWrap = false;
+        TerminalRow line = mLines[externalToInternalRow(row)];
+        if (line.mLineWrap) {
+            line.mLineWrap = false;
+            mContentRevision++;
+        }
     }
 
     /**
@@ -354,13 +415,17 @@ public final class TerminalBuffer {
 
                 int currentOldCol = 0;
                 long styleAtCol = 0;
+                String hyperlinkAtCol = null;
                 for (int i = 0; i < lastNonSpaceIndex; i++) {
                     // Note that looping over java character, not cells.
                     char c = oldLine.mText[i];
                     int codePoint = (Character.isHighSurrogate(c)) ? Character.toCodePoint(c, oldLine.mText[++i]) : c;
                     int displayWidth = WcWidth.width(codePoint);
                     // Use the last style if this is a zero-width character:
-                    if (displayWidth > 0) styleAtCol = oldLine.getStyle(currentOldCol);
+                    if (displayWidth > 0) {
+                        styleAtCol = oldLine.getStyle(currentOldCol);
+                        hyperlinkAtCol = oldLine.getHyperlink(currentOldCol);
+                    }
 
                     // Line wrap as necessary:
                     if (currentOutputExternalColumn + displayWidth > mColumns) {
@@ -376,7 +441,7 @@ public final class TerminalBuffer {
 
                     int offsetDueToCombiningChar = ((displayWidth <= 0 && currentOutputExternalColumn > 0) ? 1 : 0);
                     int outputColumn = currentOutputExternalColumn - offsetDueToCombiningChar;
-                    setChar(outputColumn, currentOutputExternalRow, codePoint, styleAtCol);
+                    setChar(outputColumn, currentOutputExternalRow, codePoint, styleAtCol, hyperlinkAtCol);
 
                     if (displayWidth > 0) {
                         if (oldCursorRow == externalOldRow && oldCursorColumn == currentOldCol) {
@@ -606,6 +671,7 @@ public final class TerminalBuffer {
                 if (!line.mHasNonOneWidthOrSurrogateChars) {
                     Arrays.fill(line.mText, sx, sx + w, ' ');
                     Arrays.fill(line.mStyle, sx, sx + w, style);
+                    line.clearHyperlinks(sx, sx + w);
                 } else {
                     for (int x = 0; x < w; x++) {
                         setChar(sx + x, sy + y, val, style);
@@ -625,15 +691,59 @@ public final class TerminalBuffer {
     }
 
     public void setChar(int column, int row, int codePoint, long style) {
+        setChar(column, row, codePoint, style, null);
+    }
+
+    void setChar(int column, int row, int codePoint, long style, String hyperlink) {
         if (row  < 0 || row >= mScreenRows || column < 0 || column >= mColumns)
             throw new IllegalArgumentException("TerminalBuffer.setChar(): row=" + row + ", column=" + column + ", mScreenRows=" + mScreenRows + ", mColumns=" + mColumns);
+        int internalRow = externalToInternalRow(row);
+        TerminalRow line = allocateFullLineIfNecessary(internalRow);
+        if (line.hasOnlyOneWidthCharacters() && codePoint < Character.MIN_SUPPLEMENTARY_CODE_POINT &&
+            WcWidth.width(codePoint) == 1 && line.mText[column] == (char) codePoint &&
+            line.getStyle(column) == style && Objects.equals(line.getHyperlink(column), hyperlink)) {
+            return;
+        }
         markDirtyRows(row, row + 1);
-        row = externalToInternalRow(row);
-        allocateFullLineIfNecessary(row).setChar(column, codePoint, style);
+        line.setChar(column, codePoint, style, hyperlink);
+    }
+
+    boolean setAsciiRunIfSimple(int column, int row, byte[] bytes, int offset, int length,
+                                long style) {
+        return setAsciiRunIfSimple(column, row, bytes, offset, length, style, null);
+    }
+
+    boolean setAsciiRunIfSimple(int column, int row, byte[] bytes, int offset, int length,
+                                long style, String hyperlink) {
+        if (row < 0 || row >= mScreenRows || column < 0 || length < 0 || column + length > mColumns)
+            throw new IllegalArgumentException("TerminalBuffer.setAsciiRunIfSimple(): row=" + row + ", column=" + column + ", length=" + length + ", mScreenRows=" + mScreenRows + ", mColumns=" + mColumns);
+        if (length == 0) return true;
+
+        TerminalRow line = allocateFullLineIfNecessary(externalToInternalRow(row));
+        if (line.mHasNonOneWidthOrSurrogateChars) return false;
+        boolean changed = false;
+        for (int i = 0; i < length; i++) {
+            if (line.mText[column + i] != (char) (bytes[offset + i] & 0x7f) ||
+                line.getStyle(column + i) != style ||
+                !Objects.equals(line.getHyperlink(column + i), hyperlink)) {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) return true;
+        line.setAsciiRun(column, bytes, offset, length, style, hyperlink);
+        markDirtyRows(row, row + 1);
+        return true;
     }
 
     public long getStyleAt(int externalRow, int column) {
         return allocateFullLineIfNecessary(externalToInternalRow(externalRow)).getStyle(column);
+    }
+
+    public String getHyperlinkAt(int externalRow, int column) {
+        if (externalRow < -mActiveTranscriptRows || externalRow >= mScreenRows ||
+            column < 0 || column >= mColumns) return null;
+        return allocateFullLineIfNecessary(externalToInternalRow(externalRow)).getHyperlink(column);
     }
 
     /** Support for http://vt100.net/docs/vt510-rm/DECCARA and http://vt100.net/docs/vt510-rm/DECCARA */

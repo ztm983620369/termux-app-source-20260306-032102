@@ -3,6 +3,12 @@
     <string name="extensions_hub_subtitle">这是独立模块接入的扩展页骨架，后续能力会继续从这里分发。</string>
     <string name="extensions_hub_status_idle">状态：已加载，等待进入</string>
     <string name="extensions_hub_status_ready">状态：扩展模块已运行</string>
+    <string name="extensions_hub_status_picture_selector_opened">状态：已打开 PictureSelector</string>
+    <string name="extensions_hub_status_picture_selector_failed">状态：PictureSelector 打开失败</string>
+    <string name="extensions_hub_status_shadow_opened">状态：已打开 Shadow 宿主</string>
+    <string name="extensions_hub_status_shadow_failed">状态：Shadow 宿主打开失败</string>
+    <string name="extensions_hub_picture_selector_button">打开 PictureSelector</string>
+    <string name="extensions_hub_shadow_miniapps_button">打开 Shadow 宿主</string>
     <string name="extensions_hub_card_title_one">模块化入口</string>
     <string name="extensions_hub_card_body_one">当前页面来自独立的 Android library 模块，不再直接堆在 app 宿主里。</string>
     <string name="extensions_hub_card_title_two">后续可扩展</string>

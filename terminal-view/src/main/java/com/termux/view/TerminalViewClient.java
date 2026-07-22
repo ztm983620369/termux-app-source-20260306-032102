@@ -37,6 +37,9 @@ public interface TerminalViewClient {
      */
     void onTextInputTap(MotionEvent e);
 
+    /** Open a URL already validated by the terminal link resolver. */
+    void onOpenUrl(String url);
+
     boolean shouldTerminalViewRequestFocusOnTap();
 
     boolean shouldBackButtonBeMappedToEscape();

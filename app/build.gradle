@@ -24,6 +24,10 @@ ext {
 configurations.all {
     exclude group: "com.google.code.findbugs", module: "jsr305"
     exclude group: "org.codehaus.mojo", module: "animal-sniffer-annotations"
+    // Termux uses Guava MoreFiles/RecursiveDeleteOption during Application startup.
+    // PictureSelector's ExoPlayer dependency otherwise resolves Guava to an android
+    // artifact that omits those java.nio.file helpers.
+    resolutionStrategy.force "com.google.guava:guava:31.1-jre"
 }
 
 android {
@@ -43,7 +47,7 @@ android {
         implementation "androidx.preference:preference:1.2.1"
         implementation "androidx.viewpager:viewpager:1.0.0"
         implementation "com.google.android.material:material:1.12.0"
-        implementation "com.google.guava:guava:24.1-jre"
+        implementation "com.google.guava:guava:31.1-jre"
         implementation "io.coil-kt:coil:2.6.0"
         implementation "io.noties.markwon:core:$markwonVersion"
         implementation "io.noties.markwon:ext-strikethrough:$markwonVersion"
@@ -55,6 +59,7 @@ android {
         implementation project(":termux-shared")
         implementation project(":terminal-tabs")
         implementation project(":extensions-hub")
+        implementation project(":shadow-termux-host")
         implementation project(":terminal-session-surface")
         implementation project(":terminal-session-core")
         implementation project(":terminal-session-runtime")
@@ -68,6 +73,12 @@ android {
         implementation project(":file-bridge")
         implementation project(":file-manager")
         implementation project(":fossify-commons")
+        implementation project(":pictureselector-selector")
+        implementation project(":pictureselector-ucrop")
+        implementation project(":pictureselector-compress")
+        implementation project(":pictureselector-camerax")
+        implementation project(":pictureselector-ijkplayer-java")
+        implementation project(":pictureselector-app-source")
     }
 
     defaultConfig {
@@ -75,6 +86,7 @@ android {
         targetSdkVersion project.properties.targetSdkVersion.toInteger()
         versionCode 118
         versionName "0.118.0"
+        testInstrumentationRunner "com.termux.shadow.ShadowProbeInstrumentation"
 
         if (appVersionName) versionName = appVersionName
         validateVersionName(versionName)
@@ -105,6 +117,21 @@ android {
                 include 'x86', 'x86_64', 'armeabi-v7a', 'arm64-v8a'
                 universalApk true
             }
+        }
+    }
+
+    sourceSets {
+        main {
+            assets.srcDir("$buildDir/generated/assets/shadow-tooling")
+        }
+        debug {
+            assets.srcDir("$buildDir/generated/assets/shadow-host/debug")
+        }
+        release {
+            assets.srcDir("$buildDir/generated/assets/shadow-host/release")
+        }
+        releaseOptimized {
+            assets.srcDir("$buildDir/generated/assets/shadow-host/release")
         }
     }
 
@@ -195,6 +222,159 @@ dependencies {
     testImplementation "junit:junit:4.13.2"
     testImplementation "org.robolectric:robolectric:4.10"
     coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
+}
+
+def shadowSourceDir = rootProject.file("third_party/Shadow")
+def shadowGradle = new File(shadowSourceDir, "gradlew")
+def shadowCliDir = rootProject.file("termux-shadow-cli")
+def shadowTemplateDir = rootProject.file("termux-shadow-basic-plugin")
+def shadowToolingAssetRoot = layout.buildDirectory.dir(
+    "generated/assets/shadow-tooling/shadow-plugin-tooling"
+)
+
+def registerShadowBuildTask = { String buildType ->
+    def capitalized = buildType.capitalize()
+    return tasks.register("buildShadow${capitalized}HostManagerArtifact", Exec) {
+        group = "shadow"
+        description = "Build Tencent Shadow manager artifact from in-tree source for ${buildType}."
+        workingDir shadowSourceDir
+        commandLine shadowGradle.absolutePath,
+            ":sample-manager:assemble${capitalized}"
+
+        inputs.files(fileTree(shadowSourceDir) {
+            include "build.gradle"
+            include "settings.gradle"
+            include "buildScripts/**"
+            include "projects/sdk/**"
+            include "projects/sample/source/sample-constant/**"
+            include "projects/sample/source/sample-host-lib/**"
+            include "projects/sample/source/sample-manager/**"
+            include "projects/sample/source/sample-plugin/sample-loader/**"
+            include "projects/sample/source/sample-plugin/sample-runtime/**"
+            exclude "**/build/**"
+            exclude "**/.gradle/**"
+        })
+        outputs.files(
+            new File(shadowSourceDir, "projects/sample/source/sample-manager/build/outputs/apk/${buildType}/sample-manager-${buildType}.apk")
+        )
+    }
+}
+
+def copyShadowAssetsTasks = [:]
+["debug", "release"].each { buildType ->
+    def capitalized = buildType.capitalize()
+    def buildShadowArtifacts = registerShadowBuildTask(buildType)
+    copyShadowAssetsTasks[buildType] = tasks.register("copyShadow${capitalized}HostManagerAssets", Copy) {
+        group = "shadow"
+        description = "Copy Tencent Shadow ${buildType} host manager artifact into Termux APK assets."
+        dependsOn buildShadowArtifacts
+
+        from(new File(shadowSourceDir, "projects/sample/source/sample-manager/build/outputs/apk/${buildType}/sample-manager-${buildType}.apk")) {
+            rename { "pluginmanager.apk" }
+        }
+        into(layout.buildDirectory.dir("generated/assets/shadow-host/${buildType}"))
+    }
+}
+
+def shadowToolingTemplateFiles = fileTree(shadowTemplateDir) {
+    exclude ".gradle/**"
+    exclude "build/**"
+    exclude "dist/**"
+    exclude "local.properties"
+    exclude "plugin-app/build/**"
+}
+
+def buildShadowPluginNative = tasks.register("buildShadowPluginNative", Exec) {
+    group = "shadow"
+    description = "Build the ARM64 native Shadow plugin CLI embedded in Termux."
+    workingDir shadowCliDir
+    commandLine new File(shadowCliDir, "scripts/build-android.sh").absolutePath
+
+    inputs.files(fileTree(shadowCliDir) {
+        include "Cargo.toml"
+        include "Cargo.lock"
+        include "src/**"
+        include "scripts/build-android.sh"
+    })
+    outputs.file(new File(shadowCliDir, "dist/shadow-plugin"))
+}
+
+def copyShadowPluginToolingAssets = tasks.register("copyShadowPluginToolingAssets", Sync) {
+    group = "shadow"
+    description = "Stage the native CLI and canonical plugin template as APK assets."
+    dependsOn buildShadowPluginNative
+
+    from(new File(shadowCliDir, "dist/shadow-plugin")) {
+        into "aarch64"
+    }
+    from(shadowToolingTemplateFiles) {
+        into "template"
+    }
+    into(shadowToolingAssetRoot)
+}
+
+def writeShadowPluginToolingManifest = tasks.register("writeShadowPluginToolingManifest") {
+    group = "shadow"
+    description = "Write content fingerprints for in-app Shadow tooling upgrades."
+    dependsOn copyShadowPluginToolingAssets
+    inputs.file(new File(shadowCliDir, "dist/shadow-plugin"))
+    inputs.files(shadowToolingTemplateFiles)
+    outputs.file(shadowToolingAssetRoot.map { it.file("manifest.properties") })
+
+    doLast {
+        def digestFile = { File file ->
+            def digest = java.security.MessageDigest.getInstance("SHA-256")
+            file.withInputStream { input ->
+                byte[] buffer = new byte[64 * 1024]
+                int read
+                while ((read = input.read(buffer)) != -1) {
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+        }
+        def templateDigest = java.security.MessageDigest.getInstance("SHA-256")
+        shadowToolingTemplateFiles.files
+            .findAll { it.isFile() }
+            .sort { left, right ->
+                shadowTemplateDir.toPath().relativize(left.toPath()).toString() <=>
+                    shadowTemplateDir.toPath().relativize(right.toPath()).toString()
+            }
+            .each { file ->
+                String relative = shadowTemplateDir.toPath().relativize(file.toPath())
+                    .toString().replace(File.separatorChar, '/' as char)
+                templateDigest.update(relative.getBytes("UTF-8"))
+                templateDigest.update((byte) 0)
+                file.withInputStream { input ->
+                    byte[] buffer = new byte[64 * 1024]
+                    int read
+                    while ((read = input.read(buffer)) != -1) {
+                        templateDigest.update(buffer, 0, read)
+                    }
+                }
+            }
+        String cliVersion = (new File(shadowCliDir, "Cargo.toml").getText("UTF-8") =~
+            /(?m)^version\s*=\s*"([^"]+)"\s*$/)[0][1]
+        File output = shadowToolingAssetRoot.get().file("manifest.properties").asFile
+        output.parentFile.mkdirs()
+        output.setText(
+            "schemaVersion=1\n" +
+                "cliVersion=${cliVersion}\n" +
+                "cliSha256=${digestFile(new File(shadowCliDir, 'dist/shadow-plugin'))}\n" +
+                "templateSha256=${templateDigest.digest().collect { String.format('%02x', it & 0xff) }.join()}\n",
+            "UTF-8"
+        )
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name == "generateDebugAssets") {
+        task.dependsOn(copyShadowAssetsTasks.debug, writeShadowPluginToolingManifest)
+    } else if (task.name == "generateReleaseAssets") {
+        task.dependsOn(copyShadowAssetsTasks.release, writeShadowPluginToolingManifest)
+    } else if (task.name == "generateReleaseOptimizedAssets") {
+        task.dependsOn(copyShadowAssetsTasks.release, writeShadowPluginToolingManifest)
+    }
 }
 
 task versionName {

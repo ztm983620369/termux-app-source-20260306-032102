@@ -1,0 +1,21 @@
+<resources>
+
+    <!-- Base application theme. -->
+    <style name="AppTheme" parent="BaseNoActionBarTheme">
+        <!-- Customize your theme here. -->
+        <item name="colorPrimary">@color/app_color_grey</item>
+        <item name="colorPrimaryDark">@color/app_color_grey</item>
+        <item name="colorAccent">@color/app_color_grey</item>
+    </style>
+
+    <style name="BaseNoActionBarTheme" parent="Theme.AppCompat.Light.NoActionBar" />
+
+    <style name="Termux.PictureSelector.SourceTheme" parent="BaseNoActionBarTheme">
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowDisablePreview">true</item>
+    </style>
+
+</resources>

@@ -2,6 +2,7 @@ package com.termux.app;
 
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -13,6 +14,7 @@ import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
@@ -36,8 +38,11 @@ import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.ProgressBar;
 import android.widget.RelativeLayout;
+import android.widget.TextView;
 
 import com.termux.BuildConfig;
 import com.termux.R;
@@ -45,6 +50,7 @@ import com.termux.app.api.file.FileReceiverActivity;
 import com.termux.app.editor.EditorTerminalWorkspaceController;
 import com.termux.app.topbar.TerminalTopBarController;
 import com.termux.app.topbar.TerminalTopBarView;
+import com.termux.app.terminal.CodexImageAttachmentController;
 import com.termux.app.terminal.TerminalSessionSelectionStateMachine;
 import com.termux.app.terminal.TermuxActivityRootView;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
@@ -81,7 +87,6 @@ import com.termux.shared.view.KeyboardUtils;
 import com.termux.shared.view.ViewUtils;
 import com.termux.shared.termux.shell.command.runner.terminal.TermuxSession;
 import com.termux.terminal.TerminalSession;
-import com.termux.terminal.TextStyle;
 import com.termux.terminal.TerminalSessionClient;
 import com.termux.view.TerminalView;
 import com.termux.view.TerminalViewClient;
@@ -92,6 +97,8 @@ import com.termux.bridge.FileEditorContract;
 import com.termux.bridge.FileOpenEvent;
 import com.termux.bridge.FileOpenRequest;
 import com.termux.extensionshub.ExtensionsHubController;
+import com.luck.pictureselector.TermuxPictureSelectorLauncher;
+import com.termux.terminalsessioncore.CodexImageAttachmentStateMachine;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -126,6 +133,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 
 /**
  * A terminal emulator activity.
@@ -138,6 +146,8 @@ import java.util.LinkedHashSet;
  * about memory leaks.
  */
 public final class TermuxActivity extends SimpleActivity implements ServiceConnection, FileOpenListener, FileManagerHost, EditorEmbeddedTerminalHost {
+
+    private static final int TERMINAL_CHROME_BACKGROUND_COLOR = 0xFF000000;
 
     /**
      * The connection to the {@link TermuxService}. Requested in {@link #onCreate(Bundle)} with a call to
@@ -268,6 +278,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private static final int CONTEXT_MENU_HELP_ID = 7;
     private static final int CONTEXT_MENU_SETTINGS_ID = 8;
     private static final int CONTEXT_MENU_REPORT_ID = 9;
+    private static final int CONTEXT_MENU_CODEX_IMAGE_ID = 12;
 
     private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
     private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
@@ -317,6 +328,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     private boolean mTerminalSessionSurfaceHasSnapshot = false;
     private boolean mBottomNavFixedOnImeEnabled = true;
     private boolean mSessionListUiUpdateScheduled = false;
+    private boolean mTerminalTopBarPreviewRefreshScheduled = false;
     private boolean mTerminalSoftKeyboardVisibilityKnown = false;
     private boolean mTerminalSoftKeyboardVisible = false;
     private boolean mTerminalRestoreFocus = false;
@@ -326,6 +338,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     @Nullable private String mTerminalConfigTmuxErrorMessage;
     private boolean mTerminalConfigTmuxLoading = false;
     private boolean mTerminalConfigTmuxMissing = false;
+    @Nullable private Dialog mCodexImageProcessingDialog;
+    @Nullable private TextView mCodexImageProcessingText;
+    @Nullable private String mCodexImageProcessingOperationId;
+    @Nullable private String mLastPresentedCodexImageTerminalOperationId;
+    @NonNull private final CodexImageAttachmentController.UiListener mCodexImageAttachmentUiListener =
+        this::onCodexImageAttachmentChanged;
     @NonNull
     private final ArrayList<TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem> mTerminalConfigTmuxSessions = new ArrayList<>();
     private int mSessionUiBatchDepth = 0;
@@ -339,6 +357,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         }
         refreshTerminalSessionSurface();
         refreshTerminalTopBar();
+    };
+    private final Runnable mCoalescedTerminalTopBarPreviewRefresh = () -> {
+        mTerminalTopBarPreviewRefreshScheduled = false;
+        if (mIsInvalidState) return;
+        renderTerminalTopBar(false);
     };
 
     private static final String ARG_FILE_MANAGER_STATE = "file_manager_state";
@@ -555,6 +578,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         if (mTermuxService != null && mTermuxTerminalSessionActivityClient != null) {
             mTermuxService.setTermuxTerminalSessionClient(mTermuxTerminalSessionActivityClient);
         }
+        attachCodexImageAttachmentUi();
 
         if (mTermuxTerminalSessionActivityClient != null)
             mTermuxTerminalSessionActivityClient.onStart();
@@ -575,6 +599,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         Logger.logVerbose(LOG_TAG, "onResume");
 
         if (mIsInvalidState) return;
+
+        attachCodexImageAttachmentUi();
 
         if (mTerminalSessionSurfaceView != null && mPreferences != null) {
             mTerminalSessionSurfaceView.setFullScreenSessionSwipeEnabled(mPreferences.isTerminalFullScreenSwipeEnabled());
@@ -602,6 +628,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
 
         if (mTermuxTerminalSessionActivityClient != null)
             mTermuxTerminalSessionActivityClient.onResume();
+
+        if (isTerminalSurfaceActive() && mTerminalSessionSurfaceView != null)
+            mTerminalSessionSurfaceView.onHostVisible();
 
         if (mTermuxTerminalViewClient != null)
             mTermuxTerminalViewClient.onResume();
@@ -727,6 +756,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mTermuxTerminalViewClient.onStop();
 
         if (mTermuxService != null) {
+            mTermuxService.getCodexImageAttachmentController()
+                .detachUiListener(mCodexImageAttachmentUiListener);
             mTermuxService.unsetTermuxTerminalSessionClient();
         }
 
@@ -747,6 +778,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         Logger.logDebug(LOG_TAG, "onDestroy");
         cancelCoalescedSessionListUiUpdate();
         unregisterDownloadedApkCleanupReceiver();
+        dismissCodexImageProcessingDialog();
 
         if (mIsInvalidState) return;
 
@@ -755,6 +787,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         FileOpenBridge.removeListener(this);
 
         if (mTermuxService != null) {
+            mTermuxService.getCodexImageAttachmentController()
+                .detachUiListener(mCodexImageAttachmentUiListener);
             // Do not leave service and session clients with references to activity.
             mTermuxService.unsetTermuxTerminalSessionClient();
             mTermuxService = null;
@@ -1316,6 +1350,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         } else {
             mEditorTerminalOverlayVisible = false;
             pauseEditor();
+            if (tab == TAB_TERMINAL && mTerminalSessionSurfaceView != null) {
+                mTerminalSessionSurfaceView.onHostVisible();
+            }
             if (tab == TAB_TERMINAL && mTerminalView != null && mTermuxTerminalViewClient != null) {
                 mTermuxTerminalViewClient.requestTerminalViewFocus(false);
                 refreshTerminalTopBar();
@@ -1381,12 +1418,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     private int resolveTerminalStatusBarColor() {
-        int terminalBackground = 0xFF000000;
-        TerminalSession session = getCurrentSession();
-        if (session != null && session.getEmulator() != null) {
-            terminalBackground = session.getEmulator().mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND];
-        }
-        return terminalBackground;
+        return TERMINAL_CHROME_BACKGROUND_COLOR;
     }
 
     private int resolveFileManagerBackgroundColor() {
@@ -1714,6 +1746,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             mTerminalContainer.animate().cancel();
             mTerminalContainer.setVisibility(View.VISIBLE);
             mTerminalContainer.bringToFront();
+            if (mTerminalSessionSurfaceView != null) {
+                mTerminalSessionSurfaceView.onHostVisible();
+            }
             mTerminalContainer.setTranslationX(width);
             mTerminalContainer.setAlpha(1f);
             mTerminalContainer.animate()
@@ -1900,6 +1935,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         Logger.logDebug(LOG_TAG, "onServiceConnected");
 
         mTermuxService = ((TermuxService.LocalBinder) service).service;
+        attachCodexImageAttachmentUi();
         beginSessionUiBatch();
         try {
             setTermuxSessionsListView();
@@ -1923,6 +1959,10 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                             if (!restoredTermuxSessions && !restoredPinnedSsh) {
                                 mTermuxTerminalSessionActivityClient.addNewSession(launchFailsafe, null);
                             }
+                            if (mTermuxTerminalSessionActivityClient != null) {
+                                mTermuxTerminalSessionActivityClient.reconcileManagedCodexSessions(
+                                    "service_connected_after_bootstrap");
+                            }
                         } catch (WindowManager.BadTokenException e) {
                             // Activity finished - ignore.
                         }
@@ -1942,15 +1982,11 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 } else {
                     bootstrapTerminalSessionSelection(mTermuxTerminalSessionActivityClient.getRestoreForegroundSessionOrStoredOrLast());
                 }
+                mTermuxTerminalSessionActivityClient.reconcileManagedCodexSessions("service_connected_live");
             }
 
             // Update the {@link TerminalSession} and {@link TerminalEmulator} clients.
             mTermuxService.setTermuxTerminalSessionClient(mTermuxTerminalSessionActivityClient);
-            if (mTermuxTerminalSessionActivityClient != null) {
-                boolean launchFailsafe = intent != null && intent.getExtras() != null &&
-                    intent.getExtras().getBoolean(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
-                mTermuxTerminalSessionActivityClient.materializeDetachedCrushSessionsIfRequested(launchFailsafe);
-            }
         } finally {
             endSessionUiBatch();
         }
@@ -1992,7 +2028,12 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         RelativeLayout relativeLayout = findViewById(R.id.activity_termux_root_relative_layout);
         int marginHorizontal = mProperties.getTerminalMarginHorizontal();
         int marginVertical = mProperties.getTerminalMarginVertical();
-        ViewUtils.setLayoutMarginsInDp(relativeLayout, marginHorizontal, marginVertical, marginHorizontal, marginVertical);
+        ViewUtils.setLayoutMarginsInDp(relativeLayout, 0, 0, 0, 0);
+
+        View terminalSurfaceHost = findViewById(R.id.terminal_surface_host);
+        if (terminalSurfaceHost != null) {
+            ViewUtils.setLayoutMarginsInDp(terminalSurfaceHost, marginHorizontal, marginVertical, marginHorizontal, marginVertical);
+        }
     }
 
 
@@ -2060,13 +2101,13 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 public void onSessionPagePreviewSelected(int index, @Nullable TerminalSession session) {
                     if (session == null) return;
                     mTerminalSelectionStateMachine.previewSession(getSessionHandle(session));
-                    refreshTerminalTopBar();
+                    scheduleTerminalTopBarPreviewRefresh();
                 }
 
                 @Override
                 public void onConfigPagePreviewSelected() {
                     mTerminalSelectionStateMachine.previewConfig();
-                    refreshTerminalTopBar();
+                    scheduleTerminalTopBarPreviewRefresh();
                 }
 
                 @Override
@@ -2222,11 +2263,36 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     private void refreshTerminalTopBar() {
+        cancelTerminalTopBarPreviewRefresh();
+        renderTerminalTopBar(true);
+    }
+
+    private void renderTerminalTopBar(boolean publishSnapshot) {
         if (mTerminalTopBarController == null || mTermuxTerminalTopBarBridge == null) return;
         TermuxTerminalTopBarBridge.Snapshot snapshot = mTermuxTerminalTopBarBridge.capture();
         mTerminalTopBarController.render(snapshot.models);
         mTerminalTopBarView.setAddButtonSelected(isTerminalConfigTabSelectedForTopBar());
-        mTermuxTerminalTopBarBridge.publish(snapshot);
+        if (publishSnapshot) mTermuxTerminalTopBarBridge.publish(snapshot);
+    }
+
+    private void scheduleTerminalTopBarPreviewRefresh() {
+        if (mTerminalTopBarPreviewRefreshScheduled) return;
+        View anchor = mTerminalTopBarView;
+        if (anchor == null && getWindow() != null) anchor = getWindow().getDecorView();
+        if (anchor == null) return;
+        mTerminalTopBarPreviewRefreshScheduled = true;
+        anchor.postOnAnimation(mCoalescedTerminalTopBarPreviewRefresh);
+    }
+
+    private void cancelTerminalTopBarPreviewRefresh() {
+        if (!mTerminalTopBarPreviewRefreshScheduled) return;
+        mTerminalTopBarPreviewRefreshScheduled = false;
+        if (mTerminalTopBarView != null) {
+            mTerminalTopBarView.removeCallbacks(mCoalescedTerminalTopBarPreviewRefresh);
+        }
+        if (getWindow() != null && getWindow().getDecorView() != null) {
+            getWindow().getDecorView().removeCallbacks(mCoalescedTerminalTopBarPreviewRefresh);
+        }
     }
 
     private void clearTopBarSelectionPreview() {
@@ -2315,7 +2381,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 mTermuxTerminalSessionActivityClient.persistTerminalSessionSelection(session);
             }
         }
-        refreshTerminalSessionSurface();
+        if (!accepted) refreshTerminalSessionSurface();
         refreshTerminalTopBar();
     }
 
@@ -2336,7 +2402,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
                 KeyboardUtils.hideSoftKeyboard(this, getWindow().getDecorView());
             }
         }
-        refreshTerminalSessionSurface();
+        if (!accepted) refreshTerminalSessionSurface();
         refreshTerminalTopBar();
     }
 
@@ -2841,6 +2907,7 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
     }
 
     private void cancelCoalescedSessionListUiUpdate() {
+        cancelTerminalTopBarPreviewRefresh();
         mSessionListUiUpdateScheduled = false;
         mSessionUiBatchDepth = 0;
         mSessionUiUpdatePendingInBatch = false;
@@ -3033,6 +3100,8 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         boolean autoFillEnabled = mTerminalView.isAutoFillEnabled();
 
         menu.add(Menu.NONE, CONTEXT_MENU_SELECT_URL_ID, Menu.NONE, R.string.action_select_url);
+        menu.add(Menu.NONE, CONTEXT_MENU_CODEX_IMAGE_ID, Menu.NONE, R.string.action_attach_image_to_codex)
+            .setEnabled(currentSession.isRunning());
         menu.add(Menu.NONE, CONTEXT_MENU_SHARE_TRANSCRIPT_ID, Menu.NONE, R.string.action_share_transcript);
         if (!DataUtils.isNullOrEmpty(mTerminalView.getStoredSelectedText()))
             menu.add(Menu.NONE, CONTEXT_MENU_SHARE_SELECTED_TEXT, Menu.NONE, R.string.action_share_selected_text);
@@ -3123,6 +3192,9 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
             case CONTEXT_MENU_SELECT_URL_ID:
                 mTermuxTerminalViewClient.showUrlSelection();
                 return true;
+            case CONTEXT_MENU_CODEX_IMAGE_ID:
+                openCodexImageSelector(session);
+                return true;
             case CONTEXT_MENU_SHARE_TRANSCRIPT_ID:
                 mTermuxTerminalViewClient.shareSessionTranscript();
                 return true;
@@ -3176,13 +3248,199 @@ public final class TermuxActivity extends SimpleActivity implements ServiceConne
         b.setMessage(R.string.title_confirm_kill_process);
         b.setPositiveButton(android.R.string.yes, (dialog, id) -> {
             dialog.dismiss();
-            if (mTermuxTerminalSessionActivityClient != null) {
-                mTermuxTerminalSessionActivityClient.destroySessionRestoreForUserAction(session);
-            }
             session.finishIfRunning();
         });
         b.setNegativeButton(android.R.string.no, null);
         b.show();
+    }
+
+    private void openCodexImageSelector(@Nullable TerminalSession session) {
+        if (session == null || !session.isRunning() || mTermuxService == null ||
+            mTermuxTerminalSessionActivityClient == null) {
+            showToast(getString(R.string.msg_codex_image_target_unavailable), true);
+            return;
+        }
+
+        String sshCommand = mTermuxTerminalSessionActivityClient.getSshBootstrapCommandForSession(session);
+        String tmuxSession = mTermuxTerminalSessionActivityClient.getPinnedTmuxSessionForSession(session);
+        String displayName = !TextUtils.isEmpty(session.mSessionName)
+            ? session.mSessionName
+            : (!TextUtils.isEmpty(session.getTitle()) ? session.getTitle() : "terminal");
+        CodexImageAttachmentController controller =
+            mTermuxService.getCodexImageAttachmentController();
+        CodexImageAttachmentController.PrepareResult prepared = controller.prepareSelection(
+            session.mHandle, displayName, sshCommand, tmuxSession);
+        if (!prepared.success) {
+            showToast(prepared.message, true);
+            return;
+        }
+
+        try {
+            TermuxPictureSelectorLauncher.openImageGallery(
+                this,
+                new TermuxPictureSelectorLauncher.ImageSelectionCallback() {
+                    @Override
+                    public void onImagesSelected(
+                        @NonNull List<TermuxPictureSelectorLauncher.SelectedImage> images) {
+                        controller.submitSelection(prepared.operationId, images);
+                    }
+
+                    @Override
+                    public void onCancel() {
+                        controller.cancelSelection(prepared.operationId);
+                    }
+                });
+        } catch (RuntimeException error) {
+            controller.cancelSelection(prepared.operationId);
+            showToast(getString(R.string.msg_codex_image_picker_failed), true);
+        }
+    }
+
+    private void attachCodexImageAttachmentUi() {
+        if (mTermuxService == null || mIsInvalidState) return;
+        mTermuxService.getCodexImageAttachmentController()
+            .attachUiListener(mCodexImageAttachmentUiListener);
+    }
+
+    private void onCodexImageAttachmentChanged(@NonNull CodexImageAttachmentController.Snapshot snapshot) {
+        if (isFinishing() || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed())) {
+            return;
+        }
+        if (snapshot.phase == CodexImageAttachmentStateMachine.Phase.AWAITING_SELECTION) return;
+
+        if (!snapshot.isTerminal()) {
+            showCodexImageProcessingDialog(snapshot);
+            return;
+        }
+        if (TextUtils.equals(mLastPresentedCodexImageTerminalOperationId, snapshot.operationId)) return;
+        mLastPresentedCodexImageTerminalOperationId = snapshot.operationId;
+
+        if (mCodexImageProcessingDialog != null && mCodexImageProcessingDialog.isShowing() &&
+            TextUtils.equals(mCodexImageProcessingOperationId, snapshot.operationId)) {
+            if (mCodexImageProcessingText != null) {
+                mCodexImageProcessingText.setText(snapshot.isSuccessful()
+                    ? R.string.msg_codex_image_processing_complete
+                    : R.string.msg_codex_image_processing_failed);
+            }
+            getWindow().getDecorView().postDelayed(() -> {
+                if (TextUtils.equals(mCodexImageProcessingOperationId, snapshot.operationId)) {
+                    dismissCodexImageProcessingDialog();
+                }
+                showCodexImageTerminalMessage(snapshot);
+            }, snapshot.isSuccessful() ? 280L : 420L);
+        } else {
+            dismissCodexImageProcessingDialog();
+            showCodexImageTerminalMessage(snapshot);
+        }
+    }
+
+    private void showCodexImageTerminalMessage(@NonNull CodexImageAttachmentController.Snapshot snapshot) {
+        if (snapshot.isSuccessful()) {
+            if (snapshot.duplicateImages > 0 || snapshot.localReusedImages > 0 ||
+                snapshot.remoteReusedImages > 0) {
+                showToast(getString(
+                    R.string.msg_codex_images_attached_with_reuse,
+                    snapshot.totalImages,
+                    snapshot.duplicateImages,
+                    snapshot.localReusedImages,
+                    snapshot.remoteReusedImages), false);
+            } else {
+                showToast(getResources().getQuantityString(
+                    R.plurals.msg_codex_images_attached,
+                    snapshot.totalImages,
+                    snapshot.totalImages), false);
+            }
+        } else if (snapshot.phase != CodexImageAttachmentStateMachine.Phase.CANCELLED) {
+            showToast(TextUtils.isEmpty(snapshot.message)
+                ? getString(R.string.msg_codex_image_processing_failed)
+                : snapshot.message, true);
+        }
+    }
+
+    private void showCodexImageProcessingDialog(@NonNull CodexImageAttachmentController.Snapshot snapshot) {
+        if (mCodexImageProcessingDialog == null) {
+            Dialog dialog = new Dialog(this);
+            dialog.setCancelable(false);
+            dialog.setCanceledOnTouchOutside(false);
+
+            LinearLayout panel = new LinearLayout(this);
+            panel.setOrientation(LinearLayout.VERTICAL);
+            panel.setGravity(Gravity.CENTER);
+            int padding = dpToPx(14);
+            panel.setPadding(padding, padding, padding, padding);
+            GradientDrawable background = new GradientDrawable();
+            background.setColor(0xE6212121);
+            background.setCornerRadius(dpToPx(8));
+            panel.setBackground(background);
+
+            ProgressBar progress = new ProgressBar(this);
+            progress.setIndeterminate(true);
+            progress.setIndeterminateTintList(ColorStateList.valueOf(Color.WHITE));
+            LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(dpToPx(34), dpToPx(34));
+            panel.addView(progress, progressParams);
+
+            TextView text = new TextView(this);
+            text.setTextColor(Color.WHITE);
+            text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            text.setGravity(Gravity.CENTER);
+            text.setMaxLines(2);
+            LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            textParams.topMargin = dpToPx(10);
+            panel.addView(text, textParams);
+
+            dialog.setContentView(panel, new ViewGroup.LayoutParams(dpToPx(122), dpToPx(122)));
+            Window window = dialog.getWindow();
+            if (window != null) {
+                window.setBackgroundDrawableResource(android.R.color.transparent);
+                window.setDimAmount(0.18f);
+                window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+                window.setGravity(Gravity.CENTER);
+            }
+            mCodexImageProcessingDialog = dialog;
+            mCodexImageProcessingText = text;
+        }
+
+        mCodexImageProcessingOperationId = snapshot.operationId;
+        if (mCodexImageProcessingText != null) {
+            String text = snapshot.message;
+            if (snapshot.totalImages > 1 && snapshot.completedImages > 0) {
+                text = getString(R.string.msg_codex_image_processing_progress,
+                    snapshot.completedImages, snapshot.totalImages);
+            }
+            mCodexImageProcessingText.setText(text);
+        }
+        if (!mCodexImageProcessingDialog.isShowing()) {
+            try {
+                mCodexImageProcessingDialog.show();
+                Window window = mCodexImageProcessingDialog.getWindow();
+                if (window != null) window.setLayout(dpToPx(122), dpToPx(122));
+                if (mTermuxService != null) {
+                    mTermuxService.getCodexImageAttachmentController()
+                        .acknowledgeProcessingSurface(snapshot.operationId);
+                }
+            } catch (WindowManager.BadTokenException ignored) {
+            }
+        } else if (mTermuxService != null) {
+            mTermuxService.getCodexImageAttachmentController()
+                .acknowledgeProcessingSurface(snapshot.operationId);
+        }
+    }
+
+    private void dismissCodexImageProcessingDialog() {
+        if (mCodexImageProcessingDialog != null) {
+            try {
+                if (mCodexImageProcessingDialog.isShowing()) mCodexImageProcessingDialog.dismiss();
+            } catch (RuntimeException ignored) {
+            }
+        }
+        mCodexImageProcessingDialog = null;
+        mCodexImageProcessingText = null;
+        mCodexImageProcessingOperationId = null;
+    }
+
+    private int dpToPx(int dp) {
+        return Math.round(dp * getResources().getDisplayMetrics().density);
     }
 
     private void onResetTerminalSession(TerminalSession session) {

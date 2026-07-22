@@ -1,0 +1,497 @@
+plugins {
+    id 'com.android.application' version '8.13.1' apply false
+    id 'com.android.library' version '8.13.1' apply false
+}
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.KeyFactory
+import java.security.MessageDigest
+import java.security.Signature
+import java.security.spec.PKCS8EncodedKeySpec
+import java.util.Properties
+import java.util.zip.ZipFile
+
+def pluginPropertiesFile = file("shadow-plugin.properties")
+if (!pluginPropertiesFile.isFile()) {
+    throw new GradleException("Missing Shadow plugin config: ${pluginPropertiesFile}")
+}
+Properties rawShadowPluginConfig = new Properties()
+pluginPropertiesFile.withReader("UTF-8") { reader -> rawShadowPluginConfig.load(reader) }
+
+def requiredShadowProperty = { String key ->
+    String value = rawShadowPluginConfig.getProperty(key)?.trim()
+    if (value == null || value.isEmpty()) {
+        throw new GradleException("Missing shadow-plugin.properties value: ${key}")
+    }
+    return value
+}
+def positiveLongProperty = { String key ->
+    String value = requiredShadowProperty(key)
+    try {
+        long parsed = Long.parseLong(value)
+        if (parsed <= 0L) {
+            throw new NumberFormatException("not positive")
+        }
+        return parsed
+    } catch (NumberFormatException ignored) {
+        throw new GradleException("${key} must be a positive integer: ${value}")
+    }
+}
+
+int configSchemaVersion
+try {
+    configSchemaVersion = Integer.parseInt(requiredShadowProperty("schemaVersion"))
+} catch (NumberFormatException ignored) {
+    throw new GradleException("shadow-plugin.properties schemaVersion must be an integer")
+}
+if (configSchemaVersion != 1) {
+    throw new GradleException("Unsupported shadow-plugin.properties schemaVersion: ${configSchemaVersion}")
+}
+
+def pluginSlug = requiredShadowProperty("pluginSlug")
+def projectName = requiredShadowProperty("projectName")
+def pluginId = requiredShadowProperty("pluginId")
+def partKey = requiredShadowProperty("partKey")
+def pluginNamespace = requiredShadowProperty("namespace")
+def activityClassName = requiredShadowProperty("activityClassName")
+def resourcePackageId = requiredShadowProperty("resourcePackageId").toUpperCase(Locale.US)
+def pluginApkName = requiredShadowProperty("pluginApkName")
+def bundleBaseName = requiredShadowProperty("bundleBaseName")
+def displayName = requiredShadowProperty("displayName")
+def pluginDescription = requiredShadowProperty("description")
+def defaultVersionCode = positiveLongProperty("defaultVersionCode")
+def defaultVersionName = requiredShadowProperty("defaultVersionName")
+def minHostVersionCode = positiveLongProperty("minHostVersionCode")
+def maxHostVersionCode = positiveLongProperty("maxHostVersionCode")
+
+def javaNamePattern = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/
+if (!(pluginSlug ==~ /^[a-z][a-z0-9-]*$/)) {
+    throw new GradleException("Invalid pluginSlug: ${pluginSlug}")
+}
+if (!(projectName ==~ /^[A-Za-z][A-Za-z0-9_-]*$/)) {
+    throw new GradleException("Invalid projectName: ${projectName}")
+}
+if (!(pluginId ==~ javaNamePattern)) {
+    throw new GradleException("Invalid pluginId: ${pluginId}")
+}
+if (!(partKey ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/)) {
+    throw new GradleException("Invalid partKey: ${partKey}")
+}
+if (!(pluginNamespace ==~ javaNamePattern)) {
+    throw new GradleException("Invalid namespace: ${pluginNamespace}")
+}
+if (!(activityClassName ==~ javaNamePattern)
+        || !activityClassName.startsWith(pluginNamespace + ".")) {
+    throw new GradleException("activityClassName must be inside namespace: ${activityClassName}")
+}
+if (!(resourcePackageId ==~ /^0X[0-9A-F]{2}$/)) {
+    throw new GradleException("Invalid resourcePackageId: ${resourcePackageId}")
+}
+int resourcePackageIdValue = Integer.parseInt(resourcePackageId.substring(2), 16)
+if (resourcePackageIdValue < 0x02 || resourcePackageIdValue > 0x7E) {
+    throw new GradleException("resourcePackageId must be between 0x02 and 0x7E")
+}
+resourcePackageId = String.format("0x%02X", resourcePackageIdValue)
+if (!(pluginApkName ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$/)) {
+    throw new GradleException("Invalid pluginApkName: ${pluginApkName}")
+}
+if (!(bundleBaseName ==~ /^[a-z0-9][a-z0-9._-]*$/)) {
+    throw new GradleException("Invalid bundleBaseName: ${bundleBaseName}")
+}
+if (!(defaultVersionName ==~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/)) {
+    throw new GradleException("Invalid defaultVersionName: ${defaultVersionName}")
+}
+if (minHostVersionCode > maxHostVersionCode) {
+    throw new GradleException("minHostVersionCode cannot exceed maxHostVersionCode")
+}
+
+ext.shadowPluginConfig = Collections.unmodifiableMap([
+        schemaVersion      : configSchemaVersion,
+        pluginSlug         : pluginSlug,
+        projectName        : projectName,
+        pluginId           : pluginId,
+        partKey            : partKey,
+        namespace          : pluginNamespace,
+        activityClassName  : activityClassName,
+        resourcePackageId  : resourcePackageId,
+        pluginApkName      : pluginApkName,
+        bundleBaseName     : bundleBaseName,
+        displayName        : displayName,
+        description        : pluginDescription,
+        defaultVersionCode : defaultVersionCode,
+        defaultVersionName : defaultVersionName,
+        minHostVersionCode : minHostVersionCode,
+        maxHostVersionCode : maxHostVersionCode
+])
+
+def pluginVersionCode = providers.gradleProperty("shadowPluginVersionCode")
+        .map { it.toLong() }
+        .orElse(defaultVersionCode)
+        .get()
+def pluginVersionName = providers.gradleProperty("shadowPluginVersionName")
+        .orElse(defaultVersionName)
+        .get()
+if (pluginVersionCode <= 0L) {
+    throw new GradleException("shadowPluginVersionCode must be positive")
+}
+if (!(pluginVersionName ==~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/)) {
+    throw new GradleException("Invalid shadowPluginVersionName: ${pluginVersionName}")
+}
+def loaderApkName = "sample-loader-debug.apk"
+def runtimeApkName = "sample-runtime-debug.apk"
+def bundleName = "${bundleBaseName}-${pluginVersionName}.shadowpkg"
+def generatedDir = layout.buildDirectory.dir("generated/shadow-package/debug")
+def packageDir = layout.buildDirectory.dir("package/debug")
+def distDir = layout.projectDirectory.dir("dist")
+def validationPluginApk = layout.buildDirectory.file("tmp/validateShadowPluginDebug/${pluginApkName}")
+def signingPrivateKeyPath = providers.environmentVariable(
+        "TERMUX_SHADOW_SIGNING_KEY_PKCS8"
+).getOrNull()
+def signingKeyIdValue = providers.environmentVariable(
+        "TERMUX_SHADOW_SIGNING_KEY_ID"
+).getOrNull()
+def digestHex = { File file, String algorithm ->
+    MessageDigest digest = MessageDigest.getInstance(algorithm)
+    file.withInputStream { input ->
+        byte[] buffer = new byte[64 * 1024]
+        int read
+        while ((read = input.read(buffer)) != -1) {
+            digest.update(buffer, 0, read)
+        }
+    }
+    digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+}
+
+def md5Upper = { File file -> digestHex(file, "MD5").toUpperCase(Locale.US) }
+def sha256 = { File file -> digestHex(file, "SHA-256") }
+
+def resolveAapt2 = {
+    String override = providers.gradleProperty("android.aapt2FromMavenOverride").getOrNull()
+    if (override != null && file(override).isFile()) {
+        return file(override)
+    }
+    String sdkRoot = System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")
+    if (sdkRoot == null) {
+        throw new GradleException("ANDROID_SDK_ROOT or android.aapt2FromMavenOverride is required")
+    }
+    File buildTools = new File(sdkRoot, "build-tools")
+    File selected = buildTools.listFiles()
+            ?.findAll { new File(it, "aapt2").isFile() }
+            ?.sort { left, right -> right.name <=> left.name }
+            ?.find()
+    if (selected == null) {
+        throw new GradleException("No aapt2 found under ${buildTools}")
+    }
+    return new File(selected, "aapt2")
+}
+def aapt2Executable = resolveAapt2()
+
+def writeTextDeterministically = { File file, String text ->
+    file.setText(text, "UTF-8")
+}
+
+tasks.register("generateShadowDebugPackageFiles") {
+    dependsOn ":plugin-app:assembleDebug"
+
+    def loaderApk = file("shadow/loader/${loaderApkName}")
+    def runtimeApk = file("shadow/runtime/${runtimeApkName}")
+    def pluginApk = project(":plugin-app").layout.buildDirectory.file("outputs/apk/debug/plugin-app-debug.apk")
+
+    inputs.files(loaderApk, runtimeApk, pluginApk, pluginPropertiesFile)
+    inputs.property("pluginId", pluginId)
+    inputs.property("pluginVersionCode", pluginVersionCode)
+    inputs.property("pluginVersionName", pluginVersionName)
+    inputs.property("resourcePackageId", resourcePackageId)
+    inputs.property("signingKeyId", signingKeyIdValue ?: "")
+    if (signingPrivateKeyPath != null) {
+        inputs.file(file(signingPrivateKeyPath))
+    }
+    outputs.dir(generatedDir)
+
+    doLast {
+        File outDir = generatedDir.get().asFile
+        if (outDir.exists() && !outDir.deleteDir()) {
+            throw new GradleException("Unable to clear ${outDir}")
+        }
+        if (!outDir.mkdirs() && !outDir.isDirectory()) {
+            throw new GradleException("Unable to create ${outDir}")
+        }
+
+        Files.copy(loaderApk.toPath(), new File(outDir, loaderApkName).toPath(),
+                StandardCopyOption.REPLACE_EXISTING)
+        Files.copy(runtimeApk.toPath(), new File(outDir, runtimeApkName).toPath(),
+                StandardCopyOption.REPLACE_EXISTING)
+        Files.copy(pluginApk.get().asFile.toPath(), new File(outDir, pluginApkName).toPath(),
+                StandardCopyOption.REPLACE_EXISTING)
+
+        File copiedLoader = new File(outDir, loaderApkName)
+        File copiedRuntime = new File(outDir, runtimeApkName)
+        File copiedPlugin = new File(outDir, pluginApkName)
+        String contentSeed = [
+                pluginId,
+                pluginVersionCode.toString(),
+                pluginVersionName,
+                sha256(copiedLoader),
+                sha256(copiedRuntime),
+                sha256(copiedPlugin)
+        ].join(":")
+        MessageDigest seedDigest = MessageDigest.getInstance("SHA-256")
+        String contentId = seedDigest.digest(contentSeed.getBytes("UTF-8"))
+                .collect { String.format("%02x", it & 0xff) }.join()
+
+        Map config = [
+                compact_version: [1, 2, 3, 4],
+                pluginLoader   : [apkName: loaderApkName, hash: md5Upper(copiedLoader)],
+                plugins        : [[
+                                          partKey      : partKey,
+                                          apkName      : pluginApkName,
+                                          businessName : pluginId,
+                                          hostWhiteList: [],
+                                          hash         : md5Upper(copiedPlugin)
+                                  ]],
+                runtime        : [apkName: runtimeApkName, hash: md5Upper(copiedRuntime)],
+                UUID           : "TERMUX-SHADOW-${contentId.substring(0, 32)}",
+                version        : 4,
+                UUID_NickName  : "${pluginVersionName}+${contentId.substring(0, 12)}"
+        ]
+        File configFile = new File(outDir, "config.json")
+        writeTextDeterministically(configFile, JsonOutput.toJson(config) + "\n")
+
+        Map metadata = [
+                schemaVersion      : 2,
+                pluginId           : pluginId,
+                versionCode        : pluginVersionCode,
+                versionName        : pluginVersionName,
+                displayName        : displayName,
+                partKey            : partKey,
+                activityClassName  : activityClassName,
+                description        : pluginDescription,
+                resourcePackageId  : resourcePackageId,
+                minHostVersionCode : minHostVersionCode,
+                maxHostVersionCode : maxHostVersionCode
+        ]
+        File metadataFile = new File(outDir, "termux-shadow.json")
+        writeTextDeterministically(
+                metadataFile,
+                JsonOutput.prettyPrint(JsonOutput.toJson(metadata)) + "\n"
+        )
+
+        Map<String, File> signedFiles = [
+                ("config.json")      : configFile,
+                ("termux-shadow.json"): metadataFile,
+                (loaderApkName)       : copiedLoader,
+                (runtimeApkName)      : copiedRuntime,
+                (pluginApkName)       : copiedPlugin
+        ]
+        String checksumText = signedFiles.keySet().sort()
+                .collect { name -> "${sha256(signedFiles[name])}  ${name}" }
+                .join("\n") + "\n"
+        File checksumsFile = new File(outDir, "checksums.sha256")
+        writeTextDeterministically(checksumsFile, checksumText)
+
+        String privateKeyPath = signingPrivateKeyPath
+        String signingKeyId = signingKeyIdValue
+        if ((privateKeyPath == null) != (signingKeyId == null)) {
+            throw new GradleException(
+                    "TERMUX_SHADOW_SIGNING_KEY_PKCS8 and TERMUX_SHADOW_SIGNING_KEY_ID must be set together"
+            )
+        }
+        if (privateKeyPath != null) {
+            String pem = file(privateKeyPath).getText("UTF-8")
+                    .replace("-----BEGIN PRIVATE KEY-----", "")
+                    .replace("-----END PRIVATE KEY-----", "")
+                    .replaceAll("\\s", "")
+            byte[] encodedKey = Base64.decoder.decode(pem)
+            def privateKey = KeyFactory.getInstance("RSA")
+                    .generatePrivate(new PKCS8EncodedKeySpec(encodedKey))
+            Signature signer = Signature.getInstance("SHA256withRSA")
+            signer.initSign(privateKey)
+            signer.update(checksumText.getBytes("UTF-8"))
+            Map signature = [
+                    schemaVersion: 1,
+                    keyId        : signingKeyId,
+                    algorithm    : "SHA256withRSA",
+                    signature    : Base64.encoder.encodeToString(signer.sign())
+            ]
+            writeTextDeterministically(
+                    new File(outDir, "signature.json"),
+                    JsonOutput.prettyPrint(JsonOutput.toJson(signature)) + "\n"
+            )
+        }
+    }
+}
+
+tasks.register("assembleShadowPluginDebug", Zip) {
+    dependsOn "generateShadowDebugPackageFiles"
+    archiveFileName = bundleName
+    destinationDirectory = packageDir
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    from(generatedDir)
+}
+
+tasks.register("validateShadowPluginDebug") {
+    dependsOn "assembleShadowPluginDebug"
+    def packageFile = packageDir.get().file(bundleName)
+    inputs.file(packageFile)
+    inputs.file(aapt2Executable)
+
+    doLast {
+        File bundle = packageFile.asFile
+        ZipFile zip = new ZipFile(bundle)
+        try {
+            Set<String> names = zip.entries().collect { it.name } as Set<String>
+            Set<String> requiredNames = [
+                    "config.json", "termux-shadow.json", "checksums.sha256",
+                    loaderApkName, runtimeApkName, pluginApkName
+            ] as Set<String>
+            requiredNames.each { required ->
+                if (!names.contains(required)) {
+                    throw new GradleException("Missing Shadow package entry: ${required}")
+                }
+            }
+            Set<String> unexpected = names - requiredNames - (["signature.json"] as Set<String>)
+            if (!unexpected.isEmpty()) {
+                throw new GradleException("Unexpected Shadow package entries: ${unexpected.sort()}")
+            }
+            def metadata = new JsonSlurper().parseText(
+                    zip.getInputStream(zip.getEntry("termux-shadow.json")).getText("UTF-8")
+            )
+            def config = new JsonSlurper().parseText(
+                    zip.getInputStream(zip.getEntry("config.json")).getText("UTF-8")
+            )
+            if (metadata.schemaVersion != 2 || metadata.pluginId != pluginId
+                    || metadata.partKey != partKey || metadata.resourcePackageId != resourcePackageId
+                    || metadata.activityClassName != activityClassName
+                    || metadata.versionCode != pluginVersionCode
+                    || metadata.versionName != pluginVersionName) {
+                throw new GradleException("Invalid termux-shadow.json identity metadata")
+            }
+            if (!config.plugins.any { it.partKey == partKey && it.apkName == pluginApkName }) {
+                throw new GradleException("config.json does not map the declared partKey")
+            }
+
+            def zipDigest = { String name, String algorithm ->
+                MessageDigest digest = MessageDigest.getInstance(algorithm)
+                zip.getInputStream(zip.getEntry(name)).withCloseable { input ->
+                    byte[] buffer = new byte[64 * 1024]
+                    int read
+                    while ((read = input.read(buffer)) != -1) {
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+            }
+            if (!config.pluginLoader.hash.equalsIgnoreCase(zipDigest(loaderApkName, "MD5"))
+                    || !config.runtime.hash.equalsIgnoreCase(zipDigest(runtimeApkName, "MD5"))
+                    || !config.plugins.find { it.partKey == partKey }.hash
+                    .equalsIgnoreCase(zipDigest(pluginApkName, "MD5"))) {
+                throw new GradleException("Shadow config MD5 does not match packaged APK content")
+            }
+
+            String checksumText = zip.getInputStream(zip.getEntry("checksums.sha256")).getText("UTF-8")
+            Set<String> checksumNames = [] as Set<String>
+            checksumText.readLines().findAll { !it.trim().isEmpty() }.each { line ->
+                if (line.length() < 67 || line.substring(64, 66) != "  ") {
+                    throw new GradleException("Malformed checksums.sha256")
+                }
+                String expected = line.substring(0, 64)
+                String name = line.substring(66)
+                if (!checksumNames.add(name)) {
+                    throw new GradleException("Duplicate checksum entry: ${name}")
+                }
+                def entry = zip.getEntry(name)
+                if (entry == null) {
+                    throw new GradleException("Checksum references missing entry: ${name}")
+                }
+                MessageDigest digest = MessageDigest.getInstance("SHA-256")
+                zip.getInputStream(entry).withCloseable { input ->
+                    byte[] buffer = new byte[64 * 1024]
+                    int read
+                    while ((read = input.read(buffer)) != -1) {
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                String actual = digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+                if (expected != actual) {
+                    throw new GradleException("Checksum mismatch for ${name}")
+                }
+            }
+            Set<String> expectedChecksumNames = requiredNames - (["checksums.sha256"] as Set<String>)
+            if (checksumNames != expectedChecksumNames) {
+                throw new GradleException(
+                        "Checksum manifest coverage mismatch: expected=${expectedChecksumNames.sort()} "
+                                + "actual=${checksumNames.sort()}"
+                )
+            }
+
+            File extractedPlugin = validationPluginApk.get().asFile
+            extractedPlugin.parentFile.mkdirs()
+            zip.getInputStream(zip.getEntry(pluginApkName)).withCloseable { input ->
+                Files.copy(input, extractedPlugin.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+            Process process = new ProcessBuilder(
+                    aapt2Executable.absolutePath,
+                    "dump",
+                    "resources",
+                    extractedPlugin.absolutePath
+            ).redirectErrorStream(false).start()
+            String resourceDump = process.inputStream.getText("UTF-8")
+            String aaptError = process.errorStream.getText("UTF-8")
+            int aaptExitCode = process.waitFor()
+            if (aaptExitCode != 0) {
+                throw new GradleException(
+                        "aapt2 resource validation failed: " + aaptError
+                )
+            }
+            String packageId = resourcePackageId.substring(2).toLowerCase(Locale.US)
+            if (!(resourceDump =~ /(?m)^Package name=.* id=${packageId}\s*$/).find()) {
+                throw new GradleException(
+                        "Plugin resources do not use package id ${resourcePackageId}"
+                )
+            }
+        } finally {
+            zip.close()
+        }
+        println "Validated Shadow package: ${bundle.absolutePath} sha256=${sha256(bundle)}"
+    }
+}
+
+tasks.register("copyShadowPluginDebugToDist", Copy) {
+    dependsOn "validateShadowPluginDebug"
+    doFirst {
+        File directory = distDir.asFile
+        directory.listFiles()
+                ?.findAll {
+                    it.isFile()
+                            && it.name.endsWith(".shadowpkg")
+                            && it.name != "active.shadowpkg"
+                }
+                ?.each { file ->
+                    if (!file.delete()) {
+                        throw new GradleException("Unable to remove old artifact: ${file}")
+                    }
+                    File runtimeSidecar = new File(directory, file.name + ".runtime.json")
+                    if (runtimeSidecar.exists() && !runtimeSidecar.delete()) {
+                        throw new GradleException(
+                                "Unable to remove old runtime proof marker: ${runtimeSidecar}"
+                        )
+                    }
+                }
+    }
+    from(packageDir.get().file(bundleName))
+    into(distDir)
+}
+
+tasks.register("publishShadowPluginDebug") {
+    outputs.upToDateWhen { false }
+    doLast {
+        throw new GradleException(
+                "publishShadowPluginDebug is retired. Use the native `shadow-plugin publish` "
+                        + "or `shadow-plugin deploy`; the Rust publisher is the only inbox writer."
+        )
+    }
+}

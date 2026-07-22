@@ -49,6 +49,8 @@ public final class TerminalRow {
     final long[] mStyle;
     /** If this row might contain chars with width != 1, used for deactivating fast path */
     boolean mHasNonOneWidthOrSurrogateChars;
+    /** Lazily allocated OSC 8 destination for each display cell. */
+    private String[] mHyperlinks;
 
     /** Construct a blank row (containing only whitespace, ' ') with a specified style. */
     public TerminalRow(int columns, long style) {
@@ -67,6 +69,12 @@ public final class TerminalRow {
             if (length <= 0) return;
             System.arraycopy(line.mText, sourceX1, mText, destinationX, length);
             System.arraycopy(line.mStyle, sourceX1, mStyle, destinationX, length);
+            if (line.mHyperlinks == null) {
+                clearHyperlinks(destinationX, destinationX + length);
+            } else {
+                if (mHyperlinks == null) mHyperlinks = new String[mColumns];
+                System.arraycopy(line.mHyperlinks, sourceX1, mHyperlinks, destinationX, length);
+            }
             return;
         }
 
@@ -75,10 +83,14 @@ public final class TerminalRow {
         final int x2 = line.findStartOfColumn(sourceX2);
         boolean startingFromSecondHalfOfWideChar = (sourceX1 > 0 && line.wideDisplayCharacterStartingAt(sourceX1 - 1));
         final char[] sourceChars = (this == line) ? Arrays.copyOf(line.mText, line.mText.length) : line.mText;
+        final String[] sourceHyperlinks = (this == line && line.mHyperlinks != null)
+            ? Arrays.copyOf(line.mHyperlinks, line.mHyperlinks.length)
+            : line.mHyperlinks;
         int latestNonCombiningWidth = 0;
         for (int i = x1; i < x2; i++) {
             char sourceChar = sourceChars[i];
             int codePoint = Character.isHighSurrogate(sourceChar) ? Character.toCodePoint(sourceChar, sourceChars[++i]) : sourceChar;
+            boolean copiedSecondHalf = startingFromSecondHalfOfWideChar;
             if (startingFromSecondHalfOfWideChar) {
                 // Just treat copying second half of wide char as copying whitespace.
                 codePoint = ' ';
@@ -90,12 +102,47 @@ public final class TerminalRow {
                 sourceX1 += latestNonCombiningWidth;
                 latestNonCombiningWidth = w;
             }
-            setChar(destinationX, codePoint, line.getStyle(sourceX1));
+            String hyperlink = copiedSecondHalf || sourceHyperlinks == null
+                ? null
+                : sourceHyperlinks[sourceX1];
+            setChar(destinationX, codePoint, line.getStyle(sourceX1), hyperlink);
         }
     }
 
     public int getSpaceUsed() {
         return mSpaceUsed;
+    }
+
+    /** Whether every terminal cell maps directly to one BMP char in {@link #mText}. */
+    public boolean hasOnlyOneWidthCharacters() {
+        return !mHasNonOneWidthOrSurrogateChars;
+    }
+
+    long getContentHash() {
+        long hash = 0xcbf29ce484222325L;
+        hash = (hash ^ mSpaceUsed) * 0x100000001b3L;
+        hash = (hash ^ (mLineWrap ? 1 : 0)) * 0x100000001b3L;
+        for (int i = 0; i < mSpaceUsed; i++) {
+            hash = (hash ^ mText[i]) * 0x100000001b3L;
+        }
+        for (int column = 0; column < mStyle.length; column++) {
+            hash = (hash ^ mStyle[column]) * 0x100000001b3L;
+            String hyperlink = mHyperlinks == null ? null : mHyperlinks[column];
+            hash = (hash ^ (hyperlink == null ? 0 : hyperlink.hashCode())) * 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    void setAsciiRun(int column, byte[] bytes, int offset, int length, long style, String hyperlink) {
+        if (column < 0 || length < 0 || column + length > mColumns)
+            throw new IllegalArgumentException("TerminalRow.setAsciiRun(): column=" + column + ", length=" + length + ", columns=" + mColumns);
+        if (length == 0) return;
+
+        for (int i = 0; i < length; i++) {
+            mText[column + i] = (char) (bytes[offset + i] & 0x7f);
+        }
+        Arrays.fill(mStyle, column, column + length, style);
+        setHyperlinkRange(column, column + length, hyperlink);
     }
 
     /** Note that the column may end of second half of wide character. */
@@ -154,12 +201,17 @@ public final class TerminalRow {
     public void clear(long style) {
         Arrays.fill(mText, ' ');
         Arrays.fill(mStyle, style);
+        mHyperlinks = null;
         mSpaceUsed = (short) mColumns;
         mHasNonOneWidthOrSurrogateChars = false;
     }
 
     // https://github.com/steven676/Android-Terminal-Emulator/commit/9a47042620bec87617f0b4f5d50568535668fe26
     public void setChar(int columnToSet, int codePoint, long style) {
+        setChar(columnToSet, codePoint, style, null);
+    }
+
+    void setChar(int columnToSet, int codePoint, long style, String hyperlink) {
         if (columnToSet  < 0 || columnToSet >= mStyle.length)
             throw new IllegalArgumentException("TerminalRow.setChar(): columnToSet=" + columnToSet + ", codePoint=" + codePoint + ", style=" + style);
 
@@ -173,6 +225,7 @@ public final class TerminalRow {
                 mHasNonOneWidthOrSurrogateChars = true;
             } else {
                 mText[columnToSet] = (char) codePoint;
+                setHyperlinkRange(columnToSet, columnToSet + 1, hyperlink);
                 return;
             }
         }
@@ -278,6 +331,14 @@ public final class TerminalRow {
                 mSpaceUsed -= nextLen;
             }
         }
+
+        if (!newIsCombining) {
+            int endColumn = Math.min(mColumns, columnToSet + Math.max(1, newCodePointDisplayWidth));
+            setHyperlinkRange(columnToSet, endColumn, hyperlink);
+            if (oldCodePointDisplayWidth == 2 && newCodePointDisplayWidth == 1) {
+                clearHyperlinks(columnToSet + 1, Math.min(mColumns, columnToSet + 2));
+            }
+        }
     }
 
     boolean isBlank() {
@@ -288,6 +349,25 @@ public final class TerminalRow {
 
     public final long getStyle(int column) {
         return mStyle[column];
+    }
+
+    public final String getHyperlink(int column) {
+        return mHyperlinks == null ? null : mHyperlinks[column];
+    }
+
+    void clearHyperlinks(int startColumn, int endColumn) {
+        if (mHyperlinks == null || endColumn <= startColumn) return;
+        Arrays.fill(mHyperlinks, startColumn, endColumn, null);
+    }
+
+    private void setHyperlinkRange(int startColumn, int endColumn, String hyperlink) {
+        if (endColumn <= startColumn) return;
+        if (hyperlink == null) {
+            clearHyperlinks(startColumn, endColumn);
+            return;
+        }
+        if (mHyperlinks == null) mHyperlinks = new String[mColumns];
+        Arrays.fill(mHyperlinks, startColumn, endColumn, hyperlink);
     }
 
 }

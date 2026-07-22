@@ -12,6 +12,7 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewTreeObserver;
 import android.widget.EditText;
 import android.widget.ListView;
 import android.widget.Toast;
@@ -36,11 +37,14 @@ import com.termux.shared.data.DataUtils;
 import com.termux.shared.logger.Logger;
 import com.termux.shared.markdown.MarkdownUtils;
 import com.termux.shared.termux.TermuxUtils;
-import com.termux.shared.termux.data.TermuxUrlUtils;
 import com.termux.shared.view.KeyboardUtils;
 import com.termux.shared.view.ViewUtils;
 import com.termux.terminal.KeyHandler;
+import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalEmulator;
+import com.termux.terminal.TerminalLinkResolver;
+import com.termux.terminal.TerminalSelectionContext;
+import com.termux.terminal.TerminalSelectionContextExtractor;
 import com.termux.terminal.TerminalSession;
 import com.termux.view.TerminalView;
 
@@ -77,12 +81,31 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     private boolean mProgrammaticTerminalFocusAllowed = true;
     private int mTerminalImeStartRow = -1;
     private int mTerminalImeEndRow = -1;
+    private final TerminalImeRequestStateMachine mTerminalImeRequestStateMachine = new TerminalImeRequestStateMachine();
+    @Nullable private TerminalView mKeyboardBehaviorTerminalView;
+    @Nullable private ViewTreeObserver.OnWindowFocusChangeListener mTerminalImeWindowFocusChangeListener;
+    private final View.OnAttachStateChangeListener mTerminalImeAttachStateChangeListener = new View.OnAttachStateChangeListener() {
+        @Override
+        public void onViewAttachedToWindow(View view) {
+            if (view != mKeyboardBehaviorTerminalView) return;
+            installTerminalImeWindowFocusListener((TerminalView) view);
+            dispatchPendingTerminalImeShow((TerminalView) view);
+        }
+
+        @Override
+        public void onViewDetachedFromWindow(View view) {
+            if (view == mKeyboardBehaviorTerminalView) {
+                removeTerminalImeWindowFocusListener((TerminalView) view);
+            }
+        }
+    };
 
     private boolean mTerminalCursorBlinkerStateAlreadySet;
 
     private List<KeyboardShortcut> mSessionShortcuts;
 
     private static final String LOG_TAG = "TermuxTerminalViewClient";
+    private static final int URL_SNAPSHOT_ATTEMPTS = 3;
 
     public TermuxTerminalViewClient(TermuxActivity activity, TermuxTerminalSessionActivityClient termuxTerminalSessionActivityClient) {
         this.mActivity = activity;
@@ -189,6 +212,8 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     }
 
     public void cancelPendingShowSoftKeyboard() {
+        mTerminalImeRequestStateMachine.cancelShow();
+
         final View terminalView = mActivity.getTerminalView();
         if (terminalView == null) return;
 
@@ -209,6 +234,8 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
      * Should be called when mActivity.onStop() is called
      */
     public void onStop() {
+        cancelPendingShowSoftKeyboard();
+
         // Stop terminal cursor blinking if enabled
         setTerminalCursorBlinkerState(false);
     }
@@ -272,12 +299,10 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
         if (mActivity.getProperties().shouldOpenTerminalTranscriptURLOnClick()) {
             int[] columnAndRow = terminalView.getColumnAndRow(e, true);
-            String wordAtTap = term.getScreen().getWordAtLocation(columnAndRow[0], columnAndRow[1]);
-            LinkedHashSet<CharSequence> urlSet = TermuxUrlUtils.extractUrls(wordAtTap);
-
-            if (!urlSet.isEmpty()) {
-                String url = (String) urlSet.iterator().next();
-                ShareUtils.openUrl(mActivity, url);
+            String url = resolveStableUniqueUrlAt(
+                term, columnAndRow[0], columnAndRow[1]);
+            if (url != null) {
+                onOpenUrl(url);
                 return;
             }
         }
@@ -308,6 +333,33 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         if (row < mTerminalImeStartRow || row > mTerminalImeEndRow) return;
 
         showSoftKeyboardForTerminal();
+    }
+
+    @Override
+    public void onOpenUrl(String url) {
+        ShareUtils.openUrl(mActivity, url);
+    }
+
+    @Nullable
+    private String resolveStableUniqueUrlAt(TerminalEmulator emulator, int column, int row) {
+        TerminalBuffer screen = emulator.getScreen();
+        for (int attempt = 0; attempt < URL_SNAPSHOT_ATTEMPTS; attempt++) {
+            long revisionBefore = screen.getContentRevision();
+            try {
+                TerminalLinkResolver.SelectionResult result =
+                    TerminalLinkResolver.resolveTerminalSelection(
+                        screen, column, row, column, row, true);
+                LinkedHashSet<String> urls = result.getUrls();
+                String url = !result.requiresConfirmation() && urls.size() == 1
+                    ? urls.iterator().next()
+                    : null;
+                long revisionAfter = screen.getContentRevision();
+                if (revisionBefore == revisionAfter && emulator.getScreen() == screen) return url;
+            } catch (IndexOutOfBoundsException | IllegalArgumentException ignored) {
+                // A concurrent terminal resize invalidated this snapshot; retry once it stabilizes.
+            }
+        }
+        return null;
     }
 
     private boolean isTerminalImeRectSet() {
@@ -743,13 +795,15 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         KeyboardUtils.setSoftInputModeAdjustResize(mActivity);
         KeyboardUtils.clearDisableSoftKeyboardFlags(mActivity);
         setProgrammaticTerminalFocusAllowed(true);
+        mTerminalImeRequestStateMachine.requestShow();
         terminalView.requestFocusFromTouch();
         terminalView.requestFocus();
-        KeyboardUtils.showSoftKeyboard(mActivity, terminalView);
-        terminalView.postDelayed(getShowSoftKeyboardRunnable(), 100);
+        dispatchPendingTerminalImeShow(terminalView);
     }
 
     public void hideSoftKeyboardForTerminal() {
+        cancelPendingShowSoftKeyboard();
+
         TerminalView terminalView = mActivity.getTerminalView();
         if (terminalView == null) return;
 
@@ -767,7 +821,11 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     public void bindTerminalViewKeyboardBehavior(TerminalView terminalView) {
         if (terminalView == null) return;
 
+        bindTerminalImeReadinessCallbacks(terminalView);
+
         terminalView.setOnFocusChangeListener((view, hasFocus) -> {
+            if (hasFocus) dispatchPendingTerminalImeShow(terminalView);
+
             if (mActivity.isEmbeddedTerminalWorkspaceVisible() && mActivity.isEmbeddedTerminalImeActive()) {
                 Logger.logVerbose(LOG_TAG, "Ignoring terminal focus change while embedded IME proxy is active");
                 return;
@@ -798,6 +856,78 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
             KeyboardUtils.setSoftKeyboardVisibility(getShowSoftKeyboardRunnable(), mActivity, terminalView,
                 hasFocus || textInputViewHasFocus);
+        });
+    }
+
+    private void bindTerminalImeReadinessCallbacks(TerminalView terminalView) {
+        if (mKeyboardBehaviorTerminalView == terminalView) return;
+
+        if (mKeyboardBehaviorTerminalView != null) {
+            mKeyboardBehaviorTerminalView.removeOnAttachStateChangeListener(mTerminalImeAttachStateChangeListener);
+            removeTerminalImeWindowFocusListener(mKeyboardBehaviorTerminalView);
+            mKeyboardBehaviorTerminalView.setOnFocusChangeListener(null);
+        }
+
+        mKeyboardBehaviorTerminalView = terminalView;
+        terminalView.addOnAttachStateChangeListener(mTerminalImeAttachStateChangeListener);
+        if (terminalView.isAttachedToWindow()) {
+            installTerminalImeWindowFocusListener(terminalView);
+        }
+    }
+
+    private void installTerminalImeWindowFocusListener(TerminalView terminalView) {
+        removeTerminalImeWindowFocusListener(terminalView);
+
+        ViewTreeObserver observer = terminalView.getViewTreeObserver();
+        if (!observer.isAlive()) return;
+
+        mTerminalImeWindowFocusChangeListener = hasWindowFocus -> {
+            if (hasWindowFocus && terminalView == mKeyboardBehaviorTerminalView) {
+                dispatchPendingTerminalImeShow(terminalView);
+            }
+        };
+        observer.addOnWindowFocusChangeListener(mTerminalImeWindowFocusChangeListener);
+    }
+
+    private void removeTerminalImeWindowFocusListener(TerminalView terminalView) {
+        if (mTerminalImeWindowFocusChangeListener == null) return;
+
+        ViewTreeObserver observer = terminalView.getViewTreeObserver();
+        if (observer.isAlive()) {
+            observer.removeOnWindowFocusChangeListener(mTerminalImeWindowFocusChangeListener);
+        }
+        mTerminalImeWindowFocusChangeListener = null;
+    }
+
+    private void dispatchPendingTerminalImeShow(TerminalView terminalView) {
+        final long token = mTerminalImeRequestStateMachine.getPendingToken();
+        if (token == 0L) return;
+
+        if (mActivity.isFinishing() || mActivity.isDestroyed() || !mActivity.isVisible() ||
+            terminalView != mActivity.getTerminalView()) {
+            mTerminalImeRequestStateMachine.cancelShow();
+            return;
+        }
+        if (!terminalView.isAttachedToWindow()) return;
+        if (terminalView.getVisibility() != View.VISIBLE || !terminalView.isShown()) {
+            mTerminalImeRequestStateMachine.cancelShow();
+            return;
+        }
+        if (!terminalView.hasFocus() && !terminalView.requestFocus()) return;
+        if (!terminalView.hasWindowFocus() || terminalView.getWindowToken() == null) return;
+
+        terminalView.post(() -> {
+            boolean ready = terminalView == mActivity.getTerminalView() &&
+                !mActivity.isFinishing() && !mActivity.isDestroyed() && mActivity.isVisible() &&
+                terminalView.isAttachedToWindow() && terminalView.isShown() &&
+                terminalView.hasWindowFocus() && terminalView.hasFocus() &&
+                terminalView.getWindowToken() != null;
+            if (ready && mTerminalImeRequestStateMachine.consumeIfReady(token,
+                terminalView.isAttachedToWindow(), terminalView.isShown(),
+                terminalView.hasWindowFocus(), terminalView.hasFocus(),
+                terminalView.getWindowToken() != null)) {
+                KeyboardUtils.showSoftKeyboard(mActivity, terminalView);
+            }
         });
     }
 
@@ -1050,31 +1180,33 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         TerminalSession session = mActivity.getCurrentSession();
         if (session == null) return;
 
-        String text = ShellUtils.getTerminalSessionTranscriptText(session, true, true);
-
-        LinkedHashSet<CharSequence> urlSet = TermuxUrlUtils.extractUrls(text);
+        TerminalEmulator emulator = session.getEmulator();
+        if (emulator == null || emulator.getScreen() == null) return;
+        TerminalSelectionContext transcriptContext = extractStableTranscriptContext(emulator);
+        if (transcriptContext == null) return;
+        LinkedHashSet<String> urlSet = TerminalLinkResolver.extractUrls(transcriptContext, true);
         if (urlSet.isEmpty()) {
             new AlertDialog.Builder(mActivity).setMessage(R.string.title_select_url_none_found).show();
             return;
         }
 
-        final CharSequence[] urls = urlSet.toArray(new CharSequence[0]);
+        final String[] urls = urlSet.toArray(new String[0]);
         Collections.reverse(Arrays.asList(urls)); // Latest first.
 
         final int[] selectedIndex = {0};
         final AlertDialog dialog = new AlertDialog.Builder(mActivity)
             .setSingleChoiceItems(urls, 0, (di, which) -> {
                 selectedIndex[0] = which;
-                String url = (String) urls[which];
+                String url = urls[which];
                 ShareUtils.copyTextToClipboard(mActivity, url, mActivity.getString(R.string.msg_select_url_copied_to_clipboard));
             })
             .setPositiveButton(R.string.action_copy_detected_url, (di, which) -> {
-                String url = (String) urls[selectedIndex[0]];
+                String url = urls[selectedIndex[0]];
                 ShareUtils.copyTextToClipboard(mActivity, url, mActivity.getString(R.string.msg_select_url_copied_to_clipboard));
             })
             .setNeutralButton(R.string.action_open_detected_url, (di, which) -> {
-                String url = (String) urls[selectedIndex[0]];
-                ShareUtils.openUrl(mActivity, url);
+                String url = urls[selectedIndex[0]];
+                onOpenUrl(url);
             })
             .setNegativeButton(R.string.action_cancel_select_url_dialog, null)
             .setTitle(R.string.title_select_url_dialog)
@@ -1086,13 +1218,30 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             lv.setOnItemLongClickListener((parent, view, position, id) -> {
                 selectedIndex[0] = position;
                 dialog.dismiss();
-                String url = (String) urls[position];
-                ShareUtils.openUrl(mActivity, url);
+                String url = urls[position];
+                onOpenUrl(url);
                 return true;
             });
         });
 
         dialog.show();
+    }
+
+    @Nullable
+    private TerminalSelectionContext extractStableTranscriptContext(TerminalEmulator emulator) {
+        TerminalBuffer screen = emulator.getScreen();
+        for (int attempt = 0; attempt < URL_SNAPSHOT_ATTEMPTS; attempt++) {
+            long revisionBefore = screen.getContentRevision();
+            try {
+                TerminalSelectionContext context =
+                    TerminalSelectionContextExtractor.extractTranscriptContext(screen);
+                long revisionAfter = screen.getContentRevision();
+                if (revisionBefore == revisionAfter && emulator.getScreen() == screen) return context;
+            } catch (IndexOutOfBoundsException | IllegalArgumentException ignored) {
+                // Retry if the terminal was resized while the transcript was copied.
+            }
+        }
+        return null;
     }
 
     public void reportIssueFromTranscript() {

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <receiver
+            android:name="com.tencent.shadow.sample.host.ShadowControlReceiver"
+            android:exported="false" />
+
+        <activity
+            android:name="com.tencent.shadow.sample.host.MainActivity"
+            android:exported="false"
+            android:theme="@style/TestHostTheme" />
+
+        <activity
+            android:name="com.tencent.shadow.sample.host.PluginLoadActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="standard"
+            android:screenOrientation="portrait" />
+
+        <activity
+            android:name="com.tencent.shadow.sample.host.plugin_view.HostAddPluginViewActivity"
+            android:exported="false"
+            android:process=":plugin" />
+
+        <provider
+            android:name="com.tencent.shadow.core.runtime.container.PluginContainerContentProvider"
+            android:authorities="${applicationId}.contentprovider.authority.dynamic"
+            android:exported="false"
+            android:grantUriPermissions="true"
+            android:process=":plugin" />
+
+        <service
+            android:name="com.tencent.shadow.sample.host.PluginProcessPPS"
+            android:exported="false"
+            android:process=":plugin" />
+
+        <service
+            android:name="com.tencent.shadow.sample.host.Plugin2ProcessPPS"
+            android:exported="false"
+            android:process=":plugin2" />
+
+        <activity
+            android:name="com.tencent.shadow.sample.plugin.runtime.PluginDefaultProxyActivity"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:launchMode="standard"
+            android:multiprocess="true"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen" />
+
+        <activity
+            android:name="com.tencent.shadow.sample.plugin.runtime.PluginSingleInstance1ProxyActivity"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:launchMode="singleInstance"
+            android:multiprocess="true"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen" />
+
+        <activity
+            android:name="com.tencent.shadow.sample.plugin.runtime.PluginSingleTask1ProxyActivity"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:launchMode="singleTask"
+            android:multiprocess="true"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen" />
+
+        <receiver
+            android:name="com.tencent.shadow.sample.host.plugin_view.MainProcessManagerReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="sample_host.manager.startPluginService" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

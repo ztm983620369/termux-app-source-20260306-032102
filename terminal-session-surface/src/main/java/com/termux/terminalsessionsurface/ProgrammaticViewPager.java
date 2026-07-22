@@ -28,8 +28,10 @@ public class ProgrammaticViewPager extends ViewPager {
 
     @Nullable private SwipeRegionProvider swipeRegionProvider;
     @Nullable private SwipeGestureListener swipeGestureListener;
-    private boolean gestureStartedInSwipeRegion;
-    private boolean gestureCapturedByPager;
+    @NonNull
+    private final TerminalSessionSwipeGestureStateMachine gestureStateMachine =
+        new TerminalSessionSwipeGestureStateMachine();
+    @NonNull private final Rect swipeRegionBounds = new Rect();
 
     public ProgrammaticViewPager(@NonNull Context context) {
         super(context);
@@ -51,91 +53,85 @@ public class ProgrammaticViewPager extends ViewPager {
     public boolean onInterceptTouchEvent(MotionEvent ev) {
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                gestureCapturedByPager = false;
-                gestureStartedInSwipeRegion = isTouchInSwipeRegion(ev);
-                if (gestureStartedInSwipeRegion && swipeGestureListener != null) {
-                    swipeGestureListener.onSwipeTouchDownInRegion();
-                }
-                if (!gestureStartedInSwipeRegion) {
-                    return false;
-                }
+                dispatchGestureSignals(gestureStateMachine.onDown(ev.getDownTime(), isTouchInSwipeRegion(ev)));
+                if (!gestureStateMachine.isEligible(ev.getDownTime())) return false;
                 return dispatchIntercept(ev);
             case MotionEvent.ACTION_MOVE:
-                if (!gestureStartedInSwipeRegion) {
-                    return false;
-                }
+                if (!gestureStateMachine.isEligible(ev.getDownTime())) return false;
                 return dispatchIntercept(ev);
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
-                if (!gestureStartedInSwipeRegion) {
+                if (!gestureStateMachine.isEligible(ev.getDownTime())) {
+                    gestureStateMachine.onFinished(ev.getDownTime());
                     return false;
                 }
                 boolean intercepted = dispatchIntercept(ev);
-                finishSwipeGesture();
+                dispatchGestureSignals(gestureStateMachine.onFinished(ev.getDownTime()));
                 return intercepted;
             default:
-                return gestureStartedInSwipeRegion && dispatchIntercept(ev);
+                return gestureStateMachine.isEligible(ev.getDownTime()) && dispatchIntercept(ev);
         }
     }
 
     @Override
     public boolean onTouchEvent(MotionEvent ev) {
-        if (!gestureStartedInSwipeRegion && ev.getActionMasked() != MotionEvent.ACTION_DOWN) {
+        if (!gestureStateMachine.isEligible(ev.getDownTime()) && ev.getActionMasked() != MotionEvent.ACTION_DOWN) {
             return false;
         }
 
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                gestureCapturedByPager = false;
-                gestureStartedInSwipeRegion = isTouchInSwipeRegion(ev);
-                if (gestureStartedInSwipeRegion && swipeGestureListener != null) {
-                    swipeGestureListener.onSwipeTouchDownInRegion();
-                }
-                if (!gestureStartedInSwipeRegion) return false;
-                boolean handledDown = super.onTouchEvent(ev);
-                if (handledDown) {
-                    captureSwipeGesture();
-                }
-                return handledDown;
+                dispatchGestureSignals(gestureStateMachine.onDown(ev.getDownTime(), isTouchInSwipeRegion(ev)));
+                if (!gestureStateMachine.isEligible(ev.getDownTime())) return false;
+                return dispatchTouch(ev);
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
-                boolean handledUp = gestureStartedInSwipeRegion && super.onTouchEvent(ev);
-                finishSwipeGesture();
+                boolean handledUp = gestureStateMachine.isEligible(ev.getDownTime()) && dispatchTouch(ev);
+                dispatchGestureSignals(gestureStateMachine.onFinished(ev.getDownTime()));
                 return handledUp;
             default:
-                if (!gestureStartedInSwipeRegion) return false;
-                boolean handledMove = super.onTouchEvent(ev);
-                if (handledMove) {
-                    captureSwipeGesture();
+                if (!gestureStateMachine.isEligible(ev.getDownTime())) return false;
+                boolean handledMove = dispatchTouch(ev);
+                if (handledMove && ev.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                    dispatchGestureSignals(gestureStateMachine.onCaptured(ev.getDownTime()));
                 }
                 return handledMove;
         }
     }
 
     private boolean dispatchIntercept(@NonNull MotionEvent event) {
-        boolean intercepted = super.onInterceptTouchEvent(event);
+        final boolean intercepted;
+        try {
+            intercepted = super.onInterceptTouchEvent(event);
+        } catch (IllegalArgumentException ignored) {
+            dispatchGestureSignals(gestureStateMachine.onFinished(event.getDownTime()));
+            return false;
+        }
         if (intercepted) {
-            captureSwipeGesture();
+            dispatchGestureSignals(gestureStateMachine.onCaptured(event.getDownTime()));
         }
         return intercepted;
     }
 
-    private void captureSwipeGesture() {
-        if (gestureCapturedByPager) return;
-
-        gestureCapturedByPager = true;
-        if (swipeGestureListener != null) {
-            swipeGestureListener.onSwipeGestureCaptured();
+    private boolean dispatchTouch(@NonNull MotionEvent event) {
+        try {
+            return super.onTouchEvent(event);
+        } catch (IllegalArgumentException ignored) {
+            dispatchGestureSignals(gestureStateMachine.onFinished(event.getDownTime()));
+            return false;
         }
     }
 
-    private void finishSwipeGesture() {
-        boolean notifyFinished = gestureStartedInSwipeRegion || gestureCapturedByPager;
-        gestureStartedInSwipeRegion = false;
-        gestureCapturedByPager = false;
-
-        if (notifyFinished && swipeGestureListener != null) {
+    private void dispatchGestureSignals(int signals) {
+        if (swipeGestureListener == null || signals == TerminalSessionSwipeGestureStateMachine.SIGNAL_NONE) return;
+        if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_FINISHED) != 0) {
             swipeGestureListener.onSwipeGestureFinished();
+        }
+        if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_TOUCH_DOWN) != 0) {
+            swipeGestureListener.onSwipeTouchDownInRegion();
+        }
+        if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_CAPTURED) != 0) {
+            swipeGestureListener.onSwipeGestureCaptured();
         }
     }
 
@@ -145,11 +141,10 @@ public class ProgrammaticViewPager extends ViewPager {
             return false;
         }
 
-        Rect rect = new Rect();
-        if (!regionView.getGlobalVisibleRect(rect)) {
+        if (!regionView.getGlobalVisibleRect(swipeRegionBounds)) {
             return false;
         }
 
-        return rect.contains(Math.round(event.getRawX()), Math.round(event.getRawY()));
+        return swipeRegionBounds.contains(Math.round(event.getRawX()), Math.round(event.getRawY()));
     }
 }

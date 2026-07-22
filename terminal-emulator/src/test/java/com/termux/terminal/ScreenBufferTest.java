@@ -84,4 +84,95 @@ public class ScreenBufferTest extends TerminalTestCase {
 		assertEquals(styleB, screen.getStyleAt(0, 3));
 		assertEquals(styleA, screen.getStyleAt(0, 4));
 	}
+
+	public void testIdenticalSimpleWritesDoNotMarkRowsDirty() {
+		TerminalBuffer screen = new TerminalBuffer(5, 3, 3);
+		screen.clearDirtyRows();
+
+		screen.setChar(0, 0, ' ', TextStyle.NORMAL);
+		assertFalse(screen.hasDirtyRows());
+
+		byte[] unchanged = new byte[]{' ', ' ', ' '};
+		assertTrue(screen.setAsciiRunIfSimple(1, 1, unchanged, 0, unchanged.length, TextStyle.NORMAL));
+		assertFalse(screen.hasDirtyRows());
+
+		byte[] changed = new byte[]{'a', 'b', 'c'};
+		assertTrue(screen.setAsciiRunIfSimple(1, 1, changed, 0, changed.length, TextStyle.NORMAL));
+		assertTrue(screen.hasDirtyRows());
+		assertEquals(1, screen.getDirtyStartRow());
+		assertEquals(2, screen.getDirtyEndRow());
+	}
+
+	public void testContentRevisionChangesOnlyWhenTheBufferIsMarkedOrWrapStateChanges() {
+		TerminalBuffer screen = new TerminalBuffer(5, 3, 3);
+		long initial = screen.getContentRevision();
+
+		screen.setChar(0, 0, ' ', TextStyle.NORMAL);
+		assertEquals(initial, screen.getContentRevision());
+
+		screen.setChar(0, 0, 'x', TextStyle.NORMAL);
+		long afterText = screen.getContentRevision();
+		assertTrue(afterText > initial);
+
+		screen.setLineWrap(0);
+		long afterWrap = screen.getContentRevision();
+		assertTrue(afterWrap > afterText);
+		screen.setLineWrap(0);
+		assertEquals(afterWrap, screen.getContentRevision());
+
+		screen.clearLineWrap(0);
+		assertTrue(screen.getContentRevision() > afterWrap);
+	}
+
+	public void testHyperlinkOnlyChangesInvalidateAndParticipateInSynchronizedOutput() {
+		TerminalBuffer screen = new TerminalBuffer(5, 3, 3);
+		screen.setChar(0, 0, 'x', TextStyle.NORMAL, "https://one.example/path");
+		screen.clearDirtyRows();
+		long before = screen.getContentRevision();
+
+		screen.setChar(0, 0, 'x', TextStyle.NORMAL, "https://two.example/path");
+		assertTrue(screen.hasDirtyRows());
+		assertTrue(screen.getContentRevision() > before);
+		assertEquals("https://two.example/path", screen.getHyperlinkAt(0, 0));
+
+		screen.clearDirtyRows();
+		screen.beginSynchronizedOutput();
+		screen.setChar(0, 0, 'x', TextStyle.NORMAL, "https://three.example/path");
+		screen.setChar(0, 0, 'x', TextStyle.NORMAL, "https://two.example/path");
+		screen.finishSynchronizedOutput();
+		assertFalse("Restored hyperlink metadata must not leave a dirty row", screen.hasDirtyRows());
+	}
+
+	public void testSynchronizedOutputKeepsOnlyFinalRowDifferences() {
+		TerminalBuffer screen = new TerminalBuffer(5, 3, 3);
+		screen.clearDirtyRows();
+
+		screen.beginSynchronizedOutput();
+		screen.setChar(2, 1, 'x', TextStyle.NORMAL);
+		screen.setChar(2, 1, ' ', TextStyle.NORMAL);
+		screen.finishSynchronizedOutput();
+		assertFalse("A row restored before synchronized presentation must stay clean", screen.hasDirtyRows());
+
+		screen.beginSynchronizedOutput();
+		screen.setChar(3, 2, 'y', TextStyle.NORMAL);
+		screen.finishSynchronizedOutput();
+		assertTrue(screen.hasDirtyRows());
+		assertEquals(2, screen.getDirtyStartRow());
+		assertEquals(3, screen.getDirtyEndRow());
+	}
+
+	public void testSynchronizedOutputPreservesPreexistingDirtyRows() {
+		TerminalBuffer screen = new TerminalBuffer(5, 3, 3);
+		screen.clearDirtyRows();
+		screen.setChar(0, 0, 'z', TextStyle.NORMAL);
+
+		screen.beginSynchronizedOutput();
+		screen.setChar(1, 2, 'q', TextStyle.NORMAL);
+		screen.setChar(1, 2, ' ', TextStyle.NORMAL);
+		screen.finishSynchronizedOutput();
+
+		assertTrue(screen.hasDirtyRows());
+		assertEquals(0, screen.getDirtyStartRow());
+		assertEquals(1, screen.getDirtyEndRow());
+	}
 }

@@ -14,8 +14,15 @@ include ':app', ':termux-shared', ':terminal-emulator', ':terminal-view',
         ':session-sync-core',
         ':ecj-bridge-core',
         ':file-bridge',
+        ':shadow-termux-host',
         ':file-manager',
-        ':fossify-commons'
+        ':fossify-commons',
+        ':pictureselector-selector',
+        ':pictureselector-ucrop',
+        ':pictureselector-compress',
+        ':pictureselector-camerax',
+        ':pictureselector-ijkplayer-java',
+        ':pictureselector-app-source'
 
 project(':sora-editor').projectDir = new File(rootDir, 'sora-editor-0.24.3/editor')
 project(':sora-demo').projectDir = new File(rootDir, 'sora-editor-0.24.3/app')
@@ -26,4 +33,17 @@ project(':sora-editor-lsp').projectDir = new File(rootDir, 'sora-editor-0.24.3/e
 project(':sora-language-treesitter').projectDir = new File(rootDir, 'sora-editor-0.24.3/language-treesitter')
 project(':sora-oniguruma-native').projectDir = new File(rootDir, 'sora-editor-0.24.3/oniguruma-native')
 project(':file-manager').projectDir = new File(rootDir, 'File-Manager-1.5.0/File-Manager-1.5.0/app')
+project(':shadow-termux-host').projectDir = new File(rootDir, 'shadow-termux-host')
 project(':fossify-commons').projectDir = new File(rootDir, 'fossify-commons')
+project(':pictureselector-selector').projectDir = new File(rootDir, 'third_party/PictureSelector/selector')
+project(':pictureselector-ucrop').projectDir = new File(rootDir, 'third_party/PictureSelector/ucrop')
+project(':pictureselector-compress').projectDir = new File(rootDir, 'third_party/PictureSelector/compress')
+project(':pictureselector-camerax').projectDir = new File(rootDir, 'third_party/PictureSelector/camerax')
+project(':pictureselector-ijkplayer-java').projectDir = new File(rootDir, 'third_party/PictureSelector/ijkplayer-java')
+project(':pictureselector-app-source').projectDir = new File(rootDir, 'third_party/PictureSelector/app')
+project(':pictureselector-selector').buildFileName = 'tindroid.gradle'
+project(':pictureselector-ucrop').buildFileName = 'tindroid.gradle'
+project(':pictureselector-compress').buildFileName = 'tindroid.gradle'
+project(':pictureselector-camerax').buildFileName = 'tindroid.gradle'
+project(':pictureselector-ijkplayer-java').buildFileName = 'tindroid.gradle'
+project(':pictureselector-app-source').buildFileName = 'tindroid.gradle'

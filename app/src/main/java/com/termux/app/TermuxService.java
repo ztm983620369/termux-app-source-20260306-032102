@@ -20,6 +20,8 @@ import androidx.annotation.Nullable;
 
 import com.termux.R;
 import com.termux.app.event.SystemEventReceiver;
+import com.termux.app.terminal.CodexImageAttachmentController;
+import com.termux.app.terminal.CodexSessionRecoveryController;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
 import com.termux.app.terminal.TermuxTerminalSessionServiceClient;
 import com.termux.shared.termux.plugins.TermuxPluginUtils;
@@ -48,6 +50,7 @@ import com.termux.shared.shell.command.ExecutionCommand.ShellCreateMode;
 import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
+import com.tencent.shadow.sample.host.ShadowBuildWorkerContract;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -88,6 +91,15 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
      */
     private final TermuxTerminalSessionServiceClient mTermuxTerminalSessionServiceClient = new TermuxTerminalSessionServiceClient(this);
 
+    /** Owns durable Codex lease reconciliation even while no activity is bound. */
+    private CodexSessionRecoveryController mCodexSessionRecoveryController;
+
+    /** Owns gallery materialization and remote attachment transfer while no activity is bound. */
+    private CodexImageAttachmentController mCodexImageAttachmentController;
+
+    /** Keeps Shadow build state and Gradle daemon outside short-lived Codex command sessions. */
+    private ShadowPluginWorkerSupervisor mShadowPluginWorkerSupervisor;
+
     /**
      * Termux app shared properties manager, loaded from termux.properties
      */
@@ -116,6 +128,10 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         mProperties = TermuxAppSharedProperties.getProperties();
 
         mShellManager = TermuxShellManager.getShellManager();
+        mCodexSessionRecoveryController = new CodexSessionRecoveryController(this);
+        mCodexImageAttachmentController = new CodexImageAttachmentController(this);
+        ShadowPluginToolingInstaller.installIfPresent(this);
+        mShadowPluginWorkerSupervisor = new ShadowPluginWorkerSupervisor(this);
 
         runStartForeground();
 
@@ -154,6 +170,18 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
                     Logger.logDebug(LOG_TAG, "ACTION_SERVICE_EXECUTE intent received");
                     actionServiceExecute(intent);
                     break;
+                case ShadowBuildWorkerContract.ACTION_ENSURE:
+                    Logger.logInfo(LOG_TAG, "Shadow Worker ensure requested: "
+                        + mShadowPluginWorkerSupervisor.ensure());
+                    break;
+                case ShadowBuildWorkerContract.ACTION_QUERY:
+                    Logger.logInfo(LOG_TAG, "Shadow Worker state: "
+                        + mShadowPluginWorkerSupervisor.query());
+                    break;
+                case ShadowBuildWorkerContract.ACTION_STOP:
+                    Logger.logInfo(LOG_TAG, "Shadow Worker stop requested: "
+                        + mShadowPluginWorkerSupervisor.stop());
+                    break;
                 default:
                     Logger.logError(LOG_TAG, "Invalid action: \"" + action + "\"");
                     break;
@@ -168,6 +196,10 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     @Override
     public void onDestroy() {
         Logger.logVerbose(LOG_TAG, "onDestroy");
+
+        if (mCodexSessionRecoveryController != null) mCodexSessionRecoveryController.stop();
+        if (mCodexImageAttachmentController != null) mCodexImageAttachmentController.stop();
+        if (mShadowPluginWorkerSupervisor != null) mShadowPluginWorkerSupervisor.stop();
 
         TermuxShellUtils.clearTermuxTMPDIR(true);
 
@@ -901,6 +933,16 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         return mShellManager.mTermuxSessions;
     }
 
+    public synchronized int moveTermuxSessionToIndex(@NonNull TerminalSession terminalSession, int targetIndex) {
+        int currentIndex = getIndexOfSession(terminalSession);
+        if (currentIndex < 0 || targetIndex < 0 || targetIndex == Integer.MAX_VALUE) return currentIndex;
+
+        TermuxSession termuxSession = mShellManager.mTermuxSessions.remove(currentIndex);
+        int boundedIndex = Math.min(targetIndex, mShellManager.mTermuxSessions.size());
+        mShellManager.mTermuxSessions.add(boundedIndex, termuxSession);
+        return boundedIndex;
+    }
+
     @Nullable
     public synchronized TermuxSession getTermuxSession(int index) {
         if (index >= 0 && index < mShellManager.mTermuxSessions.size())
@@ -973,6 +1015,22 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
     public boolean wantsToStop() {
         return mWantsToStop;
+    }
+
+    @NonNull
+    public synchronized CodexSessionRecoveryController getCodexSessionRecoveryController() {
+        if (mCodexSessionRecoveryController == null) {
+            mCodexSessionRecoveryController = new CodexSessionRecoveryController(this);
+        }
+        return mCodexSessionRecoveryController;
+    }
+
+    @NonNull
+    public synchronized CodexImageAttachmentController getCodexImageAttachmentController() {
+        if (mCodexImageAttachmentController == null) {
+            mCodexImageAttachmentController = new CodexImageAttachmentController(this);
+        }
+        return mCodexImageAttachmentController;
     }
 
 }

@@ -1,0 +1,116 @@
+plugins {
+    id 'com.android.application'
+}
+
+def shadowPlugin = rootProject.ext.shadowPluginConfig
+def generatedShadowManifestDir = layout.buildDirectory.dir("generated/source/shadowPluginManifest")
+
+tasks.register("generateShadowPluginManifest") {
+    inputs.file(rootProject.file("shadow-plugin.properties"))
+    inputs.property("activityClassName", shadowPlugin.activityClassName)
+    outputs.dir(generatedShadowManifestDir)
+
+    doLast {
+        File output = generatedShadowManifestDir.get().file(
+                "com/tencent/shadow/core/manifest_parser/PluginManifest.java"
+        ).asFile
+        output.parentFile.mkdirs()
+        output.setText("""package com.tencent.shadow.core.manifest_parser;
+
+public class PluginManifest implements com.tencent.shadow.core.runtime.PluginManifest {
+    private static final String applicationPackageName = \"com.termux\";
+    private static final String applicationClassName = null;
+    private static final String appComponentFactory = null;
+    private static final int applicationTheme = android.R.style.Theme_Material_Light_NoActionBar;
+    private static final com.tencent.shadow.core.runtime.PluginManifest.ActivityInfo[] activities =
+            new com.tencent.shadow.core.runtime.PluginManifest.ActivityInfo[]{
+                    new com.tencent.shadow.core.runtime.PluginManifest.ActivityInfo(
+                            \"${shadowPlugin.activityClassName}\",
+                            android.R.style.Theme_Material_Light_NoActionBar,
+                            0,
+                            0,
+                            -1
+                    )
+            };
+    private static final com.tencent.shadow.core.runtime.PluginManifest.ServiceInfo[] services =
+            new com.tencent.shadow.core.runtime.PluginManifest.ServiceInfo[]{};
+    private static final com.tencent.shadow.core.runtime.PluginManifest.ReceiverInfo[] receivers =
+            new com.tencent.shadow.core.runtime.PluginManifest.ReceiverInfo[]{};
+    private static final com.tencent.shadow.core.runtime.PluginManifest.ProviderInfo[] providers =
+            new com.tencent.shadow.core.runtime.PluginManifest.ProviderInfo[]{};
+
+    public final String getApplicationPackageName() { return applicationPackageName; }
+    public final String getApplicationClassName() { return applicationClassName; }
+    public final String getAppComponentFactory() { return appComponentFactory; }
+    public final int getApplicationTheme() { return applicationTheme; }
+    public final com.tencent.shadow.core.runtime.PluginManifest.ActivityInfo[] getActivities() { return activities; }
+    public final com.tencent.shadow.core.runtime.PluginManifest.ServiceInfo[] getServices() { return services; }
+    public final com.tencent.shadow.core.runtime.PluginManifest.ReceiverInfo[] getReceivers() { return receivers; }
+    public final com.tencent.shadow.core.runtime.PluginManifest.ProviderInfo[] getProviders() { return providers; }
+}
+""", "UTF-8")
+    }
+}
+
+android {
+    namespace shadowPlugin.namespace
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.termux'
+        minSdk 23
+        targetSdk 35
+        versionCode providers.gradleProperty("shadowPluginVersionCode")
+                .map { it.toInteger() }
+                .orElse(shadowPlugin.defaultVersionCode.intValue())
+                .get()
+        versionName providers.gradleProperty("shadowPluginVersionName")
+                .orElse(shadowPlugin.defaultVersionName)
+                .get()
+        manifestPlaceholders = [
+                shadowActivityClassName: shadowPlugin.activityClassName,
+                shadowDisplayName      : shadowPlugin.displayName
+        ]
+        buildConfigField "String", "SHADOW_PLUGIN_ID", "\"${shadowPlugin.pluginId}\""
+        buildConfigField "String", "SHADOW_PART_KEY", "\"${shadowPlugin.partKey}\""
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    aaptOptions {
+        additionalParameters "--package-id", shadowPlugin.resourcePackageId,
+                "--allow-reserved-package-id"
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    packaging {
+        resources {
+            excludes += [
+                    'META-INF/DEPENDENCIES',
+                    'META-INF/LICENSE',
+                    'META-INF/LICENSE.txt',
+                    'META-INF/NOTICE',
+                    'META-INF/NOTICE.txt',
+                    'META-INF/versions/**'
+            ]
+        }
+    }
+
+    sourceSets {
+        main.java.srcDir(generatedShadowManifestDir)
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn "generateShadowPluginManifest"
+}
+
+dependencies {
+    compileOnly files('../shadow/compile-only/shadow-runtime.jar')
+}

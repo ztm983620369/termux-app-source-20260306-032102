@@ -1,0 +1,56 @@
+/*
+ * Tencent is pleased to support the open source community by making Tencent Shadow available.
+ * Copyright (C) 2019 THL A29 Limited, a Tencent company.  All rights reserved.
+ *
+ * Licensed under the BSD 3-Clause License (the "License"); you may not use
+ * this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ *     https://opensource.org/licenses/BSD-3-Clause
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+package com.tencent.shadow.sample.constant;
+
+final public class Constant {
+    public static final String KEY_PLUGIN_ZIP_PATH = "pluginZipPath";
+    public static final String KEY_PLUGIN_ID = "shadowPluginId";
+    public static final String KEY_PLUGIN_GENERATION = "shadowPluginGeneration";
+    public static final String KEY_OPERATION_ID = "shadowOperationId";
+    public static final String KEY_LAUNCH_LEASE_ID = "shadowLaunchLeaseId";
+    public static final String KEY_ROLLBACK = "shadowRollback";
+    public static final String KEY_RESULT_RECEIVER = "shadowResultReceiver";
+    public static final String KEY_ERROR_TYPE = "shadowErrorType";
+    public static final String KEY_ERROR_MESSAGE = "shadowErrorMessage";
+    public static final String KEY_ERROR_STACK_TRACE = "shadowErrorStackTrace";
+    public static final String KEY_HEALTH_PROTOCOL_VERSION = "shadowHealthProtocolVersion";
+    public static final String KEY_HEALTH_STABILITY_WINDOW_MS = "shadowHealthStabilityWindowMs";
+    public static final String KEY_FIRST_FRAME_ELAPSED_MS = "shadowFirstFrameElapsedMs";
+    public static final String KEY_STABLE_ELAPSED_MS = "shadowStableElapsedMs";
+    public static final String KEY_PLUGIN_PROCESS_PID = "shadowPluginProcessPid";
+    public static final String KEY_PLUGIN_PROCESS_NAME = "shadowPluginProcessName";
+    public static final String KEY_ACTIVITY_CLASSNAME = "KEY_ACTIVITY_CLASSNAME";
+    public static final String KEY_EXTRAS = "KEY_EXTRAS";
+    public static final String KEY_PLUGIN_PART_KEY = "KEY_PLUGIN_PART_KEY";
+    public static final String PART_KEY_PLUGIN_MAIN_APP = "sample-plugin-app";
+    public static final String PART_KEY_PLUGIN_ANOTHER_APP = "sample-plugin-app2";
+    public static final String PART_KEY_PLUGIN_BASE = "sample-base";
+    public static final String ACTIVITY_PLUGIN_ORIGINAL_SAMPLE =
+            "com.tencent.shadow.sample.plugin.app.lib.gallery.splash.SplashActivity";
+
+    public static final int FROM_ID_NOOP = 1000;
+    public static final int FROM_ID_START_ACTIVITY = 1002;
+    public static final int FROM_ID_CLOSE = 1003;
+    public static final int FROM_ID_LOAD_VIEW_TO_HOST = 1004;
+    public static final int RESULT_CODE_START_ERROR = 2001;
+    public static final int RESULT_CODE_RUNTIME_READY = 2002;
+    public static final int RESULT_CODE_RUNTIME_STABLE = 2003;
+    public static final int RESULT_CODE_PLUGIN_PROCESS_DIED = 2004;
+    public static final int HEALTH_PROTOCOL_VERSION = 1;
+}

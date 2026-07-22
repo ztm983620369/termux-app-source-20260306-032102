@@ -1,0 +1,40 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace "com.tencent.shadow.sample.host"
+
+    compileSdkVersion project.properties.compileSdkVersion.toInteger()
+
+    defaultConfig {
+        minSdkVersion project.properties.minSdkVersion.toInteger()
+        targetSdkVersion project.properties.targetSdkVersion.toInteger()
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs += [
+                '../third_party/Shadow/projects/sdk/core/common/src/main/java',
+                '../third_party/Shadow/projects/sdk/core/utils/src/main/java',
+                '../third_party/Shadow/projects/sdk/dynamic/dynamic-apk/src/main/java',
+                '../third_party/Shadow/projects/sdk/dynamic/dynamic-host/src/main/java',
+            ]
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+    implementation "androidx.annotation:annotation:1.9.0"
+    implementation "commons-io:commons-io:2.15.1"
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "org.json:json:20240303"
+}

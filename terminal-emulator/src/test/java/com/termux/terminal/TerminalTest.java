@@ -27,6 +27,30 @@ public class TerminalTest extends TerminalTestCase {
 		assertEquals("hello\nworld", mTerminal.getScreen().getTranscriptText());
 	}
 
+	public void testAsciiRunFastPathKeepsAutowrapSemantics() {
+		withTerminalSized(5, 3).enterString("abcdefghi");
+		assertLinesAre("abcde", "fghi ", "     ");
+		assertLineWraps(true, false, false);
+		assertCursorAt(1, 4);
+	}
+
+	public void testAsciiRunFastPathStopsBeforeEscapeSequence() {
+		withTerminalSized(8, 2).enterString("ab\033[31mcd");
+		assertLinesAre("abcd    ", "        ");
+		assertForegroundColorAt(0, 0, TextStyle.COLOR_INDEX_FOREGROUND);
+		assertForegroundColorAt(0, 1, TextStyle.COLOR_INDEX_FOREGROUND);
+		assertForegroundColorAt(0, 2, 1);
+		assertForegroundColorAt(0, 3, 1);
+		assertCursorAt(0, 4);
+	}
+
+	public void testBackspaceOutsideLeftRightMarginsNeverMakesCursorNegative() {
+		withTerminalSized(40, 12)
+			.enterString("\033[?69h\033[3;35s\033[10;1H\033[4h\bT")
+			.assertCursorAt(9, 1);
+		assertLineStartsWith(9, 'T');
+	}
+
 	public void testScrollDownInAltBuffer() {
 		withTerminalSized(3, 3).enterString("\033[?1049h");
 		enterString("\033[38;5;111m1\r\n");

@@ -20,6 +20,10 @@ public class TerminalSessionSurfaceItemsTest {
         );
 
         Assert.assertTrue(TerminalSessionSurfaceItems.hasSameItems(currentItems, newItems));
+        Assert.assertEquals(
+            TerminalSessionSurfaceItems.ChangeType.NONE,
+            TerminalSessionSurfaceItems.classifyChange(currentItems, newItems)
+        );
     }
 
     @Test
@@ -34,6 +38,10 @@ public class TerminalSessionSurfaceItemsTest {
         );
 
         Assert.assertFalse(TerminalSessionSurfaceItems.hasSameItems(currentItems, newItems));
+        Assert.assertEquals(
+            TerminalSessionSurfaceItems.ChangeType.STRUCTURE,
+            TerminalSessionSurfaceItems.classifyChange(currentItems, newItems)
+        );
     }
 
     @Test
@@ -47,5 +55,9 @@ public class TerminalSessionSurfaceItemsTest {
         );
 
         Assert.assertFalse(TerminalSessionSurfaceItems.hasSameItems(currentItems, newItems));
+        Assert.assertEquals(
+            TerminalSessionSurfaceItems.ChangeType.STRUCTURE,
+            TerminalSessionSurfaceItems.classifyChange(currentItems, newItems)
+        );
     }
 }

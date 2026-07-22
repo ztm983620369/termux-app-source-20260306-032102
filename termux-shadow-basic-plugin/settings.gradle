@@ -1,0 +1,37 @@
+import java.util.Properties
+
+pluginManagement {
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "com.android.library" && requested.version != null) {
+                useModule("com.android.tools.build:gradle:${requested.version}")
+            }
+        }
+    }
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+def shadowPluginFile = new File(settingsDir, "shadow-plugin.properties")
+if (!shadowPluginFile.isFile()) {
+    throw new GradleException("Missing Shadow plugin config: ${shadowPluginFile}")
+}
+Properties shadowPlugin = new Properties()
+shadowPluginFile.withReader("UTF-8") { reader -> shadowPlugin.load(reader) }
+def configuredProjectName = shadowPlugin.getProperty("projectName")?.trim()
+if (configuredProjectName == null || configuredProjectName.isEmpty()) {
+    throw new GradleException("Missing shadow-plugin.properties value: projectName")
+}
+rootProject.name = configuredProjectName
+include ":plugin-app"

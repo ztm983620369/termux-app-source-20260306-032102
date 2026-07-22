@@ -2,13 +2,10 @@ package com.termux.view.textselection;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.ActivityNotFoundException;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.ContextWrapper;
-import android.content.Intent;
 import android.graphics.Rect;
-import android.net.Uri;
 import android.os.Build;
 import android.text.SpannableStringBuilder;
 import android.view.ActionMode;
@@ -20,31 +17,20 @@ import android.view.View;
 import androidx.annotation.Nullable;
 
 import com.termux.terminal.TerminalBuffer;
+import com.termux.terminal.TerminalLinkResolver;
 import com.termux.terminal.TerminalRow;
-import com.termux.terminal.TerminalSelectionContext;
-import com.termux.terminal.TerminalSelectionContextExtractor;
-import com.termux.terminal.TerminalUrlDetectionResult;
 import com.termux.terminal.WcWidth;
 import com.termux.view.R;
 import com.termux.view.TerminalView;
-import com.termux.view.links.TerminalSmartUrlDetector;
 
 import java.util.LinkedHashSet;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 public class TextSelectionCursorController implements CursorController {
 
-    private static final ExecutorService URL_DETECTION_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
-        Thread thread = new Thread(r, "TermuxUrlDetection");
-        thread.setDaemon(true);
-        return thread;
-    });
-    private static final int URL_CONTEXT_PADDING_ROWS = 2;
+    private static final int URL_SNAPSHOT_ATTEMPTS = 3;
 
     private final TerminalView terminalView;
     private final TextSelectionHandleView mStartHandle, mEndHandle;
-    private final TerminalSmartUrlDetector mUrlDetector;
     private String mStoredSelectedText;
     private boolean mIsSelectingText = false;
     private long mShowStartTime = System.currentTimeMillis();
@@ -67,12 +53,12 @@ public class TextSelectionCursorController implements CursorController {
     private int mCachedUrlSelX2 = Integer.MIN_VALUE;
     private int mCachedUrlSelY2 = Integer.MIN_VALUE;
     @Nullable
-    private TerminalUrlDetectionResult mCachedUrlDetectionResult;
-    private int mUrlDetectionGeneration = 0;
+    private LinkedHashSet<String> mCachedUrls;
+    private long mCachedScreenRevision = Long.MIN_VALUE;
+    private boolean mCachedRequiresConfirmation;
 
     public TextSelectionCursorController(TerminalView terminalView) {
         this.terminalView = terminalView;
-        mUrlDetector = new TerminalSmartUrlDetector(terminalView.getContext());
         mStartHandle = new TextSelectionHandleView(terminalView, this, TextSelectionHandleView.LEFT);
         mEndHandle = new TextSelectionHandleView(terminalView, this, TextSelectionHandleView.RIGHT);
 
@@ -120,7 +106,6 @@ public class TextSelectionCursorController implements CursorController {
             mActionMode.finish();
         }
 
-        cancelPendingUrlDetection();
         mSelX1 = mSelY1 = mSelX2 = mSelY2 = -1;
         mIsSelectingText = false;
         terminalView.hideTextSelectionPreview();
@@ -136,6 +121,8 @@ public class TextSelectionCursorController implements CursorController {
         mStartHandle.positionAtCursor(mSelX1, mSelY1, false);
         mEndHandle.positionAtCursor(mSelX2 + 1, mSelY2, false);
 
+        // A TUI can redraw selected cells without moving either handle.
+        if (!isDetectedUrlCacheValid()) scheduleUrlDetection(false);
         if (mActionMode != null) {
             mActionMode.invalidate();
         }
@@ -203,16 +190,11 @@ public class TextSelectionCursorController implements CursorController {
                         terminalView.stopTextSelectionMode();
                         break;
                     case ACTION_OPEN:
-                        LinkedHashSet<String> urls = getDetectedUrlsForSelection();
-                        if (urls.isEmpty()) {
-                            TerminalSelectionContext selectionContext = buildSelectionContext();
-                            if (selectionContext != null) {
-                                urls = mUrlDetector.detectLocally(selectionContext).getUrls();
-                            }
-                        }
-                        if (!urls.isEmpty()) {
+                        UrlDetectionSnapshot detection = detectUrlsForCurrentSelection();
+                        LinkedHashSet<String> urls = detection.result.getUrls();
+                        if (detection.stable && !urls.isEmpty()) {
                             terminalView.stopTextSelectionMode();
-                            openUrls(urls);
+                            openUrls(urls, detection.result.requiresConfirmation());
                         }
                         break;
                     case ACTION_PASTE:
@@ -296,64 +278,51 @@ public class TextSelectionCursorController implements CursorController {
         mCachedUrlSelY1 = Integer.MIN_VALUE;
         mCachedUrlSelX2 = Integer.MIN_VALUE;
         mCachedUrlSelY2 = Integer.MIN_VALUE;
-        mCachedUrlDetectionResult = null;
-    }
-
-    private void cancelPendingUrlDetection() {
-        mUrlDetectionGeneration++;
+        mCachedUrls = null;
+        mCachedScreenRevision = Long.MIN_VALUE;
+        mCachedRequiresConfirmation = false;
     }
 
     private boolean isDetectedUrlCacheValid() {
-        return mCachedUrlDetectionResult != null &&
+        return mCachedUrls != null &&
+            terminalView.mEmulator != null &&
+            mCachedScreenRevision == terminalView.mEmulator.getScreen().getContentRevision() &&
             mCachedUrlSelX1 == mSelX1 && mCachedUrlSelY1 == mSelY1 &&
             mCachedUrlSelX2 == mSelX2 && mCachedUrlSelY2 == mSelY2;
     }
 
     private LinkedHashSet<String> getDetectedUrlsForSelection() {
         if (!isDetectedUrlCacheValid()) return new LinkedHashSet<>();
-        return mCachedUrlDetectionResult.getUrls();
-    }
-
-    @Nullable
-    private TerminalSelectionContext buildSelectionContext() {
-        if (terminalView.mEmulator == null) return null;
-        return TerminalSelectionContextExtractor.extractSelectionContext(
-            terminalView.mEmulator.getScreen(),
-            mSelX1, mSelY1, mSelX2, mSelY2,
-            URL_CONTEXT_PADDING_ROWS
-        );
+        return new LinkedHashSet<>(mCachedUrls);
     }
 
     private void scheduleUrlDetection(boolean invalidateActionMode) {
-        TerminalSelectionContext selectionContext = buildSelectionContext();
-        final int requestGeneration = ++mUrlDetectionGeneration;
-
-        if (selectionContext == null || selectionContext.isEmpty()) {
-            applyUrlDetectionResult(requestGeneration, TerminalUrlDetectionResult.empty(), invalidateActionMode);
+        UrlDetectionSnapshot detection = detectUrlsForCurrentSelection();
+        if (!detection.stable) {
+            invalidateDetectedUrlCache();
+            if (mActionMode != null) mActionMode.invalidate();
             return;
         }
-
-        applyUrlDetectionResult(requestGeneration, mUrlDetector.detectLocally(selectionContext), invalidateActionMode);
-
-        URL_DETECTION_EXECUTOR.execute(() -> {
-            TerminalUrlDetectionResult result = mUrlDetector.detectSmart(selectionContext);
-            terminalView.post(() -> applyUrlDetectionResult(requestGeneration, result, false));
-        });
+        applyUrlDetectionResult(detection.result, detection.screenRevision, invalidateActionMode);
     }
 
-    private void applyUrlDetectionResult(int requestGeneration,
-                                         TerminalUrlDetectionResult detectionResult,
+    private void applyUrlDetectionResult(TerminalLinkResolver.SelectionResult result,
+                                         long screenRevision,
                                          boolean invalidateActionMode) {
-        if (requestGeneration != mUrlDetectionGeneration || !isActive()) return;
+        if (!isActive()) return;
 
+        LinkedHashSet<String> urls = result.getUrls();
         boolean changed = !isDetectedUrlCacheValid()
-            || !getDetectedUrlsForSelection().equals(detectionResult.getUrls());
+            || !getDetectedUrlsForSelection().equals(urls)
+            || mCachedRequiresConfirmation != result.requiresConfirmation();
 
         mCachedUrlSelX1 = mSelX1;
         mCachedUrlSelY1 = mSelY1;
         mCachedUrlSelX2 = mSelX2;
         mCachedUrlSelY2 = mSelY2;
-        mCachedUrlDetectionResult = detectionResult;
+        mCachedUrls = new LinkedHashSet<>(urls);
+        mCachedScreenRevision = screenRevision;
+        mCachedRequiresConfirmation = result.requiresConfirmation();
 
         if (mActionMode != null && (invalidateActionMode || changed)) {
             mActionMode.invalidate();
@@ -370,18 +339,38 @@ public class TextSelectionCursorController implements CursorController {
         return null;
     }
 
-    private void openUrls(LinkedHashSet<String> urls) {
+    private UrlDetectionSnapshot detectUrlsForCurrentSelection() {
+        if (terminalView.mEmulator == null) return UrlDetectionSnapshot.unstable();
+        TerminalBuffer screen = terminalView.mEmulator.getScreen();
+        for (int attempt = 0; attempt < URL_SNAPSHOT_ATTEMPTS; attempt++) {
+            long revisionBefore = screen.getContentRevision();
+            try {
+                TerminalLinkResolver.SelectionResult result =
+                    TerminalLinkResolver.resolveTerminalSelection(
+                        screen, mSelX1, mSelY1, mSelX2, mSelY2, true);
+                long revisionAfter = screen.getContentRevision();
+                if (revisionBefore == revisionAfter &&
+                    terminalView.mEmulator != null && terminalView.mEmulator.getScreen() == screen) {
+                    return new UrlDetectionSnapshot(result, revisionAfter, true);
+                }
+            } catch (IndexOutOfBoundsException | IllegalArgumentException ignored) {
+                // A concurrent resize invalidated coordinates; retry against the next stable frame.
+            }
+        }
+        return UrlDetectionSnapshot.unstable();
+    }
+
+    private void openUrls(LinkedHashSet<String> urls, boolean forceChooser) {
         if (urls == null || urls.isEmpty()) return;
 
-        if (urls.size() == 1) {
+        if (urls.size() == 1 && !forceChooser) {
             openUrl(urls.iterator().next());
             return;
         }
 
         Activity activity = findActivity(terminalView.getContext());
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-            // Best effort: no valid Activity context to show a dialog.
-            openUrl(urls.iterator().next());
+            // Never guess which target to open when a chooser cannot be presented.
             return;
         }
 
@@ -396,14 +385,29 @@ public class TextSelectionCursorController implements CursorController {
             .show();
     }
 
-    private void openUrl(String url) {
-        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        try {
-            terminalView.getContext().startActivity(intent);
-        } catch (ActivityNotFoundException ignored) {
-            // No handler for ACTION_VIEW, keep silent to avoid breaking selection flow.
+    private static final class UrlDetectionSnapshot {
+        final TerminalLinkResolver.SelectionResult result;
+        final long screenRevision;
+        final boolean stable;
+
+        UrlDetectionSnapshot(TerminalLinkResolver.SelectionResult result,
+                             long screenRevision,
+                             boolean stable) {
+            this.result = result;
+            this.screenRevision = screenRevision;
+            this.stable = stable;
         }
+
+        static UrlDetectionSnapshot unstable() {
+            return new UrlDetectionSnapshot(
+                TerminalLinkResolver.resolveSelectionResult(null, true),
+                Long.MIN_VALUE,
+                false);
+        }
+    }
+
+    private void openUrl(String url) {
+        if (terminalView.mClient != null) terminalView.mClient.onOpenUrl(url);
     }
 
     @Override
@@ -562,7 +566,6 @@ public class TextSelectionCursorController implements CursorController {
 
     @Override
     public void onDetached() {
-        cancelPendingUrlDetection();
         terminalView.hideTextSelectionPreview();
     }
 

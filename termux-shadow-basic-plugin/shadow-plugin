@@ -1,0 +1,9 @@
+#!/data/data/com.termux/files/usr/bin/sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+native=${SHADOW_PLUGIN_NATIVE_BIN:-/data/data/com.termux/files/usr/bin/shadow-plugin}
+if [ -x "$native" ] && [ "$native" != "$ROOT_DIR/shadow-plugin" ]; then
+    exec "$native" --project "$ROOT_DIR" "$@"
+fi
+exec sh "$ROOT_DIR/scripts/shadow-plugin.sh" "$@"

@@ -16,6 +16,16 @@
 
     <!-- Terminal Popup -->
     <string name="action_share_transcript">分享终端记录</string>
+    <string name="action_attach_image_to_codex">图片</string>
+    <string name="msg_codex_image_target_unavailable">原终端会话已不可用。</string>
+    <string name="msg_codex_image_picker_failed">无法打开图片选择器。</string>
+    <string name="msg_codex_image_processing_progress">正在处理 %1$d/%2$d</string>
+    <string name="msg_codex_image_processing_complete">完成</string>
+    <string name="msg_codex_image_processing_failed">处理失败</string>
+    <plurals name="msg_codex_images_attached">
+        <item quantity="other">已添加 %d 张图片到 Codex</item>
+    </plurals>
+    <string name="msg_codex_images_attached_with_reuse">已添加 %1$d 张；批内去重 %2$d，本地复用 %3$d，远端复用 %4$d</string>
     <string name="title_share_transcript">终端记录</string>
     <string name="title_share_transcript_with">发送终端记录到：</string>
     <string name="action_share_selected_text">分享选中文本</string>

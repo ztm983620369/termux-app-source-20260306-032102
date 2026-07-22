@@ -1,5 +1,7 @@
 package org.fossify.filemanager.helpers
 
+import android.system.Os
+import android.system.OsConstants
 import com.termux.sessionsync.FileRootResolver
 import com.termux.sessionsync.SessionFileCoordinator
 import com.termux.sessionsync.SftpProtocolManager
@@ -37,7 +39,9 @@ class ArchiveTransferWorkflow(
         val targetPath: String = "",
         val highlightPaths: ArrayList<String> = arrayListOf(),
         val installCommand: String = "",
-        val dialogTitle: String = ""
+        val dialogTitle: String = "",
+        val operationId: String = "",
+        val diagnosticsPath: String = ""
     )
 
     enum class CompressionFormat(val sevenZipType: String, val suffix: String) {
@@ -119,6 +123,9 @@ class ArchiveTransferWorkflow(
     private data class RemoteArchiveCapabilities(
         val tools: Set<String>
     )
+
+    private val operationJournal = runCatching { ArchiveOperationJournal(activity) }.getOrNull()
+    private val activeOperation = ThreadLocal<ArchiveOperationJournal.Handle?>()
 
     private enum class ArchiveKind(
         val suffixes: List<String>,
@@ -238,10 +245,6 @@ class ArchiveTransferWorkflow(
             localZipCompatible = false
         );
 
-        fun isCompressedTar(): Boolean {
-            return this == TAR_GZ || this == TAR_BZ2 || this == TAR_XZ || this == TAR_ZST
-        }
-
         companion object {
             fun fromName(name: String): ArchiveKind? {
                 val lower = name.lowercase(Locale.ROOT)
@@ -345,7 +348,13 @@ class ArchiveTransferWorkflow(
 
         buildSingleServerRemoteSourceContext(selectedItems)?.let { remoteSourceContext ->
             val jobDir = createJobDirectory()
-            return runArchiveJob(jobDir, cancelled) {
+            return runArchiveJob(
+                jobDir,
+                cancelled,
+                operation = "压缩",
+                sourcePaths = selectedItems.map { it.path },
+                destinationPath = destinationDirectory
+            ) {
                 val destinationInfo = if (sessionFileCoordinator.isVirtualPath(activity, destinationDirectory)) {
                     sessionFileCoordinator.describeVirtualPath(activity, destinationDirectory)
                 } else {
@@ -400,7 +409,13 @@ class ArchiveTransferWorkflow(
         }
 
         val jobDir = createJobDirectory()
-        return runArchiveJob(jobDir, cancelled) {
+        return runArchiveJob(
+            jobDir,
+            cancelled,
+            operation = "压缩",
+            sourcePaths = selectedItems.map { it.path },
+            destinationPath = destinationDirectory
+        ) {
             requireLocalArchiveTool()
             progress("正在准备压缩任务...")
             val sourceStage = File(jobDir, "sources").also(::ensureDirectory)
@@ -447,21 +462,38 @@ class ArchiveTransferWorkflow(
 
         buildSameServerRemoteContext(archiveItems, destinationDirectory)?.let { remoteContext ->
             val jobDir = createJobDirectory()
-            return runArchiveJob(jobDir, cancelled) {
+            return runArchiveJob(
+                jobDir,
+                cancelled,
+                operation = "解压",
+                sourcePaths = archiveItems.map { it.path },
+                destinationPath = destinationDirectory
+            ) {
                 decompressOnServer(remoteContext, archiveItems, destinationDirectory, cancelled, progress)
             }
         }
 
         buildCrossServerRemoteDecompressContext(archiveItems, destinationDirectory)?.let { remoteContext ->
             val jobDir = createJobDirectory()
-            return runArchiveJob(jobDir, cancelled) {
+            return runArchiveJob(
+                jobDir,
+                cancelled,
+                operation = "解压",
+                sourcePaths = archiveItems.map { it.path },
+                destinationPath = destinationDirectory
+            ) {
                 decompressAcrossServers(remoteContext, archiveItems, destinationDirectory, cancelled, progress)
             }
         }
 
         val jobDir = createJobDirectory()
-        return runArchiveJob(jobDir, cancelled) {
-            requireLocalArchiveTool()
+        return runArchiveJob(
+            jobDir,
+            cancelled,
+            operation = "解压",
+            sourcePaths = archiveItems.map { it.path },
+            destinationPath = destinationDirectory
+        ) {
             progress("正在准备解压任务...")
             val sourceStage = File(jobDir, "sources").also(::ensureDirectory)
             val stagedArchives = stageSources(archiveItems, sourceStage, cancelled, progress)
@@ -504,9 +536,17 @@ class ArchiveTransferWorkflow(
                 )
             }
 
+            val stagedArtifact = selectCommitArtifact(artifact, stagedArchives.size)
+            if (stagedArtifact != artifact) {
+                journalPhase(
+                    phase = "NORMALIZING",
+                    message = "折叠归档自带的同名顶层目录：${stagedArtifact.name}"
+                )
+                progress("正在整理归档目录结构...")
+            }
             val finalName = resolveDecompressTargetName(destinationDirectory, artifact.name, options)
             val committedPath = commitArtifact(
-                stagedArtifact = artifact,
+                stagedArtifact = stagedArtifact,
                 destinationDirectory = destinationDirectory,
                 finalName = finalName,
                 directory = true,
@@ -524,38 +564,120 @@ class ArchiveTransferWorkflow(
         }
     }
 
+    private fun selectCommitArtifact(artifact: File, archiveCount: Int): File {
+        val children = artifact.listFiles()?.toList()
+            ?: throw ArchiveWorkflowException("无法读取解压结果目录：${artifact.absolutePath}")
+        val entries = children.map { child ->
+            val mode = runCatching { Os.lstat(child.absolutePath).st_mode }
+                .getOrElse { throw ArchiveWorkflowException("无法检查解压结果：${child.absolutePath}") }
+            ExtractedRootEntry(
+                name = child.name,
+                directory = OsConstants.S_ISDIR(mode),
+                symbolicLink = OsConstants.S_ISLNK(mode)
+            )
+        }
+        val selectedName = ArchiveLayoutPolicy.redundantSingleRootName(
+            archiveCount = archiveCount,
+            requestedRootName = artifact.name,
+            children = entries
+        ) ?: return artifact
+        return File(artifact, selectedName)
+    }
+
     private fun runArchiveJob(
         jobDir: File,
         cancelled: AtomicBoolean,
+        operation: String,
+        sourcePaths: List<String>,
+        destinationPath: String,
         block: () -> ArchiveResult
     ): ArchiveResult {
+        val handle = runCatching {
+            operationJournal?.start(
+                operation = operation,
+                sourcePaths = sourcePaths,
+                destinationPath = destinationPath,
+                tempPaths = listOf(jobDir.absolutePath)
+            )
+        }.getOrNull()
+        activeOperation.set(handle)
         return try {
-            block()
-        } catch (_: ArchiveCancelledException) {
-            ArchiveResult(success = false, cancelled = true, message = "操作已取消。")
-        } catch (missingTool: MissingLocalArchiveToolException) {
-            ArchiveResult(
-                success = false,
-                message = missingTool.message.orEmpty(),
-                installCommand = TERMUX_7ZIP_INSTALL_COMMAND
-            )
-        } catch (missingRemoteTool: RemoteArchiveToolUnavailableException) {
-            ArchiveResult(
-                success = false,
-                message = missingRemoteTool.message.orEmpty(),
-                dialogTitle = "服务器压缩格式不可用"
-            )
-        } catch (throwable: Throwable) {
-            if (cancelled.get()) {
+            val rawResult = try {
+                block()
+            } catch (_: ArchiveCancelledException) {
                 ArchiveResult(success = false, cancelled = true, message = "操作已取消。")
-            } else {
+            } catch (missingTool: MissingLocalArchiveToolException) {
                 ArchiveResult(
                     success = false,
-                    message = throwable.message?.trim().orEmpty().ifBlank { "归档操作失败，请重试。" }
+                    message = missingTool.message.orEmpty(),
+                    installCommand = TERMUX_7ZIP_INSTALL_COMMAND
                 )
+            } catch (missingRemoteTool: RemoteArchiveToolUnavailableException) {
+                ArchiveResult(
+                    success = false,
+                    message = missingRemoteTool.message.orEmpty(),
+                    dialogTitle = "服务器压缩格式不可用"
+                )
+            } catch (throwable: Throwable) {
+                if (cancelled.get()) {
+                    ArchiveResult(success = false, cancelled = true, message = "操作已取消。")
+                } else {
+                    ArchiveResult(
+                        success = false,
+                        message = throwable.message?.trim().orEmpty().ifBlank { "归档操作失败，请重试。" }
+                    )
+                }
             }
+
+            val status = when {
+                rawResult.success -> ArchiveOperationJournal.Status.SUCCEEDED
+                rawResult.cancelled -> ArchiveOperationJournal.Status.CANCELLED
+                else -> ArchiveOperationJournal.Status.FAILED
+            }
+            runCatching {
+                if (handle != null) {
+                    operationJournal?.finish(
+                        handle,
+                        status,
+                        rawResult.message,
+                        rawResult.highlightPaths.firstOrNull().orEmpty()
+                    )
+                }
+            }
+
+            val diagnosticsPath = operationJournal?.eventLogPath().orEmpty()
+            val operationId = handle?.id.orEmpty()
+            val diagnosticSuffix = if (!rawResult.success && !rawResult.cancelled && operationId.isNotBlank()) {
+                buildString {
+                    append("\n\n操作 ID：").append(operationId)
+                    if (diagnosticsPath.isNotBlank()) append("\n诊断记录：").append(diagnosticsPath)
+                }
+            } else {
+                ""
+            }
+            rawResult.copy(
+                message = rawResult.message + diagnosticSuffix,
+                dialogTitle = if (
+                    !rawResult.success && !rawResult.cancelled && rawResult.installCommand.isBlank() && rawResult.dialogTitle.isBlank()
+                ) "$operation 失败" else rawResult.dialogTitle,
+                operationId = operationId,
+                diagnosticsPath = diagnosticsPath
+            )
         } finally {
+            activeOperation.remove()
             deleteRecursivelySafe(jobDir)
+        }
+    }
+
+    private fun journalPhase(
+        phase: String,
+        message: String = "",
+        backend: String = "",
+        tempPath: String = ""
+    ) {
+        val handle = activeOperation.get() ?: return
+        runCatching {
+            operationJournal?.phase(handle, phase, message, backend, tempPath)
         }
     }
 
@@ -1584,60 +1706,64 @@ class ArchiveTransferWorkflow(
         throwIfCancelled(cancelled)
         ensureDirectory(destinationRoot)
 
-        val kind = ArchiveKind.fromName(archiveFile.name)
-        if (kind != null && kind.isCompressedTar()) {
-            val intermediateRoot = File(destinationRoot.parentFile, ".${destinationRoot.name}.tar-stage-${UUID.randomUUID()}")
-            ensureDirectory(intermediateRoot)
-            try {
-                runSevenZipExtract(
-                    archiveFile = archiveFile,
-                    destinationRoot = intermediateRoot,
-                    cancelled = cancelled,
-                    progress = progress,
-                    archiveIndex = archiveIndex,
-                    archiveTotal = archiveTotal,
-                    stageLabel = "正在解包 TAR 外层",
-                    options = options
-                )
-
-                val tarFile = intermediateRoot.walkTopDown()
-                    .firstOrNull { it.isFile && it.name.endsWith(".tar", ignoreCase = true) }
-                if (tarFile != null) {
-                    runSevenZipExtract(
-                        archiveFile = tarFile,
-                        destinationRoot = destinationRoot,
-                        cancelled = cancelled,
-                        progress = progress,
-                        archiveIndex = archiveIndex,
-                        archiveTotal = archiveTotal,
-                        stageLabel = "正在解压 TAR 内容",
-                        options = options
-                    )
-                } else {
-                    val extractedChildren = intermediateRoot.listFiles()
-                        ?: throw ArchiveWorkflowException("无法读取 TAR 外层解包结果：${archiveFile.name}")
-                    if (extractedChildren.isEmpty()) {
-                        throw ArchiveWorkflowException("7-Zip 未生成 TAR 中间文件：${archiveFile.name}")
-                    }
-                    extractedChildren.forEach { child ->
-                        copyFileTree(child, File(destinationRoot, child.name), child.isDirectory, cancelled) {}
-                    }
-                }
-            } finally {
-                deleteRecursivelySafe(intermediateRoot)
-            }
-        } else {
-            runSevenZipExtract(
-                archiveFile = archiveFile,
-                destinationRoot = destinationRoot,
-                cancelled = cancelled,
-                progress = progress,
-                archiveIndex = archiveIndex,
-                archiveTotal = archiveTotal,
-                stageLabel = "正在使用 7-Zip 解压",
-                options = options
+        val sourceBytes = archiveFile.length()
+        val sourceModifiedAt = archiveFile.lastModified()
+        val binDirectory = File(FileRootResolver.termuxPrivateRoot(activity), "usr/bin")
+        val plan = try {
+            LocalArchivePlanner.buildExtractPlan(
+                archive = archiveFile,
+                destination = destinationRoot,
+                binDirectory = binDirectory,
+                conflictSwitch = options.conflictStrategy.sevenZipSwitch
             )
+        } catch (policy: ArchivePolicyException) {
+            throw ArchiveWorkflowException(policy.message.orEmpty())
         }
+
+        journalPhase(
+            phase = "PREFLIGHT",
+            message = "使用 ${plan.displayName} 校验 ${archiveFile.name}",
+            backend = plan.backend.name,
+            tempPath = destinationRoot.absolutePath
+        )
+        progress(
+            "正在校验归档 ($archiveIndex/$archiveTotal)\n" +
+                "工具：${plan.displayName}\n" +
+                "当前：${archiveFile.name}\n" +
+                "大小：${sourceBytes.coerceAtLeast(0L).formatSize()}"
+        )
+        runLocalArchiveCommand(
+            command = plan.preflightCommand,
+            workingDirectory = archiveFile.parentFile ?: destinationRoot,
+            cancelled = cancelled,
+            title = "正在校验归档 ($archiveIndex/$archiveTotal)",
+            failureMessage = "原生归档完整性校验失败：${archiveFile.name}",
+            progress = progress,
+            emitOutputProgress = false
+        )
+        requireStableArchive(archiveFile, sourceBytes, sourceModifiedAt)
+
+        journalPhase(
+            phase = "EXTRACTING",
+            message = "使用 ${plan.displayName} 解压 ${archiveFile.name}",
+            backend = plan.backend.name,
+            tempPath = destinationRoot.absolutePath
+        )
+        progress(
+            "正在解压 ($archiveIndex/$archiveTotal)\n" +
+                "工具：${plan.displayName}\n" +
+                "当前：${archiveFile.name}\n" +
+                "大小：${sourceBytes.coerceAtLeast(0L).formatSize()}"
+        )
+        runLocalArchiveCommand(
+            command = plan.command,
+            workingDirectory = archiveFile.parentFile ?: destinationRoot,
+            cancelled = cancelled,
+            title = "正在使用 ${plan.displayName} 解压 ($archiveIndex/$archiveTotal)",
+            failureMessage = "${plan.displayName} 解压失败：${archiveFile.name}",
+            progress = progress
+        )
+        requireStableArchive(archiveFile, sourceBytes, sourceModifiedAt)
 
         validateExtractedTree(destinationRoot)
         progress(
@@ -1646,43 +1772,10 @@ class ArchiveTransferWorkflow(
         )
     }
 
-    private fun runSevenZipExtract(
-        archiveFile: File,
-        destinationRoot: File,
-        cancelled: AtomicBoolean,
-        progress: (String) -> Unit,
-        archiveIndex: Int,
-        archiveTotal: Int,
-        stageLabel: String,
-        options: DecompressOptions
-    ) {
-        throwIfCancelled(cancelled)
-        val tool = requireLocalArchiveTool()
-        ensureDirectory(destinationRoot)
-        progress(
-            "$stageLabel ($archiveIndex/$archiveTotal)\n" +
-                "工具：${tool.displayName}\n" +
-                "当前：${archiveFile.name}\n" +
-                "大小：${archiveFile.length().coerceAtLeast(0L).formatSize()}"
-        )
-
-        runLocalArchiveCommand(
-            command = listOf(
-                tool.binary.absolutePath,
-                "x",
-                "-y",
-                options.conflictStrategy.sevenZipSwitch,
-                "-bb1",
-                "-bd",
-                "-o${destinationRoot.absolutePath}",
-                archiveFile.absolutePath
-            ),
-            workingDirectory = archiveFile.parentFile ?: destinationRoot,
-            cancelled = cancelled,
-            title = "$stageLabel ($archiveIndex/$archiveTotal)",
-            failureMessage = "7-Zip 解压失败：${archiveFile.name}",
-            progress = progress
-        )
+    private fun requireStableArchive(archiveFile: File, expectedBytes: Long, expectedModifiedAt: Long) {
+        if (!archiveFile.isFile || archiveFile.length() != expectedBytes || archiveFile.lastModified() != expectedModifiedAt) {
+            throw ArchiveWorkflowException("归档在处理期间发生变化，请重试：${archiveFile.name}")
+        }
     }
 
     private fun requireLocalArchiveTool(): LocalArchiveTool {
@@ -1703,7 +1796,8 @@ class ArchiveTransferWorkflow(
         cancelled: AtomicBoolean,
         title: String,
         failureMessage: String,
-        progress: (String) -> Unit
+        progress: (String) -> Unit,
+        emitOutputProgress: Boolean = true
     ) {
         throwIfCancelled(cancelled)
         val outputLines = Collections.synchronizedList(ArrayList<String>())
@@ -1735,7 +1829,9 @@ class ArchiveTransferWorkflow(
                                 outputLines.removeAt(0)
                             }
                         }
-                        progress("$title\n当前：${line.take(MAX_PROGRESS_LINE_LENGTH)}")
+                        if (emitOutputProgress) {
+                            progress("$title\n当前：${line.take(MAX_PROGRESS_LINE_LENGTH)}")
+                        }
                     }
                 }
             }
@@ -1748,15 +1844,19 @@ class ArchiveTransferWorkflow(
         try {
             while (exitCode == null) {
                 if (cancelled.get()) {
-                    process.destroy()
+                    terminateLocalProcess(process)
                     throw ArchiveCancelledException()
                 }
                 if (process.waitFor(PROCESS_POLL_MS, TimeUnit.MILLISECONDS)) {
                     exitCode = process.exitValue()
                 }
             }
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+            terminateLocalProcess(process)
+            throw ArchiveCancelledException()
         } finally {
-            readerThread.join(PROCESS_READER_JOIN_MS)
+            runCatching { readerThread.join(PROCESS_READER_JOIN_MS) }
         }
 
         if (exitCode != 0) {
@@ -1773,20 +1873,128 @@ class ArchiveTransferWorkflow(
         }
     }
 
+    private fun terminateLocalProcess(process: Process) {
+        process.destroy()
+        val exited = runCatching {
+            process.waitFor(PROCESS_TERMINATION_GRACE_MS, TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        if (!exited) {
+            process.destroyForcibly()
+            runCatching { process.waitFor(PROCESS_TERMINATION_GRACE_MS, TimeUnit.MILLISECONDS) }
+        }
+    }
+
     private fun validateExtractedTree(root: File) {
         val rootCanonical = root.canonicalFile.absolutePath.trimEnd(File.separatorChar)
+        val trustedRoots = trustedTermuxArchiveLinkRoots()
+        val metadata = arrayListOf<ArchiveEntryMetadata>()
         fun walk(file: File) {
+            val mode = try {
+                Os.lstat(file.absolutePath).st_mode
+            } catch (throwable: Throwable) {
+                throw ArchiveWorkflowException("无法检查解压条目：${file.absolutePath} (${throwable.message.orEmpty()})")
+            }
+            if (OsConstants.S_ISLNK(mode)) {
+                val target = try {
+                    Os.readlink(file.absolutePath)
+                } catch (throwable: Throwable) {
+                    throw ArchiveWorkflowException("无法读取符号链接：${file.absolutePath} (${throwable.message.orEmpty()})")
+                }
+                if (!isAllowedExtractedLink(file, target, rootCanonical, trustedRoots)) {
+                    val relative = file.absolutePath.removePrefix(rootCanonical).trimStart(File.separatorChar)
+                    throw ArchiveWorkflowException("压缩包包含未受信任符号链接：$relative -> $target")
+                }
+                metadata.add(
+                    ArchiveEntryMetadata(
+                        rawPath = relativeExtractedPath(file, rootCanonical),
+                        kind = ArchiveEntryKind.SYMBOLIC_LINK,
+                        linkTarget = target
+                    )
+                )
+                return
+            }
+
             val canonical = file.canonicalFile.absolutePath
-            if (canonical != rootCanonical && !canonical.startsWith("$rootCanonical${File.separator}")) {
+            if (!isPathWithin(canonical, rootCanonical)) {
                 throw ArchiveWorkflowException("压缩包包含不安全路径：${file.name}")
             }
-            if (file.isDirectory) {
+            if (OsConstants.S_ISDIR(mode)) {
+                metadata.add(
+                    ArchiveEntryMetadata(
+                        rawPath = relativeExtractedPath(file, rootCanonical),
+                        kind = ArchiveEntryKind.DIRECTORY
+                    )
+                )
                 val children = file.listFiles()
                     ?: throw ArchiveWorkflowException("无法读取解压目录：${file.absolutePath}")
                 children.forEach(::walk)
+            } else if (!OsConstants.S_ISREG(mode)) {
+                throw ArchiveWorkflowException("压缩包包含不支持的特殊文件：${file.absolutePath}")
+            } else {
+                metadata.add(
+                    ArchiveEntryMetadata(
+                        rawPath = relativeExtractedPath(file, rootCanonical),
+                        kind = ArchiveEntryKind.FILE,
+                        size = file.length().coerceAtLeast(0L)
+                    )
+                )
             }
         }
         walk(root)
+        try {
+            ArchivePathPolicy.validate(metadata, trustedRoots)
+        } catch (policy: ArchivePolicyException) {
+            throw ArchiveWorkflowException(policy.message.orEmpty())
+        }
+    }
+
+    private fun relativeExtractedPath(file: File, extractionRoot: String): String {
+        return file.absolutePath.removePrefix(extractionRoot).trimStart(File.separatorChar)
+    }
+
+    private fun isAllowedExtractedLink(
+        link: File,
+        target: String,
+        extractionRoot: String,
+        trustedRoots: List<String>
+    ): Boolean {
+        if (target.isBlank() || target.indexOf('\u0000') >= 0) return false
+        val resolved = runCatching {
+            if (target.startsWith(File.separator)) File(target).canonicalFile
+            else File(link.parentFile, target).canonicalFile
+        }.getOrNull() ?: return false
+        val resolvedPath = resolved.absolutePath
+        if (isPathWithin(resolvedPath, extractionRoot)) return true
+
+        if (target.startsWith(File.separator) &&
+            !ArchivePathPolicy.isTrustedAbsoluteLink(target, trustedRoots)
+        ) {
+            return false
+        }
+        if (trustedRoots.none { isPathWithin(resolvedPath, it) }) return false
+
+        // Portable bundles may intentionally reference an optional Termux package that is not
+        // installed yet. The trusted prefix boundary is the security decision; existence is not.
+        return true
+    }
+
+    private fun trustedTermuxArchiveLinkRoots(): List<String> {
+        val privateRoot = FileRootResolver.termuxPrivateRoot(activity)
+            .replace('\\', '/')
+            .trimEnd('/')
+        val roots = linkedSetOf("$privateRoot/usr")
+        when {
+            privateRoot.startsWith("/data/user/0/com.termux/files") ->
+                roots.add("/data/data/com.termux/files/usr")
+            privateRoot.startsWith("/data/data/com.termux/files") ->
+                roots.add("/data/user/0/com.termux/files/usr")
+        }
+        return roots.toList()
+    }
+
+    private fun isPathWithin(path: String, root: String): Boolean {
+        val normalizedRoot = root.trimEnd(File.separatorChar)
+        return path == normalizedRoot || path.startsWith("$normalizedRoot${File.separator}")
     }
 
     private fun commitArtifact(
@@ -1828,24 +2036,34 @@ class ArchiveTransferWorkflow(
 
         val tempTarget = File(
             targetDirectory,
-            ".${finalName}.termux-archive-${System.currentTimeMillis()}.part"
+            ".${finalName}.termux-archive-${activeOperation.get()?.id ?: System.currentTimeMillis()}.part"
         )
         if (tempTarget.exists()) {
             deleteRecursivelySafe(tempTarget)
         }
 
         try {
-            val totalBytes = fileTreeSize(stagedArtifact)
-            var copiedBytes = 0L
+            journalPhase(
+                phase = "COMMITTING",
+                message = "提交本地归档结果：$finalName",
+                tempPath = tempTarget.absolutePath
+            )
             progress("正在提交到本地目录...")
-            copyFileTree(stagedArtifact, tempTarget, directory, cancelled) { copied ->
-                copiedBytes += copied
-                progress(
-                    "正在提交到本地目录\n" +
-                        "当前：$finalName\n" +
-                        "大小：${copiedBytes.formatSize()} / ${if (totalBytes > 0L) totalBytes.formatSize() else "?"}"
-                )
+            if (stagedArtifact.renameTo(tempTarget)) {
+                progress("正在提交到本地目录\n当前：$finalName\n方式：同文件系统原子搬移")
+            } else {
+                val totalBytes = fileTreeSize(stagedArtifact)
+                var copiedBytes = 0L
+                copyFileTree(stagedArtifact, tempTarget, directory, cancelled) { copied ->
+                    copiedBytes += copied
+                    progress(
+                        "正在提交到本地目录\n" +
+                            "当前：$finalName\n" +
+                            "大小：${copiedBytes.formatSize()} / ${if (totalBytes > 0L) totalBytes.formatSize() else "?"}"
+                    )
+                }
             }
+            syncDirectory(targetDirectory)
 
             throwIfCancelled(cancelled)
             if (finalTarget.exists()) {
@@ -1858,6 +2076,7 @@ class ArchiveTransferWorkflow(
             if (!tempTarget.renameTo(finalTarget)) {
                 throw ArchiveWorkflowException("无法原子提交本地目标：${finalTarget.absolutePath}")
             }
+            syncDirectory(targetDirectory)
             return finalTarget.absolutePath.replace('\\', '/')
         } catch (throwable: Throwable) {
             deleteRecursivelySafe(tempTarget)
@@ -1960,6 +2179,11 @@ class ArchiveTransferWorkflow(
         onBytes: (Long) -> Unit
     ) {
         throwIfCancelled(cancelled)
+        val sourceFile = File(sourcePath)
+        if (sourceFile.exists() && isSymbolicLink(sourceFile)) {
+            copySymbolicLink(sourceFile, destination)
+            return
+        }
         if (directory) {
             ensureDirectory(destination)
             if (activity.isRestrictedSAFOnlyRoot(sourcePath)) {
@@ -1978,7 +2202,6 @@ class ArchiveTransferWorkflow(
                 return
             }
 
-            val sourceFile = File(sourcePath)
             val children = sourceFile.listFiles()
                 ?: throw ArchiveWorkflowException("无法读取目录：$sourcePath")
             children.sortedBy { it.name.lowercase(Locale.getDefault()) }.forEach { child ->
@@ -1994,6 +2217,10 @@ class ArchiveTransferWorkflow(
         }
 
         destination.parentFile?.let(::ensureDirectory)
+        if (sourceFile.isFile && tryCreateHardLink(sourceFile, destination)) {
+            onBytes(sourceFile.length().coerceAtLeast(0L))
+            return
+        }
         val input = activity.getFileInputStreamSync(sourcePath)
             ?: throw ArchiveWorkflowException("无法读取文件：$sourcePath")
         input.use { inputStream ->
@@ -2002,7 +2229,6 @@ class ArchiveTransferWorkflow(
                 outputStream.fd.sync()
             }
         }
-        val sourceFile = File(sourcePath)
         if (sourceFile.exists()) {
             destination.setLastModified(sourceFile.lastModified())
         }
@@ -2016,6 +2242,10 @@ class ArchiveTransferWorkflow(
         onBytes: (Long) -> Unit
     ) {
         throwIfCancelled(cancelled)
+        if (isSymbolicLink(source)) {
+            copySymbolicLink(source, target)
+            return
+        }
         if (directory || source.isDirectory) {
             ensureDirectory(target)
             val children = source.listFiles()
@@ -2328,6 +2558,7 @@ class ArchiveTransferWorkflow(
     }
 
     private fun fileTreeSize(file: File): Long {
+        if (isSymbolicLink(file)) return 0L
         if (file.isFile) {
             return max(0L, file.length())
         }
@@ -2374,11 +2605,11 @@ class ArchiveTransferWorkflow(
     }
 
     private fun deleteRecursivelySafe(file: File?) {
-        if (file == null || !file.exists()) {
+        if (file == null || (!file.exists() && !isSymbolicLink(file))) {
             return
         }
         try {
-            if (file.isDirectory) {
+            if (!isSymbolicLink(file) && file.isDirectory) {
                 file.listFiles()?.forEach { deleteRecursivelySafe(it) }
             }
             file.delete()
@@ -2386,10 +2617,54 @@ class ArchiveTransferWorkflow(
         }
     }
 
+    private fun tryCreateHardLink(source: File, destination: File): Boolean {
+        if (!source.isFile || isSymbolicLink(source)) return false
+        return runCatching {
+            if (destination.exists() || isSymbolicLink(destination)) deleteRecursivelySafe(destination)
+            Os.link(source.absolutePath, destination.absolutePath)
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun copySymbolicLink(source: File, destination: File) {
+        val target = try {
+            Os.readlink(source.absolutePath)
+        } catch (throwable: Throwable) {
+            throw ArchiveWorkflowException("无法读取符号链接：${source.absolutePath} (${throwable.message.orEmpty()})")
+        }
+        destination.parentFile?.let(::ensureDirectory)
+        if (destination.exists() || isSymbolicLink(destination)) deleteRecursivelySafe(destination)
+        try {
+            Os.symlink(target, destination.absolutePath)
+        } catch (throwable: Throwable) {
+            throw ArchiveWorkflowException("无法创建符号链接：${destination.absolutePath} (${throwable.message.orEmpty()})")
+        }
+    }
+
+    private fun isSymbolicLink(file: File): Boolean {
+        return runCatching { OsConstants.S_ISLNK(Os.lstat(file.absolutePath).st_mode) }.getOrDefault(false)
+    }
+
+    private fun syncDirectory(directory: File) {
+        runCatching {
+            val descriptor = Os.open(
+                directory.absolutePath,
+                OsConstants.O_RDONLY,
+                0
+            )
+            try {
+                Os.fsync(descriptor)
+            } finally {
+                Os.close(descriptor)
+            }
+        }
+    }
+
     companion object {
         private const val DEFAULT_BUFFER_SIZE = 128 * 1024
         private const val PROCESS_POLL_MS = 250L
         private const val PROCESS_READER_JOIN_MS = 1_000L
+        private const val PROCESS_TERMINATION_GRACE_MS = 2_000L
         private const val MAX_PROCESS_OUTPUT_LINES = 40
         private const val MAX_PROGRESS_LINE_LENGTH = 160
         const val TERMUX_7ZIP_INSTALL_COMMAND = "pkg update && (pkg install 7zip || pkg install p7zip)"
