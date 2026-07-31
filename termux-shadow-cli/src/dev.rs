@@ -10,6 +10,7 @@ use crate::cli::{BuildArgs, BumpKind, DeployArgs, DevArgs, LaunchArgs};
 use crate::config::{PluginConfig, valid_version_name};
 use crate::context::{AppContext, BuildEnvironment};
 use crate::control::{LaunchOutcome, execute_launch};
+use crate::dependency;
 use crate::doctor;
 use crate::errors;
 use crate::history::{self, OperationRecord};
@@ -141,6 +142,10 @@ pub fn run_deploy(context: &AppContext, args: DeployArgs) -> Result<()> {
     run_named(
         context,
         DevArgs {
+            workspace: false,
+            watch: false,
+            diff: false,
+            debounce_ms: None,
             run: args.run,
             no_run: false,
             version_name: args.version_name,
@@ -172,6 +177,8 @@ fn run_named(context: &AppContext, args: DevArgs, action: &'static str) -> Resul
             ));
         }
     };
+    dependency::ensure_lock(context, &project)
+        .map_err(|error| development_error(context, &config, &project, None, error))?;
     let registry = if context.shadow_home.join("reports/registry.json").is_file() {
         read_registry(&context.shadow_home)
             .map_err(|error| development_error(context, &config, &project, None, error))?
@@ -203,9 +210,11 @@ fn run_named(context: &AppContext, args: DevArgs, action: &'static str) -> Resul
     crate::runtime_artifacts::reconcile_project(context, &config.plugin_id).map_err(|error| {
         development_error(context, &config, &project, Some(next_version_code), error)
     })?;
-    let environment = context.build_environment().map_err(|error| {
-        development_error(context, &config, &project, Some(next_version_code), error)
-    })?;
+    let environment = context
+        .build_environment_for_project(&project)
+        .map_err(|error| {
+            development_error(context, &config, &project, Some(next_version_code), error)
+        })?;
     let source_fingerprint =
         cache::source_fingerprint(&project, &environment).map_err(|error| {
             development_error(context, &config, &project, Some(next_version_code), error)
@@ -370,6 +379,8 @@ fn resume_registered(
                 no_wait: false,
                 force: false,
                 timeout: args.timeout,
+                smoke: false,
+                smoke_file: None,
             },
             false,
             false,
@@ -524,6 +535,8 @@ fn complete_published(
                 no_wait: false,
                 force: false,
                 timeout,
+                smoke: false,
+                smoke_file: None,
             },
             false,
             false,

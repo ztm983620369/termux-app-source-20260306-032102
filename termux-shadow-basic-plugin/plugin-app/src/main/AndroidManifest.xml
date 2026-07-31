@@ -5,10 +5,13 @@
         android:allowBackup="false"
         android:label="${shadowDisplayName}"
         android:supportsRtl="true"
-        android:theme="@style/PluginTheme">
+        android:theme="${shadowApplicationTheme}">
         <activity
             android:name="${shadowActivityClassName}"
             android:exported="false"
-            android:screenOrientation="portrait" />
+            android:theme="${shadowActivityTheme}"
+            android:screenOrientation="${shadowScreenOrientation}"
+            android:windowSoftInputMode="${shadowSoftInputMode}"
+            android:configChanges="${shadowConfigChanges}" />
     </application>
 </manifest>

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -10,21 +11,34 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     long_about = "Create, diagnose, build, publish, query, launch, upgrade, and recover managed Termux Shadow plugins from one native command."
 )]
 pub struct Cli {
-    /// Plugin project. Defaults to the nearest parent containing shadow-plugin.properties.
+    /// Plugin project path or @NAME from .shadow-workspace.toml.
+    /// Defaults to the nearest parent containing shadow-plugin.properties.
     #[arg(
         long,
         global = true,
         env = "SHADOW_PLUGIN_PROJECT",
-        value_name = "PATH"
+        value_name = "PATH",
+        help_heading = "Global options"
     )]
     pub project: Option<PathBuf>,
+
+    /// Workspace configuration. Defaults to the nearest .shadow-workspace.toml.
+    #[arg(
+        long,
+        global = true,
+        env = "TERMUX_SHADOW_WORKSPACE",
+        value_name = "PATH",
+        help_heading = "Global options"
+    )]
+    pub workspace_config: Option<PathBuf>,
 
     /// Canonical scaffold template.
     #[arg(
         long,
         global = true,
         env = "TERMUX_SHADOW_TEMPLATE",
-        value_name = "PATH"
+        value_name = "PATH",
+        help_heading = "Global options"
     )]
     pub template: Option<PathBuf>,
 
@@ -33,20 +47,72 @@ pub struct Cli {
         long,
         global = true,
         env = "TERMUX_SHADOW_ANDROID_TOOLCHAIN",
-        value_name = "PATH"
+        value_name = "PATH",
+        help_heading = "Global options"
     )]
     pub toolchain: Option<PathBuf>,
 
+    /// Dependency resolution policy for Gradle builds.
+    #[arg(
+        long,
+        global = true,
+        env = "TERMUX_SHADOW_DEPENDENCY_POLICY",
+        value_enum,
+        help_heading = "Global options"
+    )]
+    pub dependency_policy: Option<DependencyPolicy>,
+
+    /// Require locked dependencies and prohibit network access.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "online",
+        help_heading = "Global options"
+    )]
+    pub offline: bool,
+
+    /// Resolve locked dependencies normally and permit repository access.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "offline",
+        help_heading = "Global options"
+    )]
+    pub online: bool,
+
+    /// Permit cache-first mode to retry a missing dependency through the network.
+    #[arg(long, global = true, help_heading = "Global options")]
+    pub allow_network: bool,
+
     /// Emit machine-readable JSON; dev automatically uses the compact agent contract.
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "human",
+        help_heading = "Global options"
+    )]
     pub json: bool,
 
     /// Emit the compact, decision-focused JSON contract for coding agents.
-    #[arg(long, global = true, conflicts_with = "verbose")]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["verbose", "human"],
+        help_heading = "Global options"
+    )]
     pub agent: bool,
 
+    /// Force human output, overriding a workspace output default.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["json", "agent"],
+        help_heading = "Global options"
+    )]
+    pub human: bool,
+
     /// Emit detailed JSON metadata; human mode also prints captured Gradle output.
-    #[arg(short, long, global = true)]
+    #[arg(short, long, global = true, help_heading = "Global options")]
     pub verbose: bool,
 
     /// Stable idempotency key for a Worker request. Normally generated automatically.
@@ -54,7 +120,8 @@ pub struct Cli {
         long,
         global = true,
         env = "TERMUX_SHADOW_REQUEST_ID",
-        value_name = "ID"
+        value_name = "ID",
+        help_heading = "Global options"
     )]
     pub request_id: Option<String>,
 
@@ -64,7 +131,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create an isolated plugin project from the installed template.
+    /// Create an isolated project and return its complete coding handoff.
     New(NewArgs),
     /// Validate project identity, tools, collisions, and optionally the package.
     Doctor(DoctorArgs),
@@ -79,11 +146,17 @@ pub enum Command {
     Dev(DevArgs),
     /// Build, publish, and optionally activate through one resumable deployment request.
     Deploy(DeployArgs),
+    /// Resolve, lock, import, vendor, inspect, or clean dependency caches.
+    Deps(DepsArgs),
+    /// Convert an existing Android application module into an isolated Shadow plugin project.
+    ImportAndroid(ImportAndroidArgs),
     /// Query platform health, receipts, registry pointers, and generations.
     #[command(alias = "list")]
     Status(StatusArgs),
     /// Launch or activate a plugin and wait for the exact health result.
     Run(LaunchArgs),
+    /// Launch a plugin and execute its declared UI smoke-test steps.
+    TestUi(LaunchArgs),
     /// Health-activate the retained previous generation.
     Rollback(LaunchArgs),
     /// Disable launches while preserving managed versions and evidence.
@@ -114,6 +187,45 @@ pub enum Command {
     Worker(WorkerArgs),
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DependencyPolicy {
+    /// Resolve only from the selected locked cache.
+    Offline,
+    /// Try the selected cache first; network fallback requires explicit approval.
+    #[default]
+    CacheFirst,
+    /// Resolve normally from configured repositories and update the shared cache.
+    Online,
+}
+
+impl DependencyPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::CacheFirst => "cache-first",
+            Self::Online => "online",
+        }
+    }
+}
+
+impl Cli {
+    pub fn effective_dependency_policy(
+        &self,
+        workspace_default: Option<DependencyPolicy>,
+    ) -> DependencyPolicy {
+        if self.offline {
+            DependencyPolicy::Offline
+        } else if self.online {
+            DependencyPolicy::Online
+        } else {
+            self.dependency_policy
+                .or(workspace_default)
+                .unwrap_or_default()
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct NewArgs {
     /// Lowercase logical slug, for example notes or image-tools.
@@ -122,18 +234,25 @@ pub struct NewArgs {
     /// Human-readable plugin name.
     pub display_name: Option<String>,
 
+    /// Destination directory. Defaults to ~/termux-shadow-<slug>.
     #[arg(long, value_name = "PATH")]
     pub target: Option<PathBuf>,
+    /// Stable logical plugin ID written to shadow-plugin.properties.
     #[arg(long, value_name = "ID")]
     pub plugin_id: Option<String>,
+    /// Stable Shadow loader part key; must be unique in the Host registry.
     #[arg(long, value_name = "KEY")]
     pub part_key: Option<String>,
+    /// Java/Kotlin package for generated business source.
     #[arg(long, value_name = "PACKAGE")]
     pub namespace: Option<String>,
+    /// Simple generated Activity class name, without the namespace.
     #[arg(long, value_name = "CLASS")]
     pub activity: Option<String>,
+    /// Isolated Android resource package ID; auto allocates a collision-free ID.
     #[arg(long, default_value = "auto", value_name = "auto|0xNN")]
     pub resource_id: String,
+    /// Plugin description stored in schema-2 package metadata.
     #[arg(long, value_name = "TEXT")]
     pub description: Option<String>,
     /// Build, publish, reconcile, and confirm registration after creation.
@@ -147,8 +266,109 @@ pub struct NewArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct DepsArgs {
+    /// Apply the read-only audit command to every configured workspace project.
+    #[arg(long, global = true)]
+    pub workspace: bool,
+    #[command(subcommand)]
+    pub command: DepsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DepsCommand {
+    /// Resolve every resolvable project configuration and optionally commit lock metadata.
+    Resolve(DepsResolveArgs),
+    /// Snapshot locked dependency cache entries into project-local vendor storage.
+    Vendor(DepsVendorArgs),
+    /// Import an existing Gradle dependency cache into the shared managed cache.
+    ImportGradleCache(DepsImportArgs),
+    /// Report dependency policy, lock validity, and cache layers.
+    Status,
+    /// Audit dependency declarations, lock integrity, and reproducible cache availability.
+    Audit,
+    /// Remove project vendor data or, with confirmation, the shared managed cache.
+    Clean(DepsCleanArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct DepsResolveArgs {
+    /// Explicitly permit repository access for this resolution.
+    #[arg(long)]
+    pub allow_network: bool,
+    /// Commit Gradle lockfiles and the signed-input dependency manifest.
+    #[arg(long)]
+    pub lock: bool,
+    /// Ignore cached dynamic/changing-module metadata while resolving online.
+    #[arg(long, requires = "allow_network")]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct DepsVendorArgs {
+    /// Recreate the vendor snapshot even when its manifest is current.
+    #[arg(long)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct DepsImportArgs {
+    /// Gradle user home to import. Defaults to ~/.gradle.
+    #[arg(long, value_name = "PATH")]
+    pub from: Option<PathBuf>,
+    /// Report the planned cache merge without writing files.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct DepsCleanArgs {
+    /// Remove the current project's vendor cache snapshot.
+    #[arg(long)]
+    pub vendor: bool,
+    /// Remove the managed shared Gradle cache.
+    #[arg(long, requires = "yes")]
+    pub shared: bool,
+    /// Confirm shared-cache deletion.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportAndroidArgs {
+    /// Existing Android project or application-module directory.
+    pub source: PathBuf,
+    /// Lowercase logical slug for the generated Shadow project.
+    #[arg(long)]
+    pub slug: String,
+    /// Human-readable plugin name.
+    #[arg(long, value_name = "NAME")]
+    pub display_name: Option<String>,
+    /// Destination project path.
+    #[arg(long, value_name = "PATH")]
+    pub target: Option<PathBuf>,
+    /// Override the generated logical plugin ID.
+    #[arg(long, value_name = "ID")]
+    pub plugin_id: Option<String>,
+    /// Override the generated Shadow part key.
+    #[arg(long, value_name = "KEY")]
+    pub part_key: Option<String>,
+    /// Override the migrated Java/Kotlin namespace.
+    #[arg(long, value_name = "PACKAGE")]
+    pub namespace: Option<String>,
+    /// Resource package ID, or auto for collision-free allocation.
+    #[arg(long, default_value = "auto", value_name = "auto|0xNN")]
+    pub resource_id: String,
+    /// Analyze and print a migration report without writing a project.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Args, Clone, Copy)]
 pub struct DoctorArgs {
+    /// Diagnose every project declared by .shadow-workspace.toml.
+    #[arg(long)]
+    pub workspace: bool,
     /// Check config and source only; do not require Android or Termux tools.
     #[arg(long)]
     pub project_only: bool,
@@ -203,6 +423,18 @@ pub struct UpgradeArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct DevArgs {
+    /// Run the resumable development loop for every configured workspace project.
+    #[arg(long, conflicts_with = "watch")]
+    pub workspace: bool,
+    /// Watch build inputs, debounce changes, and submit a fresh resumable Worker request.
+    #[arg(long, conflicts_with = "workspace")]
+    pub watch: bool,
+    /// Print added, modified, and removed build inputs before each watched deployment.
+    #[arg(long, requires = "watch")]
+    pub diff: bool,
+    /// Filesystem-event debounce window. Defaults to 500 ms.
+    #[arg(long, value_name = "MILLISECONDS", requires = "watch")]
+    pub debounce_ms: Option<u64>,
     /// Legacy compatibility flag. Runtime health is already part of dev by default.
     #[arg(long, hide = true, conflicts_with = "no_run")]
     pub run: bool,
@@ -251,12 +483,16 @@ pub enum BumpKind {
 
 #[derive(Debug, Args, Clone)]
 pub struct StatusArgs {
-    /// Include every logical plugin instead of only the current project.
+    /// Show all registered plugins regardless of project context.
+    ///
+    /// By default, status shows only the plugin matching the current project. If no
+    /// project context exists, status safely falls back to all registered plugins.
     #[arg(long)]
     pub all: bool,
     /// Wait for the current project's last publish receipt SHA.
     #[arg(long)]
     pub wait: bool,
+    /// Registration wait timeout in seconds.
     #[arg(long, default_value_t = 45, value_name = "SECONDS")]
     pub timeout: u64,
     /// Print the raw health and registry JSON reports.
@@ -283,6 +519,12 @@ pub struct LaunchArgs {
     /// Relaunch an already proven active generation instead of returning ALREADY_ACTIVE.
     #[arg(long)]
     pub force: bool,
+    /// Run the declarative UI smoke test after the first frame.
+    #[arg(long)]
+    pub smoke: bool,
+    /// Smoke-test JSON file. Defaults to shadow-smoke.json in the current project.
+    #[arg(long, value_name = "PATH", requires = "smoke")]
+    pub smoke_file: Option<PathBuf>,
     /// Health-result timeout in seconds.
     #[arg(long, default_value_t = 30, value_name = "SECONDS")]
     pub timeout: u64,
@@ -312,9 +554,19 @@ pub struct SyncArgs {
 
 #[derive(Debug, Args)]
 pub struct ContextArgs {
-    /// Return changed=false when the Host registry has not advanced beyond this revision.
-    #[arg(long, value_name = "REVISION")]
+    /// Host-only compatibility cursor. Prefer --since-cursor when local source changes matter.
+    #[arg(
+        long,
+        value_name = "REVISION",
+        conflicts_with_all = ["since_cursor", "resume"]
+    )]
     pub since_revision: Option<u64>,
+    /// Return changed=false when the complete development context still matches this cursor.
+    #[arg(long, value_name = "CURSOR", conflicts_with = "resume")]
+    pub since_cursor: Option<String>,
+    /// Resume from a private per-project cursor under ~/.termux-shadow/sessions.
+    #[arg(long)]
+    pub resume: bool,
     /// Emit the compact decision capsule. Kept explicit for discoverability.
     #[arg(long, default_value_t = true)]
     pub compact: bool,
@@ -348,7 +600,7 @@ pub struct WorkerArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, DependencyPolicy};
     use clap::Parser;
 
     #[test]
@@ -384,5 +636,39 @@ mod tests {
         ));
         let cli = Cli::try_parse_from(["shadow-plugin", "dev", "--no-run"]).unwrap();
         assert!(matches!(cli.command, Command::Dev(args) if args.no_run && !args.run));
+    }
+
+    #[test]
+    fn dependency_policy_defaults_to_cache_first_and_supports_explicit_network_modes() {
+        let default = Cli::try_parse_from(["shadow-plugin", "deps", "status"]).unwrap();
+        assert_eq!(
+            default.effective_dependency_policy(None),
+            DependencyPolicy::CacheFirst
+        );
+        let offline =
+            Cli::try_parse_from(["shadow-plugin", "--offline", "deps", "status"]).unwrap();
+        assert_eq!(
+            offline.effective_dependency_policy(None),
+            DependencyPolicy::Offline
+        );
+        let online = Cli::try_parse_from(["shadow-plugin", "deps", "status", "--online"]).unwrap();
+        assert_eq!(
+            online.effective_dependency_policy(None),
+            DependencyPolicy::Online
+        );
+    }
+
+    #[test]
+    fn workspace_default_policy_is_lower_precedence_than_cli_modes() {
+        let default = Cli::try_parse_from(["shadow-plugin", "deps", "status"]).unwrap();
+        assert_eq!(
+            default.effective_dependency_policy(Some(DependencyPolicy::Offline)),
+            DependencyPolicy::Offline
+        );
+        let online = Cli::try_parse_from(["shadow-plugin", "--online", "deps", "status"]).unwrap();
+        assert_eq!(
+            online.effective_dependency_policy(Some(DependencyPolicy::Offline)),
+            DependencyPolicy::Online
+        );
     }
 }

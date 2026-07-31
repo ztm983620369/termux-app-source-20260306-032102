@@ -2,6 +2,7 @@ package com.termux.sessionsync;
 
 import android.content.Context;
 import android.text.TextUtils;
+import android.util.AtomicFile;
 import android.util.Base64;
 
 import androidx.annotation.NonNull;
@@ -12,6 +13,7 @@ import com.jcraft.jsch.HostKeyRepository;
 import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.UserInfo;
 import com.termux.sshconnectioncore.ResolvedSshEndpoint;
+import com.termux.sshconnectioncore.SshHostKeyFingerprint;
 import com.termux.sshconnectioncore.SshKnownHostsFiles;
 import com.termux.sshconnectioncore.SshPendingTrustRecord;
 import com.termux.sshconnectioncore.SshTrustRecord;
@@ -25,7 +27,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -49,8 +50,6 @@ final class SshHostTrustStore implements HostKeyRepository {
     private File managedKnownHostsFile;
     @Nullable
     private File legacyKnownHostsFile;
-    @Nullable
-    private ResolvedSshEndpoint activeEndpoint;
     @NonNull
     private final LinkedHashMap<String, HostRecord> records = new LinkedHashMap<>();
     @NonNull
@@ -80,20 +79,17 @@ final class SshHostTrustStore implements HostKeyRepository {
         }
     }
 
-    void setActiveEndpoint(@Nullable ResolvedSshEndpoint endpoint) {
-        synchronized (lock) {
-            activeEndpoint = endpoint;
-        }
-    }
-
-    void clearActiveEndpoint() {
-        synchronized (lock) {
-            activeEndpoint = null;
-        }
+    @NonNull
+    HostKeyRepository bindEndpoint(@NonNull ResolvedSshEndpoint endpoint) {
+        return new BoundHostKeyRepository(this, endpoint);
     }
 
     @Override
     public int check(String host, byte[] key) {
+        return check(null, host, key);
+    }
+
+    private int check(@Nullable ResolvedSshEndpoint boundEndpoint, @Nullable String host, @Nullable byte[] key) {
         if (key == null || key.length == 0) {
             return NOT_INCLUDED;
         }
@@ -101,10 +97,14 @@ final class SshHostTrustStore implements HostKeyRepository {
         synchronized (lock) {
             ensureLoadedLocked();
             HostKey hostKey = createHostKey(normalizeHostForHostKey(host), key);
-            String algorithm = hostKey == null ? "unknown" : safe(hostKey.getType());
+            if (hostKey == null) return NOT_INCLUDED;
+            String algorithm = safe(hostKey.getType());
             String fingerprint = fingerprintSha256(key);
+            if (algorithm.isEmpty() || fingerprint.isEmpty()) return NOT_INCLUDED;
             String keyBase64 = Base64.encodeToString(key, Base64.NO_WRAP);
-            ResolvedSshEndpoint endpoint = resolveEndpointLocked(host);
+            ResolvedSshEndpoint endpoint = boundEndpoint == null
+                ? resolveEndpointLocked(host)
+                : boundEndpoint;
 
             HostRecord existing = records.get(buildRecordKey(endpoint.authorityKey, algorithm));
             SshTrustStateMachine machine = new SshTrustStateMachine();
@@ -126,6 +126,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                         endpoint.authorityKey,
                         endpoint.hostIdentity,
                         endpoint.port,
+                        endpoint.usesHostKeyAlias,
                         algorithm,
                         keyBase64,
                         fingerprint,
@@ -144,6 +145,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                         endpoint.authorityKey,
                         endpoint.hostIdentity,
                         endpoint.port,
+                        endpoint.usesHostKeyAlias,
                         algorithm,
                         keyBase64,
                         fingerprint,
@@ -163,27 +165,10 @@ final class SshHostTrustStore implements HostKeyRepository {
 
     @Override
     public void add(HostKey hostkey, UserInfo ui) {
-        if (hostkey == null) return;
-        synchronized (lock) {
-            ensureLoadedLocked();
-            ResolvedSshEndpoint endpoint = resolveEndpointLocked(hostkey.getHost());
-            String algorithm = safe(hostkey.getType());
-            String keyBase64 = safe(hostkey.getKey());
-            if (algorithm.isEmpty() || keyBase64.isEmpty()) return;
-
-            SshTrustRecord record = new SshTrustRecord(
-                endpoint.authorityKey,
-                endpoint.hostIdentity,
-                endpoint.port,
-                algorithm,
-                fingerprintSha256(decodeBase64(keyBase64)),
-                SshTrustSource.LEGACY_AUTO_TRUSTED,
-                System.currentTimeMillis(),
-                System.currentTimeMillis()
-            );
-            upsertRecordLocked(record, endpoint.host, keyBase64);
-            clearPendingAuthorityLocked(endpoint.authorityKey);
-        }
+        // Managed trust is deliberately two-step: check() records the observation and the user
+        // approves it through approvePendingAuthority(). Never let a future JSch configuration
+        // using "ask" or "no" silently turn HostKeyRepository.add() into an auto-trust bypass.
+        if (hostkey != null) traceWarn("ignored-implicit-hostkey-add", hostkey.getHost(), hostkey.getType());
     }
 
     @Override
@@ -353,6 +338,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                 pending.authorityKey,
                 pending.hostIdentity,
                 pending.port,
+                pending.usesHostKeyAlias,
                 pending.algorithm,
                 pending.observedFingerprintSha256,
                 trustSource,
@@ -381,7 +367,7 @@ final class SshHostTrustStore implements HostKeyRepository {
         pendingRecords.clear();
         if (storeFile != null && storeFile.exists()) {
             try {
-                String raw = readTextFile(storeFile);
+                String raw = readAtomicTextFile(storeFile);
                 JSONArray array = new JSONArray(raw);
                 for (int i = 0; i < array.length(); i++) {
                     JSONObject item = array.optJSONObject(i);
@@ -395,7 +381,7 @@ final class SshHostTrustStore implements HostKeyRepository {
         }
         if (pendingStoreFile != null && pendingStoreFile.exists()) {
             try {
-                String raw = readTextFile(pendingStoreFile);
+                String raw = readAtomicTextFile(pendingStoreFile);
                 JSONArray array = new JSONArray(raw);
                 for (int i = 0; i < array.length(); i++) {
                     JSONObject item = array.optJSONObject(i);
@@ -408,7 +394,14 @@ final class SshHostTrustStore implements HostKeyRepository {
             }
         }
         importKnownHostsFileLocked(managedKnownHostsFile, true);
-        importKnownHostsFileLocked(legacyKnownHostsFile, shouldLegacyOverrideManagedLocked());
+        // Legacy ~/.ssh/known_hosts is a migration source only. A newer legacy file must never
+        // overwrite an already approved managed record, since it may have been populated by an
+        // unrelated OpenSSH command using weaker checking policy.
+        importKnownHostsFileLocked(legacyKnownHostsFile, false);
+        // Canonicalize legacy fingerprints/host patterns immediately. In particular, old builds
+        // case-folded Base64 fingerprints and encoded default-port IPv6/HostKeyAlias entries
+        // differently from OpenSSH.
+        persistLocked();
     }
 
     private void persistLocked() {
@@ -418,39 +411,42 @@ final class SshHostTrustStore implements HostKeyRepository {
             if (record == null) continue;
             array.put(record.toJson());
         }
-        try (FileOutputStream outputStream = new FileOutputStream(storeFile, false)) {
+        AtomicFile atomicFile = new AtomicFile(storeFile);
+        FileOutputStream outputStream = null;
+        try {
+            outputStream = atomicFile.startWrite();
             outputStream.write(array.toString().getBytes(StandardCharsets.UTF_8));
             outputStream.flush();
             try {
                 outputStream.getFD().sync();
             } catch (Throwable ignored) {
             }
+            atomicFile.finishWrite(outputStream);
         } catch (Throwable ignored) {
+            if (outputStream != null) atomicFile.failWrite(outputStream);
         }
         rewriteManagedKnownHostsLocked();
         persistPendingLocked();
     }
 
-    private boolean shouldLegacyOverrideManagedLocked() {
-        if (legacyKnownHostsFile == null || !legacyKnownHostsFile.exists()) return false;
-        if (managedKnownHostsFile == null || !managedKnownHostsFile.exists()) return true;
-        return legacyKnownHostsFile.lastModified() > managedKnownHostsFile.lastModified();
-    }
-
     private void importKnownHostsFileLocked(@Nullable File file, boolean overwriteExisting) {
         if (file == null || !file.exists() || !file.isFile()) return;
         try {
-            String raw = readTextFile(file);
+            String raw = file.equals(managedKnownHostsFile)
+                ? readAtomicTextFile(file)
+                : readTextFile(file);
             String[] lines = raw.split("\\r?\\n");
             long importedAtMs = Math.max(0L, file.lastModified());
             for (String line : lines) {
                 OpenSshKnownHostsEntry entry = OpenSshKnownHostsEntry.parse(line);
                 if (entry == null) continue;
+                HostRecord metadata = findRecordForKnownHostsEntryLocked(entry);
                 HostRecord record = new HostRecord(
-                    entry.authorityKey,
-                    entry.hostIdentity,
-                    entry.port,
-                    entry.host,
+                    metadata == null ? entry.authorityKey : metadata.authorityKey,
+                    metadata == null ? entry.hostIdentity : metadata.hostIdentity,
+                    metadata == null ? entry.port : metadata.port,
+                    metadata != null && metadata.usesHostKeyAlias,
+                    metadata == null ? entry.host : metadata.host,
                     entry.algorithm,
                     entry.keyBase64,
                     fingerprintSha256(decodeBase64(entry.keyBase64)),
@@ -470,7 +466,10 @@ final class SshHostTrustStore implements HostKeyRepository {
         if (managedKnownHostsFile == null) return;
         File parent = managedKnownHostsFile.getParentFile();
         if (parent != null && !parent.exists()) parent.mkdirs();
-        try (FileOutputStream outputStream = new FileOutputStream(managedKnownHostsFile, false)) {
+        AtomicFile atomicFile = new AtomicFile(managedKnownHostsFile);
+        FileOutputStream outputStream = null;
+        try {
+            outputStream = atomicFile.startWrite();
             for (HostRecord record : records.values()) {
                 String line = record.toOpenSshKnownHostsLine();
                 if (line.isEmpty()) continue;
@@ -478,8 +477,37 @@ final class SshHostTrustStore implements HostKeyRepository {
                 outputStream.write('\n');
             }
             outputStream.flush();
+            try {
+                outputStream.getFD().sync();
+            } catch (Throwable ignored) {
+            }
+            atomicFile.finishWrite(outputStream);
         } catch (Throwable ignored) {
+            if (outputStream != null) atomicFile.failWrite(outputStream);
         }
+    }
+
+    @Nullable
+    private HostRecord findRecordForKnownHostsEntryLocked(@NonNull OpenSshKnownHostsEntry entry) {
+        for (HostRecord candidate : records.values()) {
+            if (candidate == null || !candidate.type.equals(entry.algorithm)) continue;
+            if (candidate.hostIdentity.equalsIgnoreCase(entry.hostIdentity)
+                && (candidate.usesHostKeyAlias || candidate.port == entry.port)) {
+                return candidate;
+            }
+            ResolvedSshEndpoint endpoint = new ResolvedSshEndpoint.Builder()
+                .setAuthorityKey(candidate.authorityKey)
+                .setHost(candidate.host)
+                .setHostIdentity(candidate.hostIdentity)
+                .setPort(candidate.port)
+                .setUsesHostKeyAlias(candidate.usesHostKeyAlias)
+                .build();
+            if (SshKnownHostsFiles.buildKnownHostsHostPattern(endpoint)
+                .equalsIgnoreCase(entry.originalHostPattern)) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     private void upsertRecordLocked(@NonNull SshTrustRecord trustRecord,
@@ -489,6 +517,7 @@ final class SshHostTrustStore implements HostKeyRepository {
             trustRecord.authorityKey,
             trustRecord.hostIdentity,
             trustRecord.port,
+            trustRecord.usesHostKeyAlias,
             host,
             trustRecord.algorithm,
             keyBase64,
@@ -496,6 +525,7 @@ final class SshHostTrustStore implements HostKeyRepository {
             trustRecord.trustedAtMs,
             trustRecord.lastSeenAtMs
         );
+        if (record.fingerprintSha256.isEmpty() || record.toHostKey() == null) return;
         records.put(buildRecordKey(record.authorityKey, record.type), record);
         persistLocked();
     }
@@ -518,18 +548,24 @@ final class SshHostTrustStore implements HostKeyRepository {
             if (record == null) continue;
             array.put(record.toJson());
         }
-        try (FileOutputStream outputStream = new FileOutputStream(pendingStoreFile, false)) {
+        AtomicFile atomicFile = new AtomicFile(pendingStoreFile);
+        FileOutputStream outputStream = null;
+        try {
+            outputStream = atomicFile.startWrite();
             outputStream.write(array.toString().getBytes(StandardCharsets.UTF_8));
             outputStream.flush();
+            try {
+                outputStream.getFD().sync();
+            } catch (Throwable ignored) {
+            }
+            atomicFile.finishWrite(outputStream);
         } catch (Throwable ignored) {
+            if (outputStream != null) atomicFile.failWrite(outputStream);
         }
     }
 
     @NonNull
     private ResolvedSshEndpoint resolveEndpointLocked(@Nullable String hostQuery) {
-        if (activeEndpoint != null) {
-            return activeEndpoint;
-        }
         HostSpec spec = HostSpec.parse(hostQuery);
         return new ResolvedSshEndpoint.Builder()
             .setHost(spec.host)
@@ -538,6 +574,92 @@ final class SshHostTrustStore implements HostKeyRepository {
             .setUser("")
             .setHostKeyVerificationMode(ResolvedSshEndpoint.HostKeyVerificationMode.YES)
             .build();
+    }
+
+    @NonNull
+    private HostKey[] getHostKeysForEndpoint(@NonNull ResolvedSshEndpoint endpoint,
+                                             @Nullable String type) {
+        synchronized (lock) {
+            ensureLoadedLocked();
+            String normalizedType = safe(type);
+            ArrayList<HostKey> out = new ArrayList<>();
+            for (HostRecord record : records.values()) {
+                if (record == null || !TextUtils.equals(record.authorityKey, endpoint.authorityKey)) continue;
+                if (!normalizedType.isEmpty() && !TextUtils.equals(record.type, normalizedType)) continue;
+                HostKey hostKey = record.toHostKey();
+                if (hostKey != null) out.add(hostKey);
+            }
+            return out.toArray(new HostKey[0]);
+        }
+    }
+
+    private void removeForEndpoint(@NonNull ResolvedSshEndpoint endpoint,
+                                   @Nullable String type, @Nullable byte[] key) {
+        synchronized (lock) {
+            ensureLoadedLocked();
+            String normalizedType = safe(type);
+            String keyBase64 = key == null ? "" : Base64.encodeToString(key, Base64.NO_WRAP);
+            ArrayList<String> toRemove = new ArrayList<>();
+            for (Map.Entry<String, HostRecord> item : records.entrySet()) {
+                HostRecord record = item.getValue();
+                if (record == null || !TextUtils.equals(record.authorityKey, endpoint.authorityKey)) continue;
+                if (!normalizedType.isEmpty() && !TextUtils.equals(record.type, normalizedType)) continue;
+                if (key != null && !TextUtils.equals(record.keyBase64, keyBase64)) continue;
+                toRemove.add(item.getKey());
+            }
+            if (toRemove.isEmpty()) return;
+            for (String recordKey : toRemove) records.remove(recordKey);
+            persistLocked();
+        }
+    }
+
+    private static final class BoundHostKeyRepository implements HostKeyRepository {
+        @NonNull private final SshHostTrustStore store;
+        @NonNull private final ResolvedSshEndpoint endpoint;
+
+        BoundHostKeyRepository(@NonNull SshHostTrustStore store,
+                               @NonNull ResolvedSshEndpoint endpoint) {
+            this.store = store;
+            this.endpoint = endpoint;
+        }
+
+        @Override
+        public int check(String host, byte[] key) {
+            return store.check(endpoint, host, key);
+        }
+
+        @Override
+        public void add(HostKey hostkey, UserInfo ui) {
+            store.add(hostkey, ui);
+        }
+
+        @Override
+        public void remove(String host, String type) {
+            store.removeForEndpoint(endpoint, type, null);
+        }
+
+        @Override
+        public void remove(String host, String type, byte[] key) {
+            store.removeForEndpoint(endpoint, type, key);
+        }
+
+        @Override
+        @Nullable
+        public String getKnownHostsRepositoryID() {
+            return store.getKnownHostsRepositoryID();
+        }
+
+        @Override
+        @NonNull
+        public HostKey[] getHostKey() {
+            return store.getHostKeysForEndpoint(endpoint, null);
+        }
+
+        @Override
+        @NonNull
+        public HostKey[] getHostKey(String host, String type) {
+            return store.getHostKeysForEndpoint(endpoint, type);
+        }
     }
 
     @NonNull
@@ -566,16 +688,7 @@ final class SshHostTrustStore implements HostKeyRepository {
 
     @NonNull
     private static String fingerprintSha256(@Nullable byte[] rawKey) {
-        if (rawKey == null || rawKey.length == 0) {
-            return "";
-        }
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] sha = digest.digest(rawKey);
-            return "sha256:" + Base64.encodeToString(sha, Base64.NO_WRAP).toLowerCase(Locale.ROOT);
-        } catch (Throwable ignored) {
-            return "";
-        }
+        return SshHostKeyFingerprint.fromPublicKeyBlob(rawKey);
     }
 
     @Nullable
@@ -603,15 +716,27 @@ final class SshHostTrustStore implements HostKeyRepository {
     @NonNull
     private static String readTextFile(@NonNull File file) throws Exception {
         try (FileInputStream inputStream = new FileInputStream(file)) {
-            byte[] buffer = new byte[(int) Math.max(0L, Math.min(file.length(), 1024L * 1024L))];
-            int offset = 0;
-            while (offset < buffer.length) {
-                int read = inputStream.read(buffer, offset, buffer.length - offset);
-                if (read < 0) break;
-                offset += read;
-            }
-            return new String(buffer, 0, offset, StandardCharsets.UTF_8);
+            return readTextStream(inputStream, file.length());
         }
+    }
+
+    @NonNull
+    private static String readAtomicTextFile(@NonNull File file) throws Exception {
+        try (FileInputStream inputStream = new AtomicFile(file).openRead()) {
+            return readTextStream(inputStream, file.length());
+        }
+    }
+
+    @NonNull
+    private static String readTextStream(@NonNull FileInputStream inputStream, long lengthHint) throws Exception {
+        byte[] buffer = new byte[(int) Math.max(0L, Math.min(lengthHint, 1024L * 1024L))];
+        int offset = 0;
+        while (offset < buffer.length) {
+            int read = inputStream.read(buffer, offset, buffer.length - offset);
+            if (read < 0) break;
+            offset += read;
+        }
+        return new String(buffer, 0, offset, StandardCharsets.UTF_8);
     }
 
     private static final class HostSpec {
@@ -667,6 +792,7 @@ final class SshHostTrustStore implements HostKeyRepository {
         @NonNull final String authorityKey;
         @NonNull final String hostIdentity;
         final int port;
+        final boolean usesHostKeyAlias;
         @NonNull final String host;
         @NonNull final String type;
         @NonNull final String keyBase64;
@@ -677,6 +803,7 @@ final class SshHostTrustStore implements HostKeyRepository {
         HostRecord(@NonNull String authorityKey,
                    @NonNull String hostIdentity,
                    int port,
+                   boolean usesHostKeyAlias,
                    @NonNull String host,
                    @NonNull String type,
                    @NonNull String keyBase64,
@@ -686,10 +813,14 @@ final class SshHostTrustStore implements HostKeyRepository {
             this.authorityKey = safe(authorityKey).toLowerCase(Locale.ROOT);
             this.hostIdentity = safe(hostIdentity).toLowerCase(Locale.ROOT);
             this.port = port > 0 && port <= 65535 ? port : 22;
+            this.usesHostKeyAlias = usesHostKeyAlias;
             this.host = safe(host).toLowerCase(Locale.ROOT);
             this.type = safe(type);
             this.keyBase64 = safe(keyBase64);
-            this.fingerprintSha256 = safe(fingerprintSha256).toLowerCase(Locale.ROOT);
+            String derivedFingerprint = fingerprintSha256(decodeBase64(this.keyBase64));
+            this.fingerprintSha256 = derivedFingerprint.isEmpty()
+                ? SshHostKeyFingerprint.normalizeSha256(fingerprintSha256)
+                : derivedFingerprint;
             this.trustedAtMs = Math.max(0L, trustedAtMs);
             this.lastSeenAtMs = Math.max(0L, lastSeenAtMs);
         }
@@ -700,6 +831,10 @@ final class SshHostTrustStore implements HostKeyRepository {
             String type = safe(json.optString("type", ""));
             String keyBase64 = safe(json.optString("keyBase64", ""));
             if (type.isEmpty() || keyBase64.isEmpty()) return null;
+            byte[] rawKey = decodeBase64(keyBase64);
+            HostKey parsedKey = rawKey == null ? null : createHostKey("validation.invalid", rawKey);
+            if (parsedKey == null || !type.equals(parsedKey.getType())) return null;
+            keyBase64 = Base64.encodeToString(rawKey, Base64.NO_WRAP);
 
             String host = safe(json.optString("host", ""));
             String authorityKey = safe(json.optString("authorityKey", ""));
@@ -720,10 +855,17 @@ final class SshHostTrustStore implements HostKeyRepository {
                 hostIdentity = HostSpec.parse(host).hostIdentity;
             }
 
+            boolean usesHostKeyAlias = json.optBoolean(
+                "usesHostKeyAlias", !hostIdentity.equalsIgnoreCase(host));
+            if (usesHostKeyAlias) {
+                authorityKey = "ssh-hostkeyalias://" + hostIdentity.toLowerCase(Locale.ROOT);
+            }
+
             return new HostRecord(
                 authorityKey,
                 hostIdentity,
                 port,
+                usesHostKeyAlias,
                 host,
                 type,
                 keyBase64,
@@ -741,6 +883,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                 json.put("authorityKey", authorityKey);
                 json.put("hostIdentity", hostIdentity);
                 json.put("port", port);
+                json.put("usesHostKeyAlias", usesHostKeyAlias);
                 json.put("host", host);
                 json.put("type", type);
                 json.put("keyBase64", keyBase64);
@@ -767,6 +910,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                 authorityKey,
                 hostIdentity,
                 port,
+                usesHostKeyAlias,
                 type,
                 fingerprintSha256,
                 SshTrustSource.IMPORTED_APP_STORE,
@@ -782,6 +926,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                 .setHostIdentity(hostIdentity)
                 .setHost(host)
                 .setPort(port)
+                .setUsesHostKeyAlias(usesHostKeyAlias)
                 .setUser("")
                 .setHostKeyVerificationMode(ResolvedSshEndpoint.HostKeyVerificationMode.YES)
                 .build();
@@ -792,6 +937,7 @@ final class SshHostTrustStore implements HostKeyRepository {
     }
 
     private static final class OpenSshKnownHostsEntry {
+        @NonNull final String originalHostPattern;
         @NonNull final String authorityKey;
         @NonNull final String hostIdentity;
         final int port;
@@ -799,12 +945,14 @@ final class SshHostTrustStore implements HostKeyRepository {
         @NonNull final String algorithm;
         @NonNull final String keyBase64;
 
-        OpenSshKnownHostsEntry(@NonNull String authorityKey,
+        OpenSshKnownHostsEntry(@NonNull String originalHostPattern,
+                               @NonNull String authorityKey,
                                @NonNull String hostIdentity,
                                int port,
                                @NonNull String host,
                                @NonNull String algorithm,
                                @NonNull String keyBase64) {
+            this.originalHostPattern = originalHostPattern;
             this.authorityKey = authorityKey;
             this.hostIdentity = hostIdentity;
             this.port = port;
@@ -816,7 +964,7 @@ final class SshHostTrustStore implements HostKeyRepository {
         @Nullable
         static OpenSshKnownHostsEntry parse(@Nullable String rawLine) {
             String line = safe(rawLine);
-            if (line.isEmpty() || line.startsWith("#")) return null;
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith("@")) return null;
             String[] parts = line.split("\\s+");
             if (parts.length < 3) return null;
             String hostToken = safe(parts[0]);
@@ -827,15 +975,23 @@ final class SshHostTrustStore implements HostKeyRepository {
             if (comma > 0) firstHost = hostToken.substring(0, comma);
 
             HostSpec spec = HostSpec.parse(firstHost);
-            if (spec.hostIdentity.isEmpty()) return null;
+            if (spec.hostIdentity.isEmpty()
+                || !SshKnownHostsFiles.isSafeKnownHostsIdentity(spec.hostIdentity)) return null;
+
+            String algorithm = safe(parts[1]);
+            String keyBase64 = safe(parts[2]);
+            byte[] rawKey = decodeBase64(keyBase64);
+            HostKey parsedKey = rawKey == null ? null : createHostKey(spec.host, rawKey);
+            if (parsedKey == null || !algorithm.equals(parsedKey.getType())) return null;
 
             return new OpenSshKnownHostsEntry(
+                firstHost,
                 "ssh://" + spec.hostIdentity + ":" + spec.port,
                 spec.hostIdentity,
                 spec.port,
                 spec.host,
-                safe(parts[1]),
-                safe(parts[2])
+                algorithm,
+                Base64.encodeToString(rawKey, Base64.NO_WRAP)
             );
         }
     }
@@ -844,6 +1000,7 @@ final class SshHostTrustStore implements HostKeyRepository {
         @NonNull final String authorityKey;
         @NonNull final String hostIdentity;
         final int port;
+        final boolean usesHostKeyAlias;
         @NonNull final String algorithm;
         @NonNull final String keyBase64;
         @NonNull final String observedFingerprintSha256;
@@ -854,6 +1011,7 @@ final class SshHostTrustStore implements HostKeyRepository {
         PendingRecord(@NonNull String authorityKey,
                       @NonNull String hostIdentity,
                       int port,
+                      boolean usesHostKeyAlias,
                       @NonNull String algorithm,
                       @NonNull String keyBase64,
                       @NonNull String observedFingerprintSha256,
@@ -863,10 +1021,14 @@ final class SshHostTrustStore implements HostKeyRepository {
             this.authorityKey = safe(authorityKey).toLowerCase(Locale.ROOT);
             this.hostIdentity = safe(hostIdentity).toLowerCase(Locale.ROOT);
             this.port = port > 0 && port <= 65535 ? port : 22;
+            this.usesHostKeyAlias = usesHostKeyAlias;
             this.algorithm = safe(algorithm);
             this.keyBase64 = safe(keyBase64);
-            this.observedFingerprintSha256 = safe(observedFingerprintSha256).toLowerCase(Locale.ROOT);
-            this.existingFingerprintSha256 = safe(existingFingerprintSha256).toLowerCase(Locale.ROOT);
+            String derivedFingerprint = fingerprintSha256(decodeBase64(this.keyBase64));
+            this.observedFingerprintSha256 = derivedFingerprint.isEmpty()
+                ? SshHostKeyFingerprint.normalizeSha256(observedFingerprintSha256)
+                : derivedFingerprint;
+            this.existingFingerprintSha256 = SshHostKeyFingerprint.normalizeSha256(existingFingerprintSha256);
             this.replacementRequired = replacementRequired;
             this.observedAtMs = Math.max(0L, observedAtMs);
         }
@@ -878,13 +1040,18 @@ final class SshHostTrustStore implements HostKeyRepository {
             String algorithm = safe(json.optString("algorithm", ""));
             String keyBase64 = safe(json.optString("keyBase64", ""));
             String observedFingerprintSha256 = safe(json.optString("observedFingerprintSha256", ""));
-            if (authorityKey.isEmpty() || algorithm.isEmpty() || keyBase64.isEmpty() || observedFingerprintSha256.isEmpty()) {
+            byte[] rawKey = decodeBase64(keyBase64);
+            HostKey parsedKey = rawKey == null ? null : createHostKey("validation.invalid", rawKey);
+            if (authorityKey.isEmpty() || algorithm.isEmpty() || parsedKey == null
+                || !algorithm.equals(parsedKey.getType())) {
                 return null;
             }
+            keyBase64 = Base64.encodeToString(rawKey, Base64.NO_WRAP);
             return new PendingRecord(
                 authorityKey,
                 safe(json.optString("hostIdentity", "")),
                 json.optInt("port", 22),
+                json.optBoolean("usesHostKeyAlias", false),
                 algorithm,
                 keyBase64,
                 observedFingerprintSha256,
@@ -901,6 +1068,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                 json.put("authorityKey", authorityKey);
                 json.put("hostIdentity", hostIdentity);
                 json.put("port", port);
+                json.put("usesHostKeyAlias", usesHostKeyAlias);
                 json.put("algorithm", algorithm);
                 json.put("keyBase64", keyBase64);
                 json.put("observedFingerprintSha256", observedFingerprintSha256);
@@ -918,6 +1086,7 @@ final class SshHostTrustStore implements HostKeyRepository {
                 authorityKey,
                 hostIdentity,
                 port,
+                usesHostKeyAlias,
                 algorithm,
                 observedFingerprintSha256,
                 existingFingerprintSha256,

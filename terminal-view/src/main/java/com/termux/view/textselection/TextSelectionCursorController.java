@@ -16,9 +16,8 @@ import android.view.View;
 
 import androidx.annotation.Nullable;
 
-import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalLinkResolver;
-import com.termux.terminal.TerminalRow;
+import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.WcWidth;
 import com.termux.view.R;
 import com.termux.view.TerminalView;
@@ -130,19 +129,11 @@ public class TextSelectionCursorController implements CursorController {
 
     public void setInitialTextSelectionPosition(MotionEvent event) {
         int[] columnAndRow = terminalView.getColumnAndRow(event, true);
-        mSelX1 = mSelX2 = columnAndRow[0];
-        mSelY1 = mSelY2 = columnAndRow[1];
-
-        TerminalBuffer screen = terminalView.mEmulator.getScreen();
-        if (!" ".equals(screen.getSelectedText(mSelX1, mSelY1, mSelX1, mSelY1))) {
-            // Selecting something other than whitespace. Expand to word.
-            while (mSelX1 > 0 && !"".equals(screen.getSelectedText(mSelX1 - 1, mSelY1, mSelX1 - 1, mSelY1))) {
-                mSelX1--;
-            }
-            while (mSelX2 < terminalView.mEmulator.mColumns - 1 && !"".equals(screen.getSelectedText(mSelX2 + 1, mSelY1, mSelX2 + 1, mSelY1))) {
-                mSelX2++;
-            }
-        }
+        int[] bounds = terminalView.mEmulator.getWordBounds(columnAndRow[0], columnAndRow[1]);
+        mSelX1 = bounds[0];
+        mSelY1 = bounds[1];
+        mSelX2 = bounds[2];
+        mSelY2 = bounds[3];
     }
     
     public void setActionModeCallBacks() {
@@ -253,8 +244,8 @@ public class TextSelectionCursorController implements CursorController {
             public void onGetContentRect(ActionMode mode, View view, Rect outRect) {
                 int x1 = Math.round(mSelX1 * terminalView.mRenderer.getFontWidth());
                 int x2 = Math.round(mSelX2 * terminalView.mRenderer.getFontWidth());
-                int y1 = Math.round((mSelY1 - 1 - terminalView.getTopRow()) * terminalView.mRenderer.getFontLineSpacing());
-                int y2 = Math.round((mSelY2 + 1 - terminalView.getTopRow()) * terminalView.mRenderer.getFontLineSpacing());
+                int y1 = terminalView.getPointY(mSelY1 - 1);
+                int y2 = terminalView.getPointY(mSelY2 + 1);
 
                 if (x1 > x2) {
                     int tmp = x1;
@@ -286,7 +277,7 @@ public class TextSelectionCursorController implements CursorController {
     private boolean isDetectedUrlCacheValid() {
         return mCachedUrls != null &&
             terminalView.mEmulator != null &&
-            mCachedScreenRevision == terminalView.mEmulator.getScreen().getContentRevision() &&
+            mCachedScreenRevision == terminalView.mEmulator.getContentRevision() &&
             mCachedUrlSelX1 == mSelX1 && mCachedUrlSelY1 == mSelY1 &&
             mCachedUrlSelX2 == mSelX2 && mCachedUrlSelY2 == mSelY2;
     }
@@ -340,17 +331,16 @@ public class TextSelectionCursorController implements CursorController {
     }
 
     private UrlDetectionSnapshot detectUrlsForCurrentSelection() {
-        if (terminalView.mEmulator == null) return UrlDetectionSnapshot.unstable();
-        TerminalBuffer screen = terminalView.mEmulator.getScreen();
+        TerminalEmulator emulator = terminalView.mEmulator;
+        if (emulator == null) return UrlDetectionSnapshot.unstable();
         for (int attempt = 0; attempt < URL_SNAPSHOT_ATTEMPTS; attempt++) {
-            long revisionBefore = screen.getContentRevision();
+            long revisionBefore = emulator.getContentRevision();
             try {
                 TerminalLinkResolver.SelectionResult result =
-                    TerminalLinkResolver.resolveTerminalSelection(
-                        screen, mSelX1, mSelY1, mSelX2, mSelY2, true);
-                long revisionAfter = screen.getContentRevision();
-                if (revisionBefore == revisionAfter &&
-                    terminalView.mEmulator != null && terminalView.mEmulator.getScreen() == screen) {
+                    emulator.resolveSelectionLinks(
+                        mSelX1, mSelY1, mSelX2, mSelY2, true);
+                long revisionAfter = emulator.getContentRevision();
+                if (revisionBefore == revisionAfter && terminalView.mEmulator == emulator) {
                     return new UrlDetectionSnapshot(result, revisionAfter, true);
                 }
             } catch (IndexOutOfBoundsException | IllegalArgumentException ignored) {
@@ -414,8 +404,7 @@ public class TextSelectionCursorController implements CursorController {
     public void updatePosition(TextSelectionHandleView handle, int x, int y) {
         if (terminalView.mEmulator == null) return;
 
-        TerminalBuffer screen = terminalView.mEmulator.getScreen();
-        final int scrollRows = screen.getActiveRows() - terminalView.mEmulator.mRows;
+        final int scrollRows = terminalView.mEmulator.getActiveRows() - terminalView.mEmulator.mRows;
         final int columns = terminalView.mEmulator.mColumns;
         final float fontWidth = terminalView.mRenderer.getFontWidth();
         if (handle == mStartHandle) {
@@ -460,7 +449,7 @@ public class TextSelectionCursorController implements CursorController {
                 terminalView.setTopRow(topRow);
             }
 
-            mSelX1 = snapSelectionStartColumn(screen, mSelY1, mSelX1);
+            mSelX1 = terminalView.mEmulator.snapSelectionColumn(mSelX1, mSelY1, true);
 
         } else {
             // End handle hotspot represents the boundary *after* the last selected character. Snap to the nearest
@@ -503,7 +492,7 @@ public class TextSelectionCursorController implements CursorController {
                 terminalView.setTopRow(topRow);
             }
 
-            mSelX2 = snapSelectionEndColumn(screen, mSelY2, mSelX2, columns);
+            mSelX2 = terminalView.mEmulator.snapSelectionColumn(mSelX2, mSelY2, false);
         }
 
         invalidateDetectedUrlCache();
@@ -524,27 +513,6 @@ public class TextSelectionCursorController implements CursorController {
             float anchorY = terminalView.getPointY(mSelY2 + 1);
             updateSelectionPreview(mSelX2, mSelY2, anchorX, anchorY);
         }
-    }
-
-    private int snapSelectionStartColumn(TerminalBuffer screen, int row, int column) {
-        if (column <= 0) return column;
-        TerminalRow line = screen.allocateFullLineIfNecessary(screen.externalToInternalRow(row));
-        if (line.findStartOfColumn(column) == line.findStartOfColumn(column - 1)) {
-            // Prevent selecting the 2nd half of a wide char as start.
-            return column - 1;
-        }
-        return column;
-    }
-
-    private int snapSelectionEndColumn(TerminalBuffer screen, int row, int column, int columns) {
-        if (column < 0 || column >= columns) return column;
-        if (column + 1 >= columns) return column;
-        TerminalRow line = screen.allocateFullLineIfNecessary(screen.externalToInternalRow(row));
-        if (line.findStartOfColumn(column + 1) == line.findStartOfColumn(column)) {
-            // Prevent selecting only the 1st half of a wide char as end.
-            return Math.min(columns - 1, column + 1);
-        }
-        return column;
     }
 
     public void decrementYTextSelectionCursors(int decrement) {
@@ -647,13 +615,13 @@ public class TextSelectionCursorController implements CursorController {
     private CharSequence buildPreviewText(int focusX, int focusY) {
         if (terminalView.mEmulator == null) return " ";
 
-        TerminalBuffer screen = terminalView.mEmulator.getScreen();
         int columns = terminalView.mEmulator.mColumns;
         int previewRadius = Math.min(12, Math.max(6, columns / 5));
         int startColumn = Math.max(0, focusX - previewRadius);
         int endColumn = Math.min(columns - 1, focusX + previewRadius);
 
-        String segment = screen.getSelectedText(startColumn, focusY, endColumn, focusY);
+        String segment = terminalView.mEmulator.getSelectedText(
+            startColumn, focusY, endColumn, focusY);
         if (segment == null) segment = "";
         segment = segment.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
 

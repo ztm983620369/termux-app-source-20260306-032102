@@ -9,6 +9,94 @@ use serde::Serialize;
 use crate::context::{AppContext, PROJECT_CONFIG};
 use crate::fsutil::write_atomic;
 
+const JAVA_RESERVED_IDENTIFIERS: &[&str] = &[
+    "_",
+    "abstract",
+    "assert",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "exports",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "instanceof",
+    "int",
+    "interface",
+    "long",
+    "module",
+    "native",
+    "new",
+    "null",
+    "open",
+    "opens",
+    "package",
+    "permits",
+    "private",
+    "protected",
+    "provides",
+    "public",
+    "record",
+    "requires",
+    "return",
+    "sealed",
+    "short",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "to",
+    "transient",
+    "transitive",
+    "true",
+    "try",
+    "uses",
+    "var",
+    "void",
+    "volatile",
+    "when",
+    "while",
+    "with",
+    "yield",
+];
+
+pub(crate) fn valid_java_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && !JAVA_RESERVED_IDENTIFIERS.contains(&value)
+}
+
+pub(crate) fn valid_java_qualified_name(value: &str) -> bool {
+    let segments = value.split('.').collect::<Vec<_>>();
+    segments.len() >= 2 && segments.into_iter().all(valid_java_identifier)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginConfig {
@@ -28,6 +116,14 @@ pub struct PluginConfig {
     pub default_version_name: String,
     pub min_host_version_code: u64,
     pub max_host_version_code: u64,
+    /// Optional Android Application class. Empty means the host uses the default Application.
+    pub application_class_name: Option<String>,
+    /// Java/Android resource expression consumed by the generated Shadow manifest.
+    pub application_theme: String,
+    pub activity_theme: String,
+    pub screen_orientation: String,
+    pub soft_input_mode: String,
+    pub config_changes: String,
 }
 
 #[derive(Debug)]
@@ -54,6 +150,18 @@ impl PluginConfig {
                 .cloned()
                 .with_context(|| format!("missing property {key} in {}", path.display()))
         };
+        let optional = |key: &str, default: &str| -> String {
+            parsed
+                .values
+                .get(key)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(default)
+                .to_owned()
+        };
+        let schema_version = value("schemaVersion")?
+            .parse()
+            .context("parse schemaVersion")?;
         let positive = |key: &str| -> Result<u64> {
             let raw = value(key)?;
             let parsed = raw
@@ -65,9 +173,7 @@ impl PluginConfig {
             Ok(parsed)
         };
         Ok(Self {
-            schema_version: value("schemaVersion")?
-                .parse()
-                .context("parse schemaVersion")?,
+            schema_version,
             plugin_slug: value("pluginSlug")?,
             project_name: value("projectName")?,
             plugin_id: value("pluginId")?,
@@ -83,6 +189,22 @@ impl PluginConfig {
             default_version_name: value("defaultVersionName")?,
             min_host_version_code: positive("minHostVersionCode")?,
             max_host_version_code: positive("maxHostVersionCode")?,
+            application_class_name: parsed
+                .values
+                .get("applicationClassName")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            application_theme: optional(
+                "applicationTheme",
+                "android.R.style.Theme_Material_Light_NoActionBar",
+            ),
+            activity_theme: optional(
+                "activityTheme",
+                "android.R.style.Theme_Material_Light_NoActionBar",
+            ),
+            screen_orientation: optional("screenOrientation", "unspecified"),
+            soft_input_mode: optional("softInputMode", "adjustNothing"),
+            config_changes: optional("configChanges", "orientation|screenSize|keyboardHidden"),
         })
     }
 
@@ -90,13 +212,13 @@ impl PluginConfig {
         let java_name = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
             .expect("valid regex");
         let mut failures = Vec::new();
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             failures.push(format!(
-                "schemaVersion must be 1, got {}",
+                "schemaVersion must be 1 or 2, got {}",
                 self.schema_version
             ));
         }
-        if !Regex::new(r"^[a-z][a-z0-9-]*$")
+        if !Regex::new(r"^[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*$")
             .expect("valid regex")
             .is_match(&self.plugin_slug)
         {
@@ -117,10 +239,10 @@ impl PluginConfig {
         {
             failures.push(format!("invalid partKey: {}", self.part_key));
         }
-        if !java_name.is_match(&self.namespace) {
+        if !valid_java_qualified_name(&self.namespace) {
             failures.push(format!("invalid namespace: {}", self.namespace));
         }
-        if !java_name.is_match(&self.activity_class_name) {
+        if !valid_java_qualified_name(&self.activity_class_name) {
             failures.push(format!(
                 "invalid activityClassName: {}",
                 self.activity_class_name
@@ -157,6 +279,115 @@ impl PluginConfig {
         }
         if self.min_host_version_code > self.max_host_version_code {
             failures.push("minHostVersionCode exceeds maxHostVersionCode".to_owned());
+        }
+        if let Some(application) = &self.application_class_name
+            && !valid_java_qualified_name(application)
+        {
+            failures.push(format!("invalid applicationClassName: {application}"));
+        }
+        let theme_pattern = Regex::new(
+            r"^(?:android\.R\.style\.[A-Za-z_][A-Za-z0-9_]*|@style/[A-Za-z_][A-Za-z0-9_.]*|-?\d+|0[xX][0-9A-Fa-f]+)$",
+        )
+        .expect("valid theme regex");
+        for (label, value) in [
+            ("applicationTheme", self.application_theme.as_str()),
+            ("activityTheme", self.activity_theme.as_str()),
+        ] {
+            if !theme_pattern.is_match(value) {
+                failures.push(format!("invalid {label}: {value}"));
+            }
+        }
+        if !matches!(
+            self.screen_orientation.as_str(),
+            "unspecified"
+                | "portrait"
+                | "landscape"
+                | "user"
+                | "behind"
+                | "sensor"
+                | "nosensor"
+                | "sensorLandscape"
+                | "sensorPortrait"
+                | "reverseLandscape"
+                | "reversePortrait"
+                | "fullSensor"
+                | "userLandscape"
+                | "userPortrait"
+                | "fullUser"
+                | "locked"
+        ) && !numeric_literal(&self.screen_orientation)
+        {
+            failures.push(format!(
+                "invalid screenOrientation: {}",
+                self.screen_orientation
+            ));
+        }
+        let soft_input_parts = self
+            .soft_input_mode
+            .split('|')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        let soft_input_numeric = unsigned_numeric_literal(&self.soft_input_mode);
+        if !soft_input_parts.iter().all(|part| {
+            matches!(
+                *part,
+                "adjustUnspecified"
+                    | "adjustNothing"
+                    | "adjustResize"
+                    | "adjustPan"
+                    | "stateUnspecified"
+                    | "stateUnchanged"
+                    | "stateHidden"
+                    | "stateAlwaysHidden"
+                    | "stateVisible"
+                    | "stateAlwaysVisible"
+            )
+        }) && !soft_input_numeric
+        {
+            failures.push(format!("invalid softInputMode: {}", self.soft_input_mode));
+        } else if !soft_input_numeric {
+            let state_flags = soft_input_parts
+                .iter()
+                .filter(|part| part.starts_with("state"))
+                .count();
+            let adjust_flags = soft_input_parts
+                .iter()
+                .filter(|part| part.starts_with("adjust"))
+                .count();
+            if state_flags > 1 || adjust_flags > 1 {
+                failures.push(format!(
+                    "softInputMode may contain at most one state flag and one adjust flag: {}",
+                    self.soft_input_mode
+                ));
+            }
+        }
+        if self.config_changes != "none"
+            && !self.config_changes.split('|').all(|part| {
+                matches!(
+                    part.trim(),
+                    "mcc"
+                        | "mnc"
+                        | "locale"
+                        | "touchscreen"
+                        | "keyboard"
+                        | "keyboardHidden"
+                        | "navigation"
+                        | "orientation"
+                        | "screenSize"
+                        | "screenLayout"
+                        | "uiMode"
+                        | "fontScale"
+                        | "smallestScreenSize"
+                        | "layoutDirection"
+                        | "colorMode"
+                        | "density"
+                        | "grammaticalGender"
+                        | "fontWeightAdjustment"
+                )
+            })
+            && !numeric_literal(&self.config_changes)
+        {
+            failures.push(format!("invalid configChanges: {}", self.config_changes));
         }
         for (label, value) in [
             ("displayName", self.display_name.as_str()),
@@ -195,7 +426,13 @@ description={}\n\
 defaultVersionCode={}\n\
 defaultVersionName={}\n\
 minHostVersionCode={}\n\
-maxHostVersionCode={}\n",
+maxHostVersionCode={}\n\
+applicationClassName={}\n\
+applicationTheme={}\n\
+activityTheme={}\n\
+screenOrientation={}\n\
+softInputMode={}\n\
+configChanges={}\n",
             self.schema_version,
             self.plugin_slug,
             self.project_name,
@@ -212,12 +449,38 @@ maxHostVersionCode={}\n",
             self.default_version_name,
             self.min_host_version_code,
             self.max_host_version_code,
+            self.application_class_name.as_deref().unwrap_or(""),
+            self.application_theme,
+            self.activity_theme,
+            self.screen_orientation,
+            self.soft_input_mode,
+            self.config_changes,
         )
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
         write_atomic(path, self.render().as_bytes())
     }
+}
+
+fn numeric_literal(value: &str) -> bool {
+    let hexadecimal = (value.starts_with("0x") || value.starts_with("0X"))
+        && value.len() > 2
+        && value[2..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    let decimal = value.strip_prefix('-').unwrap_or(value);
+    hexadecimal
+        || (!decimal.is_empty() && decimal.chars().all(|character| character.is_ascii_digit()))
+}
+
+fn unsigned_numeric_literal(value: &str) -> bool {
+    ((value.starts_with("0x") || value.starts_with("0X"))
+        && value.len() > 2
+        && value[2..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()))
+        || (!value.is_empty() && value.chars().all(|character| character.is_ascii_digit()))
 }
 
 pub fn parse_properties(path: &Path) -> Result<ParsedProperties> {
@@ -336,7 +599,10 @@ pub fn sibling_configs(home: &Path) -> Result<Vec<(PathBuf, PluginConfig)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginConfig, normalize_resource_id, parse_properties};
+    use super::{
+        PluginConfig, normalize_resource_id, numeric_literal, parse_properties,
+        valid_java_identifier, valid_java_qualified_name,
+    };
     use std::fs;
 
     #[test]
@@ -344,6 +610,15 @@ mod tests {
         assert_eq!(normalize_resource_id("0x6a").unwrap(), "0x6A");
         assert!(normalize_resource_id("0x01").is_err());
         assert!(normalize_resource_id("7C").is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_java_identifiers_in_generated_class_names() {
+        assert!(valid_java_identifier("notes"));
+        assert!(!valid_java_identifier("import"));
+        assert!(!valid_java_identifier("record"));
+        assert!(valid_java_qualified_name("com.termux.shadow.notes"));
+        assert!(!valid_java_qualified_name("com.termux.shadow.import"));
     }
 
     #[test]
@@ -366,6 +641,14 @@ mod tests {
     }
 
     #[test]
+    fn numeric_literals_require_at_least_one_digit() {
+        assert!(numeric_literal("-1"));
+        assert!(numeric_literal("0x10"));
+        assert!(!numeric_literal("-"));
+        assert!(!numeric_literal("0x"));
+    }
+
+    #[test]
     fn renders_round_trip_config() {
         let config = PluginConfig {
             schema_version: 1,
@@ -384,9 +667,23 @@ mod tests {
             default_version_name: "1.0.0".into(),
             min_host_version_code: 118,
             max_host_version_code: 999_999,
+            application_class_name: None,
+            application_theme: "android.R.style.Theme_Material_Light_NoActionBar".into(),
+            activity_theme: "android.R.style.Theme_Material_Light_NoActionBar".into(),
+            screen_orientation: "unspecified".into(),
+            soft_input_mode: "adjustNothing".into(),
+            config_changes: "orientation|screenSize|keyboardHidden".into(),
         };
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("shadow-plugin.properties");
+        let mut invalid_soft_input = config.clone();
+        invalid_soft_input.soft_input_mode = "adjustPan|adjustResize".into();
+        assert!(
+            invalid_soft_input
+                .validate()
+                .iter()
+                .any(|message| message.contains("at most one"))
+        );
         config.write(&path).unwrap();
         let loaded = PluginConfig::load(&path).unwrap();
         assert_eq!(loaded.plugin_id, config.plugin_id);

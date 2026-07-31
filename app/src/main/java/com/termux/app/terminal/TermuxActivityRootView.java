@@ -2,83 +2,116 @@ package com.termux.app.terminal;
 
 import android.content.Context;
 import android.graphics.Rect;
-import android.inputmethodservice.InputMethodService;
 import android.util.AttributeSet;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
-import android.view.WindowInsets;
-import android.view.inputmethod.EditorInfo;
-import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsAnimationCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.termux.R;
 import com.termux.app.TermuxActivity;
 import com.termux.shared.logger.Logger;
 import com.termux.shared.view.ViewUtils;
+import com.termux.terminalsessionsurface.TerminalImeViewportPolicy;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Set;
 
 /**
- * The {@link TermuxActivity} relies on {@link android.view.WindowManager.LayoutParams#SOFT_INPUT_ADJUST_RESIZE)}
- * set by {@link TermuxTerminalViewClient#setSoftKeyboardState(boolean, boolean)} to automatically
- * resize the view and push the terminal up when soft keyboard is opened. However, this does not
- * always work properly. When `enforce-char-based-input=true` is set in `termux.properties`
- * and {@link com.termux.view.TerminalView#onCreateInputConnection(EditorInfo)} sets the inputType
- * to `InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS`
- * instead of the default `InputType.TYPE_NULL` for termux, some keyboards may still show suggestions.
- * Gboard does too, but only when text is copied and clipboard suggestions **and** number keys row
- * toggles are enabled in its settings. When number keys row toggle is not enabled, Gboard will still
- * show the row but will switch it with suggestions if needed. If its enabled, then number keys row
- * is always shown and suggestions are shown in an additional row on top of it. This additional row is likely
- * part of the candidates view returned by the keyboard app in {@link InputMethodService#onCreateCandidatesView()}.
+ * Coordinates IME occlusion without changing the measured terminal geometry.
  *
- * With the above configuration, the additional clipboard suggestions row partially covers the
- * extra keys/terminal. Reopening the keyboard/activity does not fix the issue. This is either a bug
- * in the Android OS where it does not consider the candidate's view height in its calculation to push
- * up the view or because Gboard does not include the candidate's view height in the height reported
- * to android that should be used, hence causing an overlap.
+ * <p>A terminal resize is process-visible: it emits {@code TIOCSWINSZ}, then SSH forwards a
+ * {@code window-change}, and tmux may reflow every pane. The IME is only a temporary visual
+ * occluder, so its animation and candidate-row changes must not resize this root view. The exact
+ * occlusion is forwarded to the terminal surface as a bottom-chrome boundary. The terminal page
+ * itself never moves for an IME transition.</p>
  *
- * Gboard logs the following entry to `logcat` when its opened with or without the suggestions bar showing:
- * I/KeyboardViewUtil: KeyboardViewUtil.calculateMaxKeyboardBodyHeight():62 leave 500 height for app when screen height:2392, header height:176 and isFullscreenMode:false, so the max keyboard body height is:1716
- * where `keyboard_height = screen_height - height_for_app - header_height` (62 is a hardcoded value in Gboard source code and may be a version number)
- * So this may in fact be due to Gboard but https://stackoverflow.com/questions/57567272 suggests
- * otherwise. Another similar report https://stackoverflow.com/questions/66761661.
- * Also check https://github.com/termux/termux-app/issues/1539.
- *
- * This overlap may happen even without `enforce-char-based-input=true` for keyboards with extended layouts
- * like number row, etc.
- *
- * To fix these issues, `activity_termux.xml` has the constant 1sp transparent
- * `activity_termux_bottom_space_view` View at the bottom. This will appear as a line matching the
- * activity theme. When {@link TermuxActivity} {@link ViewTreeObserver.OnGlobalLayoutListener} is
- * called when any of the sub view layouts change,  like keyboard opening/closing keyboard,
- * extra keys/input view switched, etc, we check if the bottom space view is visible or not.
- * If its not, then we add a margin to the bottom of the root view, so that the keyboard does not
- * overlap the extra keys/terminal, since the margin will push up the view. By default the margin
- * added is equal to the height of the hidden part of extra keys/terminal. For Gboard's case, the
- * hidden part equals the `header_height`. The updates to margins may cause a jitter in some cases
- * when the view is redrawn if the margin is incorrect, but logic has been implemented to avoid that.
+ * <p>{@link WindowInsetsCompat.Type#ime()} is authoritative. A read-only visible-frame probe is
+ * retained for OEM keyboards that fail to include a candidate row (or the entire IME) in their
+ * inset. Unlike the historical workaround, the probe never writes layout params.</p>
  */
-public class TermuxActivityRootView extends LinearLayout implements ViewTreeObserver.OnGlobalLayoutListener {
+public class TermuxActivityRootView extends LinearLayout
+    implements ViewTreeObserver.OnGlobalLayoutListener {
 
     public TermuxActivity mActivity;
-    public Integer marginBottom;
-    public Integer lastMarginBottom;
-    public long lastMarginBottomTime;
-    public long lastMarginBottomExtraTime;
 
-    private boolean mIsBottomNavigationFixedOnImeEnabled = true;
-    private int mLastImeBottomInset = 0;
-    private int mBottomNavOriginalHeight = -1;
+    private int mLastImeBottomInset;
+    private int mVisibleFrameImeBottomInset;
+    @Nullable private View mBottomNavigationView;
+    private final int[] mWindowRootLocation = new int[2];
+
+    private final Set<WindowInsetsAnimationCompat> mRunningImeAnimations =
+        Collections.newSetFromMap(new IdentityHashMap<>());
+
+    private final WindowInsetsAnimationCompat.Callback mImeAnimationCallback =
+        new WindowInsetsAnimationCompat.Callback(
+            WindowInsetsAnimationCompat.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+            @Override
+            public void onPrepare(@NonNull WindowInsetsAnimationCompat animation) {
+                if (!isImeAnimation(animation)) return;
+                mRunningImeAnimations.add(animation);
+                dispatchImeViewportState();
+            }
+
+            @NonNull
+            @Override
+            public WindowInsetsAnimationCompat.BoundsCompat onStart(
+                @NonNull WindowInsetsAnimationCompat animation,
+                @NonNull WindowInsetsAnimationCompat.BoundsCompat bounds) {
+                if (isImeAnimation(animation)) {
+                    mRunningImeAnimations.add(animation);
+                    dispatchImeViewportState();
+                }
+                return bounds;
+            }
+
+            @NonNull
+            @Override
+            public WindowInsetsCompat onProgress(@NonNull WindowInsetsCompat insets,
+                @NonNull List<WindowInsetsAnimationCompat> runningAnimations) {
+                mLastImeBottomInset =
+                    insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
+                for (WindowInsetsAnimationCompat animation : runningAnimations) {
+                    if (isImeAnimation(animation)) mRunningImeAnimations.add(animation);
+                }
+                dispatchImeViewportState();
+                return insets;
+            }
+
+            @Override
+            public void onEnd(@NonNull WindowInsetsAnimationCompat animation) {
+                if (!isImeAnimation(animation)) return;
+                mRunningImeAnimations.remove(animation);
+                WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(
+                    TermuxActivityRootView.this);
+                if (insets != null) {
+                    mLastImeBottomInset =
+                        insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
+                }
+                refreshVisibleFrameImeBottomInset();
+                dispatchImeViewportState();
+
+                // Some OEMs update getWindowVisibleDisplayFrame() one traversal after ending the
+                // insets animation. Re-sample once, without installing a timer or changing layout.
+                ViewCompat.postOnAnimation(TermuxActivityRootView.this, () -> {
+                    if (!mRunningImeAnimations.isEmpty()) return;
+                    if (refreshVisibleFrameImeBottomInset()) dispatchImeViewportState();
+                });
+            }
+        };
 
     /** Log root view events. */
-    private boolean ROOT_VIEW_LOGGING_ENABLED = false;
+    private boolean ROOT_VIEW_LOGGING_ENABLED;
 
     private static final String LOG_TAG = "TermuxActivityRootView";
-
     private static int mStatusBarHeight;
 
     public TermuxActivityRootView(Context context) {
@@ -89,260 +122,179 @@ public class TermuxActivityRootView extends LinearLayout implements ViewTreeObse
         super(context, attrs);
     }
 
-    public TermuxActivityRootView(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
+    public TermuxActivityRootView(Context context, @Nullable AttributeSet attrs,
+        int defStyleAttr) {
         super(context, attrs, defStyleAttr);
     }
 
     public void setActivity(TermuxActivity activity) {
         mActivity = activity;
+        ViewCompat.setWindowInsetsAnimationCallback(this, mImeAnimationCallback);
     }
 
-    /**
-     * Sets whether root view logging is enabled or not.
-     *
-     * @param value The boolean value that defines the state.
-     */
     public void setIsRootViewLoggingEnabled(boolean value) {
         ROOT_VIEW_LOGGING_ENABLED = value;
     }
 
-    public void setBottomNavigationFixedOnImeEnabled(boolean enabled) {
-        mIsBottomNavigationFixedOnImeEnabled = enabled;
-        applyBottomNavigationImeFix();
-    }
-
-    public boolean isBottomNavigationFixedOnImeEnabled() {
-        return mIsBottomNavigationFixedOnImeEnabled;
-    }
-
     private void onWindowInsetsApplied(WindowInsetsCompat insets) {
         mLastImeBottomInset = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
-        applyBottomNavigationImeFix();
+        if (mRunningImeAnimations.isEmpty()) refreshVisibleFrameImeBottomInset();
+        dispatchImeViewportState();
     }
 
-    private void applyBottomNavigationImeFix() {
+    /** Returns the authoritative inset plus any OEM-visible candidate-row under-reporting. */
+    public int getLastImeBottomInset() {
+        return getEffectiveImeBottomInset();
+    }
+
+    /** Returns the real IME inset; app chrome is intentionally not folded into this value. */
+    public int getTerminalViewportBottomInset() {
+        return getEffectiveImeBottomInset();
+    }
+
+    /**
+     * Returns the exact window-space bottom boundary for movable terminal chrome.
+     *
+     * <p>The app bottom navigation is persistent window chrome: it stays structurally anchored at
+     * the window bottom and is occluded by a docked IME. Only terminal-local chrome moves to this
+     * boundary, which is therefore always the real IME top. This is deliberately an absolute
+     * coordinate so callers cannot accidentally fold navigation height into the IME inset.</p>
+     */
+    public int getTerminalChromeBoundaryInWindow() {
+        return resolveTerminalChromeBoundaryInWindow();
+    }
+
+    /** Called after Activity changes the bottom-navigation visibility or other presentation state. */
+    public void onBottomNavigationPresentationChanged() {
+        dispatchImeViewportState();
+    }
+
+    public boolean isImeAnimationRunning() {
+        return !mRunningImeAnimations.isEmpty();
+    }
+
+    public void dispatchCurrentImeViewportState() {
+        if (mRunningImeAnimations.isEmpty()) refreshVisibleFrameImeBottomInset();
+        dispatchImeViewportState();
+    }
+
+    private int getEffectiveImeBottomInset() {
+        // During animation the inset is frame-synchronised. A visible-frame query may already
+        // report the final keyboard bounds and would otherwise create a one-frame jump.
+        if (!mRunningImeAnimations.isEmpty()) return Math.max(0, mLastImeBottomInset);
+        return Math.max(Math.max(0, mLastImeBottomInset), mVisibleFrameImeBottomInset);
+    }
+
+    private void dispatchImeViewportState() {
+        int imeInset = getEffectiveImeBottomInset();
+        int chromeBoundaryInWindow = resolveTerminalChromeBoundaryInWindow();
+        clearLegacyImeMargin();
+        if (mActivity != null) {
+            mActivity.onTerminalImeViewportChanged(imeInset, chromeBoundaryInWindow,
+                !mRunningImeAnimations.isEmpty());
+        }
+    }
+
+    private static boolean isImeAnimation(@NonNull WindowInsetsAnimationCompat animation) {
+        return (animation.getTypeMask() & WindowInsetsCompat.Type.ime()) != 0;
+    }
+
+    private int resolveTerminalChromeBoundaryInWindow() {
+        enforceBottomNavigationWindowAnchor();
+        int windowBottom = getWindowBottomInWindow();
+        int imeInset = getEffectiveImeBottomInset();
+        return TerminalImeViewportPolicy.computeImeTopInWindow(windowBottom, imeInset);
+    }
+
+    /**
+     * Keeps primary navigation in the stable app coordinate space.
+     *
+     * <p>A docked keyboard is a separate occluding window. Translating primary navigation to the
+     * IME top makes it appear opportunistically during typing and also steals a second strip from
+     * the terminal viewport. Resetting translation is layout-free, so terminal rows and columns
+     * remain unchanged throughout the IME animation.</p>
+     */
+    private void enforceBottomNavigationWindowAnchor() {
         if (mActivity == null) return;
-
-        View bottomNavigationView = mActivity.findViewById(R.id.bottom_navigation);
-        if (bottomNavigationView == null) return;
-
-        View terminalToolbarViewPager = mActivity.findViewById(R.id.terminal_toolbar_view_pager);
-
-        bottomNavigationView.setTranslationY(0f);
-        if (terminalToolbarViewPager != null) terminalToolbarViewPager.setTranslationY(0f);
-
-        boolean imeVisible = mLastImeBottomInset > 0;
-        ViewGroup.LayoutParams bottomNavLayoutParams = bottomNavigationView.getLayoutParams();
-        if (bottomNavLayoutParams != null) {
-            if (mBottomNavOriginalHeight <= 0) {
-                mBottomNavOriginalHeight = bottomNavLayoutParams.height;
-                if (mBottomNavOriginalHeight <= 0) {
-                    int measuredHeight = bottomNavigationView.getHeight();
-                    if (measuredHeight > 0) mBottomNavOriginalHeight = measuredHeight;
-                }
-                if (mBottomNavOriginalHeight <= 0) {
-                    mBottomNavOriginalHeight = Math.round(56f * getResources().getDisplayMetrics().density);
-                }
-            }
-
-            if (mIsBottomNavigationFixedOnImeEnabled && imeVisible) {
-                if (bottomNavLayoutParams.height != 0) {
-                    bottomNavLayoutParams.height = 0;
-                    bottomNavigationView.setLayoutParams(bottomNavLayoutParams);
-                }
-            } else {
-                if (bottomNavLayoutParams.height != mBottomNavOriginalHeight) {
-                    bottomNavLayoutParams.height = mBottomNavOriginalHeight;
-                    bottomNavigationView.setLayoutParams(bottomNavLayoutParams);
-                }
-            }
+        View bottomNavigationView = mBottomNavigationView;
+        if (bottomNavigationView == null) {
+            bottomNavigationView = mActivity.findViewById(R.id.bottom_navigation);
+            mBottomNavigationView = bottomNavigationView;
+        }
+        if (bottomNavigationView != null && bottomNavigationView.getTranslationY() != 0f) {
+            bottomNavigationView.setTranslationY(0f);
         }
     }
 
-    @Override
-    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-        super.onMeasure(widthMeasureSpec, heightMeasureSpec);
+    private int getWindowBottomInWindow() {
+        View windowRoot = getRootView();
+        if (windowRoot == null || windowRoot.getHeight() <= 0) return 0;
+        windowRoot.getLocationInWindow(mWindowRootLocation);
+        return mWindowRootLocation[1] + windowRoot.getHeight();
+    }
 
-        if (marginBottom != null) {
-            if (ROOT_VIEW_LOGGING_ENABLED)
-                Logger.logVerbose(LOG_TAG, "onMeasure: Setting bottom margin to " + marginBottom);
-            ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) getLayoutParams();
-            if (params.bottomMargin != marginBottom) {
-                params.setMargins(0, 0, 0, marginBottom);
-                setLayoutParams(params);
-                requestLayout();
+    /** Removes stale state written by older builds; subsequent IME frames are layout-write free. */
+    private void clearLegacyImeMargin() {
+        ViewGroup.LayoutParams layoutParams = getLayoutParams();
+        if (!(layoutParams instanceof ViewGroup.MarginLayoutParams)) return;
+        ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) layoutParams;
+        if (params.bottomMargin == 0) return;
+        params.bottomMargin = 0;
+        setLayoutParams(params);
+    }
+
+    /**
+     * Samples the visible frame as a conservative OEM fallback. A large threshold is required
+     * when Android reports no IME inset so status/navigation bars cannot be mistaken for a
+     * keyboard. Once the IME is known, smaller differences may represent a candidate row.
+     */
+    private boolean refreshVisibleFrameImeBottomInset() {
+        int observedInset = 0;
+        if (mActivity != null && mActivity.isVisible()) {
+            View bottomSpaceView = mActivity.getTermuxActivityBottomSpaceView();
+            Rect[] rects = ViewUtils.getWindowAndViewRects(bottomSpaceView, mStatusBarHeight);
+            if (rects != null) {
+                int hiddenPixels = Math.max(0, rects[1].bottom - rects[0].bottom);
+                int keyboardThreshold = Math.max(1, getHeight() / 4);
+                boolean imeKnown = mLastImeBottomInset > 0 ||
+                    !mRunningImeAnimations.isEmpty();
+                if (imeKnown || hiddenPixels > keyboardThreshold) {
+                    observedInset = hiddenPixels;
+                }
+                if (ROOT_VIEW_LOGGING_ENABLED) {
+                    Logger.logVerbose(LOG_TAG, "visible-frame IME probe: hidden=" +
+                        hiddenPixels + ", inset=" + mLastImeBottomInset +
+                        ", fallback=" + observedInset + ", threshold=" +
+                        keyboardThreshold);
+                }
             }
-            marginBottom = null;
         }
+
+        if (mVisibleFrameImeBottomInset == observedInset) return false;
+        mVisibleFrameImeBottomInset = observedInset;
+        return true;
     }
 
     @Override
     public void onGlobalLayout() {
         if (mActivity == null || !mActivity.isVisible()) return;
-
-        View bottomSpaceView = mActivity.getTermuxActivityBottomSpaceView();
-        if (bottomSpaceView == null) return;
-
-        boolean root_view_logging_enabled = ROOT_VIEW_LOGGING_ENABLED;
-
-        if (root_view_logging_enabled)
-            Logger.logVerbose(LOG_TAG, ":\nonGlobalLayout:");
-
-        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) getLayoutParams();
-
-        // Get the position Rects of the bottom space view and the main window holding it
-        Rect[] windowAndViewRects = ViewUtils.getWindowAndViewRects(bottomSpaceView, mStatusBarHeight);
-        if (windowAndViewRects == null)
-            return;
-
-        Rect windowAvailableRect = windowAndViewRects[0];
-        Rect bottomSpaceViewRect = windowAndViewRects[1];
-
-        // If the bottomSpaceViewRect is inside the windowAvailableRect, then it must be completely visible
-        //boolean isVisible = windowAvailableRect.contains(bottomSpaceViewRect); // rect.right comparison often fails in landscape
-        boolean isVisible = ViewUtils.isRectAbove(windowAvailableRect, bottomSpaceViewRect);
-        boolean isVisibleBecauseMargin = (windowAvailableRect.bottom == bottomSpaceViewRect.bottom) && params.bottomMargin > 0;
-        boolean isVisibleBecauseExtraMargin = ((bottomSpaceViewRect.bottom - windowAvailableRect.bottom) < 0);
-
-        if (root_view_logging_enabled) {
-            Logger.logVerbose(LOG_TAG, "windowAvailableRect " + ViewUtils.toRectString(windowAvailableRect) + ", bottomSpaceViewRect " + ViewUtils.toRectString(bottomSpaceViewRect));
-            Logger.logVerbose(LOG_TAG, "windowAvailableRect.bottom " + windowAvailableRect.bottom +
-                ", bottomSpaceViewRect.bottom " +bottomSpaceViewRect.bottom +
-                ", diff " + (bottomSpaceViewRect.bottom - windowAvailableRect.bottom) + ", bottom " + params.bottomMargin +
-                ", isVisible " + windowAvailableRect.contains(bottomSpaceViewRect) + ", isRectAbove " + ViewUtils.isRectAbove(windowAvailableRect, bottomSpaceViewRect) +
-                ", isVisibleBecauseMargin " + isVisibleBecauseMargin + ", isVisibleBecauseExtraMargin " + isVisibleBecauseExtraMargin);
-        }
-
-        // If the bottomSpaceViewRect is visible, then remove the margin if needed
-        if (isVisible) {
-            // If visible because of margin, i.e the bottom of bottomSpaceViewRect equals that of windowAvailableRect
-            // and a margin has been added
-            // Necessary so that we don't get stuck in an infinite loop since setting margin
-            // will call OnGlobalLayoutListener again and next time bottom space view
-            // will be visible and margin will be set to 0, which again will call
-            // OnGlobalLayoutListener...
-            // Calling addTermuxActivityRootViewGlobalLayoutListener with a delay fails to
-            // set appropriate margins when views are changed quickly since some changes
-            // may be missed.
-            if (isVisibleBecauseMargin) {
-                if (root_view_logging_enabled)
-                    Logger.logVerbose(LOG_TAG, "Visible due to margin");
-
-                // Once the view has been redrawn with new margin, we set margin back to 0 so that
-                // when next time onMeasure() is called, margin 0 is used. This is necessary for
-                // cases when view has been redrawn with new margin because bottom space view was
-                // hidden by keyboard and then view was redrawn again due to layout change (like
-                // keyboard symbol view is switched to), android will add margin below its new position
-                // if its greater than 0, which was already above the keyboard creating x2x margin.
-                // Adding time check since moving split screen divider in landscape causes jitter
-                // and prevents some infinite loops
-                if ((System.currentTimeMillis() - lastMarginBottomTime) > 40) {
-                    lastMarginBottomTime = System.currentTimeMillis();
-                    marginBottom = 0;
-                } else {
-                    if (root_view_logging_enabled)
-                        Logger.logVerbose(LOG_TAG, "Ignoring restoring marginBottom to 0 since called to quickly");
-                }
-
-                return;
-            }
-
-            boolean setMargin = params.bottomMargin != 0;
-
-            // If visible because of extra margin, i.e the bottom of bottomSpaceViewRect is above that of windowAvailableRect
-            // onGlobalLayout: windowAvailableRect 1408, bottomSpaceViewRect 1232, diff -176, bottom 0, isVisible true, isVisibleBecauseMargin false, isVisibleBecauseExtraMargin false
-            // onGlobalLayout: Bottom margin already equals 0
-            if (isVisibleBecauseExtraMargin) {
-                // Adding time check since prevents infinite loops, like in landscape mode in freeform mode in Taskbar
-                if ((System.currentTimeMillis() - lastMarginBottomExtraTime) > 40) {
-                    if (root_view_logging_enabled)
-                        Logger.logVerbose(LOG_TAG, "Resetting margin since visible due to extra margin");
-                    lastMarginBottomExtraTime = System.currentTimeMillis();
-                    // lastMarginBottom must be invalid. May also happen when keyboards are changed.
-                    lastMarginBottom = null;
-                    setMargin = true;
-                } else {
-                    if (root_view_logging_enabled)
-                        Logger.logVerbose(LOG_TAG, "Ignoring resetting margin since visible due to extra margin since called to quickly");
-                }
-            }
-
-            if (setMargin) {
-                if (root_view_logging_enabled)
-                    Logger.logVerbose(LOG_TAG, "Setting bottom margin to 0");
-                params.setMargins(0, 0, 0, 0);
-                setLayoutParams(params);
-            } else {
-                if (root_view_logging_enabled)
-                    Logger.logVerbose(LOG_TAG, "Bottom margin already equals 0");
-                // This is done so that when next time onMeasure() is called, lastMarginBottom is used.
-                // This is done since we **expect** the keyboard to have same dimensions next time layout
-                // changes, so best set margin while view is drawn the first time, otherwise it will
-                // cause a jitter when OnGlobalLayoutListener is called with margin 0 and it sets the
-                // likely same lastMarginBottom again and requesting a redraw. Hopefully, this logic
-                // works fine for all cases.
-                marginBottom = lastMarginBottom;
-            }
-        }
-        // ELse find the part of the extra keys/terminal that is hidden and add a margin accordingly
-        else {
-            int pxHidden = bottomSpaceViewRect.bottom - windowAvailableRect.bottom;
-
-            if (root_view_logging_enabled)
-                Logger.logVerbose(LOG_TAG, "pxHidden " + pxHidden + ", bottom " + params.bottomMargin);
-
-            boolean setMargin = params.bottomMargin != pxHidden;
-
-            // If invisible despite margin, i.e a margin was added, but the bottom of bottomSpaceViewRect
-            // is still below that of windowAvailableRect, this will trigger OnGlobalLayoutListener
-            // again, so that margins are set properly. May happen when toolbar/extra keys is disabled
-            // and enabled from left drawer, just like case for isVisibleBecauseExtraMargin.
-            // onMeasure: Setting bottom margin to 176
-            // onGlobalLayout: windowAvailableRect 1232, bottomSpaceViewRect 1408, diff 176, bottom 176, isVisible false, isVisibleBecauseMargin false, isVisibleBecauseExtraMargin false
-            // onGlobalLayout: Bottom margin already equals 176
-            if (pxHidden > 0 && params.bottomMargin > 0) {
-                if (pxHidden != params.bottomMargin) {
-                    if (root_view_logging_enabled)
-                        Logger.logVerbose(LOG_TAG, "Force setting margin to 0 since not visible due to wrong margin");
-                    pxHidden = 0;
-                } else {
-                    if (root_view_logging_enabled)
-                        Logger.logVerbose(LOG_TAG, "Force setting margin since not visible despite required margin");
-                }
-                setMargin = true;
-            }
-
-            if (pxHidden  < 0) {
-                if (root_view_logging_enabled)
-                    Logger.logVerbose(LOG_TAG, "Force setting margin to 0 since new margin is negative");
-                pxHidden = 0;
-            }
-
-
-            if (setMargin) {
-                if (root_view_logging_enabled)
-                    Logger.logVerbose(LOG_TAG, "Setting bottom margin to " + pxHidden);
-                params.setMargins(0, 0, 0, pxHidden);
-                setLayoutParams(params);
-                lastMarginBottom = pxHidden;
-            } else {
-                if (root_view_logging_enabled)
-                    Logger.logVerbose(LOG_TAG, "Bottom margin already equals " + pxHidden);
-            }
-        }
+        clearLegacyImeMargin();
+        enforceBottomNavigationWindowAnchor();
+        if (refreshVisibleFrameImeBottomInset()) dispatchImeViewportState();
     }
 
-    public static class WindowInsetsListener implements View.OnApplyWindowInsetsListener {
+    public static class WindowInsetsListener
+        implements androidx.core.view.OnApplyWindowInsetsListener {
+        @NonNull
         @Override
-        public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
-            WindowInsetsCompat insetsCompat = WindowInsetsCompat.toWindowInsetsCompat(insets);
-            mStatusBarHeight = insetsCompat.getInsets(WindowInsetsCompat.Type.statusBars()).top;
+        public WindowInsetsCompat onApplyWindowInsets(@NonNull View v,
+            @NonNull WindowInsetsCompat insets) {
+            mStatusBarHeight =
+                insets.getInsets(WindowInsetsCompat.Type.statusBars()).top;
             if (v instanceof TermuxActivityRootView) {
-                ((TermuxActivityRootView) v).onWindowInsetsApplied(insetsCompat);
+                ((TermuxActivityRootView) v).onWindowInsetsApplied(insets);
             }
-            // Let view window handle insets however it wants
-            return v.onApplyWindowInsets(insets);
+            return insets;
         }
     }
-
 }

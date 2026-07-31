@@ -34,10 +34,29 @@ public final class SshKnownHostsFiles {
     @NonNull
     public static String buildKnownHostsHostPattern(@NonNull ResolvedSshEndpoint endpoint) {
         String identity = endpoint.hostIdentity.isEmpty() ? endpoint.host : endpoint.hostIdentity;
-        if (identity.isEmpty()) return "";
-        if (endpoint.port != 22 || identity.contains(":")) {
+        if (!isSafeKnownHostsIdentity(identity)) return "";
+        // OpenSSH's get_hostfile_hostname_ipaddr() uses HostKeyAlias verbatim. Without an alias,
+        // put_host_port() adds brackets and a port only for non-default ports; a default-port IPv6
+        // literal remains unbracketed. These details must match exactly or strict checking fails.
+        if (endpoint.usesHostKeyAlias) return identity;
+        if (endpoint.port != 22) {
             return "[" + identity + "]:" + endpoint.port;
         }
         return identity;
+    }
+
+    /**
+     * Host fields in known_hosts are pattern lists, not opaque strings. Reject syntax that would
+     * turn one trusted key into a wildcard, negated, multi-host, or multi-line entry.
+     */
+    public static boolean isSafeKnownHostsIdentity(@NonNull String identity) {
+        if (identity.isEmpty()) return false;
+        for (int i = 0; i < identity.length(); i++) {
+            char ch = identity.charAt(i);
+            if (Character.isWhitespace(ch) || Character.isISOControl(ch)) return false;
+            if (ch == ',' || ch == '*' || ch == '?' || ch == '!' || ch == '[' || ch == ']'
+                || ch == '\\' || ch == '|') return false;
+        }
+        return true;
     }
 }

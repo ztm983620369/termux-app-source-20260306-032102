@@ -7,6 +7,8 @@ use anyhow::Error as AnyError;
 use regex::Regex;
 use serde::Serialize;
 
+use crate::cli::DependencyPolicy;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
@@ -35,7 +37,18 @@ pub struct GradleFailure {
 }
 
 impl GradleFailure {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn classify(output: &str, project: &Path, log_path: &Path) -> Self {
+        Self::classify_with_policy(output, project, log_path, DependencyPolicy::Offline, false)
+    }
+
+    pub fn classify_with_policy(
+        output: &str,
+        project: &Path,
+        log_path: &Path,
+        policy: DependencyPolicy,
+        allow_network: bool,
+    ) -> Self {
         let java = java_diagnostics(output, project);
         let (code, phase, diagnostics, message) = if !java.is_empty() {
             (
@@ -52,18 +65,24 @@ impl GradleFailure {
                     "plugin version is required",
                 ],
             );
+            let offline = matches!(policy, DependencyPolicy::Offline)
+                || (matches!(policy, DependencyPolicy::CacheFirst) && !allow_network);
             (
                 if missing_version {
                     "ANDROID_LIBRARY_PLUGIN_UNDECLARED"
+                } else if offline {
+                    "ANDROID_LIBRARY_PLUGIN_NOT_IN_CACHE"
                 } else {
-                    "ANDROID_LIBRARY_PLUGIN_NOT_IN_OFFLINE_CACHE"
+                    "ANDROID_LIBRARY_PLUGIN_RESOLUTION_FAILED"
                 },
                 "resolvePlugins",
                 android_library_diagnostics(output, project, missing_version),
                 if missing_version {
                     "Android Library plugin has no centrally declared version"
+                } else if offline {
+                    "The declared Android Library plugin version is unavailable in the selected cache"
                 } else {
-                    "The declared Android Library plugin version is unavailable in the offline toolchain"
+                    "The declared Android Library plugin version could not be resolved from configured repositories"
                 },
             )
         } else if contains_any(
@@ -104,12 +123,7 @@ impl GradleFailure {
                 "Could not determine the dependencies",
             ],
         ) {
-            (
-                "DEPENDENCY_NOT_IN_OFFLINE_CACHE",
-                "resolveDependencies",
-                generic_diagnostics(output, &["Could not find ", "No cached version of"]),
-                "A required offline dependency is unavailable",
-            )
+            dependency_failure(output, policy, allow_network)
         } else if contains_any(
             output,
             &[
@@ -147,6 +161,49 @@ impl GradleFailure {
             diagnostics,
             log_path: display_path(project, log_path),
         }
+    }
+}
+
+fn dependency_failure(
+    output: &str,
+    policy: DependencyPolicy,
+    allow_network: bool,
+) -> (&'static str, &'static str, Vec<Diagnostic>, &'static str) {
+    let mut diagnostics = generic_diagnostics(output, &["Could not find ", "No cached version of"]);
+    if matches!(policy, DependencyPolicy::Offline)
+        || (matches!(policy, DependencyPolicy::CacheFirst) && !allow_network)
+    {
+        diagnostics.insert(0, Diagnostic {
+            kind: Some("DEPENDENCY_REMEDIATION".to_owned()),
+            file: None,
+            line: None,
+            column: None,
+            activity: None,
+            error_type: None,
+            message: "Inspect with `shadow-plugin deps status`; then use `shadow-plugin deps resolve --allow-network --lock`, `shadow-plugin deps import-gradle-cache --from PATH`, or a reviewed project vendor cache".to_owned(),
+        });
+        (
+            "DEPENDENCY_NOT_IN_CACHE",
+            "resolveDependencies",
+            diagnostics,
+            "A required dependency is not available in the selected cache",
+        )
+    } else {
+        diagnostics.insert(0, Diagnostic {
+            kind: Some("DEPENDENCY_REMEDIATION".to_owned()),
+            file: None,
+            line: None,
+            column: None,
+            activity: None,
+            error_type: None,
+            message: "Verify repository configuration and connectivity, then rerun `shadow-plugin deps resolve --allow-network --lock`".to_owned(),
+        });
+        (
+            "DEPENDENCY_RESOLUTION_FAILED",
+            "resolveDependencies",
+            diagnostics,
+            "Gradle could not resolve one or more dependencies from the configured repositories",
+        )
     }
 }
 
@@ -469,7 +526,10 @@ fn envelope<'a>(error: &AnyError, action: &'a str) -> ErrorEnvelope<'a> {
             action,
             phase: gradle.phase.clone(),
             code: gradle.code.clone(),
-            retryable: false,
+            retryable: matches!(
+                gradle.code.as_str(),
+                "DEPENDENCY_RESOLUTION_FAILED" | "ANDROID_LIBRARY_PLUGIN_RESOLUTION_FAILED"
+            ),
             message: gradle.message.clone(),
             diagnostics: gradle.diagnostics.clone(),
             state_changed: Some(false),

@@ -18,6 +18,9 @@ import com.tencent.shadow.sample.host.platform.ShadowLaunchPlan;
 import com.tencent.shadow.sample.host.platform.ShadowPaths;
 import com.tencent.shadow.sample.host.platform.ShadowPluginDescriptor;
 import com.tencent.shadow.sample.host.platform.ShadowRuntimeHealth;
+import com.termux.view.GhosttyViewportRenderProbe;
+import com.termux.view.TerminalRunRasterProbe;
+import com.termux.terminal.TerminalIndustrialInstrumentation;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -49,8 +52,36 @@ public final class ShadowProbeInstrumentation extends Instrumentation {
     public void onStart() {
         Bundle result = new Bundle();
         try {
-            setUpPlatform();
             String action = arguments.getString("action", "baseline");
+            if ("terminal_viewport".equals(action)) {
+                String evidence = GhosttyViewportRenderProbe.run();
+                Log.i("TermuxViewportProbe", evidence);
+                result.putString("stream", evidence + "\n");
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
+            if ("terminal_run_raster".equals(action)) {
+                String evidence = TerminalRunRasterProbe.run();
+                Log.i("TermuxRunRasterProbe", evidence);
+                result.putString("stream", evidence + "\n");
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
+            if ("terminal_industrial".equals(action)) {
+                // This returns before any platform setup. The action is owned entirely by the
+                // real Termux terminal probe and exists here only because this is the declared
+                // repository-wide instrumentation entry point.
+                TerminalIndustrialInstrumentation.RunResult industrial =
+                    TerminalIndustrialInstrumentation.runIndustrial(this, arguments);
+                Log.i("TermuxIndustrialProbe", industrial.summary);
+                result.putString("stream", industrial.summary + "\n");
+                result.putString("report_path", industrial.appReportPath);
+                if (industrial.failureStack != null) result.putString("stack", industrial.failureStack);
+                finish(industrial.success ? Activity.RESULT_OK : Activity.RESULT_CANCELED, result);
+                return;
+            }
+
+            setUpPlatform();
             if ("baseline".equals(action)) {
                 baselineLifecycle();
             } else if ("upgrade".equals(action)) {

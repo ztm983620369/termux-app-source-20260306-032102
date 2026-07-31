@@ -16,6 +16,16 @@ public class ScreenBufferTest extends TerminalTestCase {
 		screen.blockSet(0, 0, 2, 2, 'X', 0);
 	}
 
+	public void testFindLastNonBlankScreenRowIgnoresEmptyPadding() {
+		TerminalBuffer screen = new TerminalBuffer(5, 6, 6);
+		screen.setChar(0, 1, '>', TextStyle.NORMAL);
+		screen.setChar(0, 4, 'S', TextStyle.NORMAL);
+
+		assertEquals(4, screen.findLastNonBlankScreenRow(1));
+		assertEquals(4, screen.findLastNonBlankScreenRow(3));
+		assertEquals(-1, screen.findLastNonBlankScreenRow(5));
+	}
+
 	public void testBlockSet() {
 		TerminalBuffer screen = new TerminalBuffer(5, 3, 3);
 		screen.blockSet(0, 0, 2, 2, 'X', 0);

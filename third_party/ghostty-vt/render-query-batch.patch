@@ -1,0 +1,12 @@
+diff --git a/terminal-emulator/src/main/jni/ghostty_terminal_backend.c b/terminal-emulator/src/main/jni/ghostty_terminal_backend.c
+--- a/terminal-emulator/src/main/jni/ghostty_terminal_backend.c
++++ b/terminal-emulator/src/main/jni/ghostty_terminal_backend.c
+@@ -27,7 +27,7 @@
+ #define TERMUX_GHOSTTY_STATE_COUNT 22
+ #define TERMUX_GHOSTTY_CELL_RECORD_BYTES 24
+ #define TERMUX_GHOSTTY_RENDER_DELTA_ABI 2
+-#define TERMUX_GHOSTTY_RENDER_BATCH_API 0
++#define TERMUX_GHOSTTY_RENDER_BATCH_API 1
+ #define TERMUX_GHOSTTY_MAX_GRAPHEME_CODEPOINTS (1024U * 1024U)
+ #define TERMUX_GHOSTTY_MAX_HOST_CONTROL_BYTES 8192U
+ #define TERMUX_GHOSTTY_MAX_HYPERLINK_BYTES 8192U

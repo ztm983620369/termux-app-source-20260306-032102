@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tmux_action_display_panes_label">Pane IDs</string>
+    <string name="tmux_action_split_vertical_label">Split L/R</string>
+    <string name="tmux_action_split_horizontal_label">Split T/B</string>
+    <string name="tmux_action_last_pane_label">Last pane</string>
+    <string name="tmux_action_next_pane_label">Next pane</string>
+    <string name="tmux_action_zoom_pane_label">Zoom pane</string>
+    <string name="tmux_action_copy_label">Copy mode</string>
+    <string name="tmux_action_kill_pane_label">Close pane</string>
+    <string name="tmux_action_resize_left_label">Resize L</string>
+    <string name="tmux_action_resize_right_label">Resize R</string>
+    <string name="tmux_action_resize_up_label">Resize U</string>
+    <string name="tmux_action_resize_down_label">Resize D</string>
+    <string name="tmux_action_previous_window_label">Prev window</string>
+    <string name="tmux_action_next_window_label">Next window</string>
+    <string name="tmux_action_new_window_label">New window</string>
+    <string name="tmux_action_detach_label">Disconnect</string>
+
+    <string name="tmux_action_display_panes_description">Temporarily show tmux pane numbers</string>
+    <string name="tmux_action_split_vertical_description">Split pane left and right</string>
+    <string name="tmux_action_split_horizontal_description">Split pane top and bottom</string>
+    <string name="tmux_action_last_pane_description">Return to the previously active pane</string>
+    <string name="tmux_action_next_pane_description">Focus next pane</string>
+    <string name="tmux_action_zoom_pane_description">Toggle pane zoom</string>
+    <string name="tmux_action_copy_description">Enter tmux copy mode</string>
+    <string name="tmux_action_kill_pane_description">Close current pane</string>
+    <string name="tmux_action_resize_left_description">Resize pane left</string>
+    <string name="tmux_action_resize_right_description">Resize pane right</string>
+    <string name="tmux_action_resize_up_description">Resize pane up</string>
+    <string name="tmux_action_resize_down_description">Resize pane down</string>
+    <string name="tmux_action_previous_window_description">Select previous tmux window</string>
+    <string name="tmux_action_next_window_description">Select next tmux window</string>
+    <string name="tmux_action_new_window_description">Create tmux window</string>
+    <string name="tmux_action_detach_description">Detach tmux client</string>
+</resources>

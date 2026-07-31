@@ -52,6 +52,7 @@ import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
 import com.tencent.shadow.sample.host.ShadowBuildWorkerContract;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -132,6 +133,21 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         mCodexImageAttachmentController = new CodexImageAttachmentController(this);
         ShadowPluginToolingInstaller.installIfPresent(this);
         mShadowPluginWorkerSupervisor = new ShadowPluginWorkerSupervisor(this);
+
+        // A force-stop/process death cannot run session disposal. Reclaim only exact private
+        // Ghostty compatibility journals, off the service startup path; live journals in this
+        // process are protected by the terminal-emulator registry.
+        final File cacheDirectory = getCacheDir();
+        Thread compatibilityCleanup = new Thread(() -> {
+            TerminalEmulator.CompatibilityJournalCleanupResult result =
+                TerminalEmulator.cleanupStaleCompatibilityJournals(cacheDirectory);
+            if (result.deletedFiles > 0) {
+                Logger.logInfo(LOG_TAG, "Deleted stale terminal compatibility journals: files=" +
+                    result.deletedFiles + ", bytes=" + result.deletedBytes);
+            }
+        }, "TermuxCompatibilityJournalCleanup");
+        compatibilityCleanup.setDaemon(true);
+        compatibilityCleanup.start();
 
         runStartForeground();
 
@@ -307,8 +323,10 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             ExecutionCommand executionCommand = termuxSessions.get(i).getExecutionCommand();
             processResult = mWantsToStop || executionCommand.isPluginExecutionCommandWithPendingResult();
             termuxSessions.get(i).killIfExecuting(this, processResult);
-            if (!processResult)
+            if (!processResult) {
                 mShellManager.mTermuxSessions.remove(termuxSessions.get(i));
+                termuxSessions.get(i).getTerminalSession().dispose();
+            }
         }
 
 
@@ -699,6 +717,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
                 TermuxPluginUtils.processPluginExecutionCommandResult(this, LOG_TAG, executionCommand);
 
             mShellManager.mTermuxSessions.remove(termuxSession);
+            // Removal is the ownership boundary. Running sessions defer native teardown until
+            // SIGKILL has drained the final ordered PTY bytes; completed sessions release now.
+            termuxSession.getTerminalSession().dispose();
 
             // Notify {@link TermuxSessionsListViewController} that sessions list has been updated if
             // activity in is foreground

@@ -18,11 +18,22 @@ public class TermuxTerminalViewClientBase implements TerminalViewClient {
     }
 
     @Override
+    public void onScaleTextSizeChanged(int textSize, boolean finished) {
+    }
+
+    @Override
     public void onSingleTapUp(MotionEvent e) {
     }
 
     @Override
     public void onTextInputTap(MotionEvent e) {
+    }
+
+    @Override
+    public void onTerminalViewTap(com.termux.view.TerminalView terminalView,
+                                  TerminalSession session, MotionEvent e) {
+        onTextInputTap(e);
+        onSingleTapUp(e);
     }
 
     @Override
@@ -48,11 +59,6 @@ public class TermuxTerminalViewClientBase implements TerminalViewClient {
 
     @Override
     public boolean isTerminalViewSelected() {
-        return true;
-    }
-
-    @Override
-    public boolean shouldScrollWithArrowKeysInAlternateBuffer(TerminalSession session) {
         return true;
     }
 

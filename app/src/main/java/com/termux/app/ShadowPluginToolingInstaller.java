@@ -31,6 +31,7 @@ final class ShadowPluginToolingInstaller {
     private static final String DEBUG_FAULT_TRIGGER = "shadow-plugin-tooling-fault.trigger";
     private static final String DEBUG_FAULT_CONSUMED = "shadow-plugin-tooling-fault.consumed";
     private static final String DEBUG_FAULT_REACHED = "shadow-plugin-tooling-fault.reached";
+    private static final String TEMPLATE_GITIGNORE_ASSET = "gitignore.shadow-template";
     private static final int BUFFER_SIZE = 64 * 1024;
     private static final int MAX_FILE_BYTES = 32 * 1024 * 1024;
 
@@ -100,7 +101,9 @@ final class ShadowPluginToolingInstaller {
             deleteTree(stagingRoot);
             ensurePrivateDirectory(stagingRoot);
             File stagedShare = new File(stagingRoot, "termux-shadow-plugin");
-            copyTree(assets, ASSET_ROOT + "/template", new File(stagedShare, "template"));
+            File stagedTemplate = new File(stagedShare, "template");
+            copyTree(assets, ASSET_ROOT + "/template", stagedTemplate);
+            restoreTemplateGitignore(stagedTemplate);
             File stagedBinary = new File(stagingRoot, "shadow-plugin");
             copyAsset(assets, ASSET_ROOT + "/aarch64/shadow-plugin", stagedBinary);
             if (!cliSha.equals(sha256(stagedBinary))
@@ -264,6 +267,21 @@ final class ShadowPluginToolingInstaller {
             }
             copyTree(assets, assetPath + "/" + child, new File(target, child));
         }
+    }
+
+    static void restoreTemplateGitignore(File template) throws IOException {
+        File transported = new File(template, TEMPLATE_GITIGNORE_ASSET);
+        if (!transported.isFile()) {
+            throw new IOException("embedded template .gitignore transport is missing");
+        }
+        File target = new File(template, ".gitignore");
+        if (target.exists() && !target.delete()) {
+            throw new IOException("cannot replace template .gitignore");
+        }
+        if (!transported.renameTo(target)) {
+            throw new IOException("cannot restore template .gitignore");
+        }
+        makePrivateFile(target);
     }
 
     private static void copyAsset(AssetManager assets, String assetPath, File target) throws IOException {

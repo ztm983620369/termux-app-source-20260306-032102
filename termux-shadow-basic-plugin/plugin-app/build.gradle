@@ -5,9 +5,145 @@ plugins {
 def shadowPlugin = rootProject.ext.shadowPluginConfig
 def generatedShadowManifestDir = layout.buildDirectory.dir("generated/source/shadowPluginManifest")
 
+def javaStringLiteral = { String value ->
+    '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+}
+def javaIntLiteral = { String value, String fallback ->
+    String normalized = value?.trim()
+    if (normalized == null || normalized.isEmpty()) {
+        return fallback
+    }
+    if (normalized ==~ /^-?\d+$/ || normalized ==~ /^0[xX][0-9A-Fa-f]+$/) {
+        return normalized
+    }
+    Map<String, String> values = [
+            unspecified: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED",
+            portrait   : "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT",
+            landscape  : "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE",
+            user       : "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER",
+            sensor     : "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR",
+            nosensor   : "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_NOSENSOR",
+            behind     : "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_BEHIND",
+            sensorLandscape: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE",
+            sensorPortrait: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT",
+            reverseLandscape: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE",
+            reversePortrait: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT",
+            fullSensor: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR",
+            userLandscape: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE",
+            userPortrait: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT",
+            fullUser: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER",
+            locked: "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LOCKED",
+            adjustNothing: "android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING",
+            adjustUnspecified: "android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED",
+            adjustResize : "android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE",
+            adjustPan    : "android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN",
+            stateUnspecified: "android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED",
+            stateUnchanged: "android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED",
+            stateHidden: "android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN",
+            stateAlwaysHidden: "android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN",
+            stateVisible: "android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE",
+            stateAlwaysVisible: "android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE"
+    ]
+    return values[normalized] ?: fallback
+}
+def softInputJavaLiteral = { String value ->
+    String normalized = value?.trim()
+    if (normalized == null || normalized.isEmpty()) {
+        return "android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING"
+    }
+    if (normalized ==~ /^\d+$/ || normalized ==~ /^0[xX][0-9A-Fa-f]+$/) {
+        return normalized
+    }
+    return normalized.split("\\|")
+            .collect { javaIntLiteral(it.trim(), null) }
+            .with { values ->
+                if (values.any { it == null }) {
+                    throw new GradleException("Invalid softInputMode: ${value}")
+                }
+                values.join(" | ")
+            }
+}
+def themeJavaLiteral = { String value ->
+    String normalized = value?.trim()
+    if (normalized == null || normalized.isEmpty()) {
+        return "android.R.style.Theme_Material_Light_NoActionBar"
+    }
+    if (normalized.startsWith("android.R.") || normalized ==~ /^-?\d+$/ || normalized ==~ /^0[xX][0-9A-Fa-f]+$/) {
+        return normalized
+    }
+    if (normalized.startsWith("@style/")) {
+        return "${shadowPlugin.namespace}.R.style.${normalized.substring('@style/'.length()).replace('.', '_')}"
+    }
+    return "android.R.style.Theme_Material_Light_NoActionBar"
+}
+def themeManifestValue = { String value ->
+    String normalized = value?.trim()
+    if (normalized == null || normalized.isEmpty()) {
+        return "@style/PluginTheme"
+    }
+    if (normalized.startsWith("@")) {
+        return normalized
+    }
+    if (normalized.startsWith("android.R.style.")) {
+        // PluginTheme is the resource-safe bridge; the generated Java manifest keeps the
+        // exact framework style constant for Shadow's runtime metadata.
+        return "@style/PluginTheme"
+    }
+    return "@style/PluginTheme"
+}
+def xmlAttributeValue = { String value ->
+    value.replace('&', '&amp;')
+            .replace('"', '&quot;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace("'", '&apos;')
+}
+def configChangesJavaLiteral = { String value ->
+    Map<String, String> values = [
+            mcc: "android.content.pm.ActivityInfo.CONFIG_MCC",
+            mnc: "android.content.pm.ActivityInfo.CONFIG_MNC",
+            locale: "android.content.pm.ActivityInfo.CONFIG_LOCALE",
+            touchscreen: "android.content.pm.ActivityInfo.CONFIG_TOUCHSCREEN",
+            keyboard: "android.content.pm.ActivityInfo.CONFIG_KEYBOARD",
+            keyboardHidden: "android.content.pm.ActivityInfo.CONFIG_KEYBOARD_HIDDEN",
+            navigation: "android.content.pm.ActivityInfo.CONFIG_NAVIGATION",
+            orientation: "android.content.pm.ActivityInfo.CONFIG_ORIENTATION",
+            screenSize: "android.content.pm.ActivityInfo.CONFIG_SCREEN_SIZE",
+            screenLayout: "android.content.pm.ActivityInfo.CONFIG_SCREEN_LAYOUT",
+            uiMode: "android.content.pm.ActivityInfo.CONFIG_UI_MODE",
+            fontScale: "android.content.pm.ActivityInfo.CONFIG_FONT_SCALE",
+            smallestScreenSize: "android.content.pm.ActivityInfo.CONFIG_SMALLEST_SCREEN_SIZE",
+            layoutDirection: "android.content.pm.ActivityInfo.CONFIG_LAYOUT_DIRECTION",
+            colorMode: "android.content.pm.ActivityInfo.CONFIG_COLOR_MODE",
+            density: "android.content.pm.ActivityInfo.CONFIG_DENSITY",
+            grammaticalGender: "android.content.pm.ActivityInfo.CONFIG_GRAMMATICAL_GENDER",
+            fontWeightAdjustment: "android.content.pm.ActivityInfo.CONFIG_FONT_WEIGHT_ADJUSTMENT"
+    ]
+    String normalized = value?.trim()
+    if (normalized == null || normalized.isEmpty() || normalized == "none") {
+        return "0"
+    }
+    if (normalized ==~ /^-?\d+$/ || normalized ==~ /^0[xX][0-9A-Fa-f]+$/) {
+        return normalized
+    }
+    List<String> parts = normalized.split("\\|").collect { it.trim() }.findAll { !it.isEmpty() }
+    if (parts.any { !values.containsKey(it) }) {
+        throw new GradleException("Invalid configChanges: ${value}")
+    }
+    return parts.collect { values[it] }.join(" | ")
+}
+
 tasks.register("generateShadowPluginManifest") {
     inputs.file(rootProject.file("shadow-plugin.properties"))
     inputs.property("activityClassName", shadowPlugin.activityClassName)
+    inputs.properties(
+            applicationClassName: shadowPlugin.applicationClassName,
+            applicationTheme: shadowPlugin.applicationTheme,
+            activityTheme: shadowPlugin.activityTheme,
+            screenOrientation: shadowPlugin.screenOrientation,
+            softInputMode: shadowPlugin.softInputMode,
+            configChanges: shadowPlugin.configChanges
+    )
     outputs.dir(generatedShadowManifestDir)
 
     doLast {
@@ -19,17 +155,17 @@ tasks.register("generateShadowPluginManifest") {
 
 public class PluginManifest implements com.tencent.shadow.core.runtime.PluginManifest {
     private static final String applicationPackageName = \"com.termux\";
-    private static final String applicationClassName = null;
+    private static final String applicationClassName = ${shadowPlugin.applicationClassName ? '"' + shadowPlugin.applicationClassName + '"' : 'null'};
     private static final String appComponentFactory = null;
-    private static final int applicationTheme = android.R.style.Theme_Material_Light_NoActionBar;
+    private static final int applicationTheme = ${themeJavaLiteral(shadowPlugin.applicationTheme)};
     private static final com.tencent.shadow.core.runtime.PluginManifest.ActivityInfo[] activities =
             new com.tencent.shadow.core.runtime.PluginManifest.ActivityInfo[]{
                     new com.tencent.shadow.core.runtime.PluginManifest.ActivityInfo(
                             \"${shadowPlugin.activityClassName}\",
-                            android.R.style.Theme_Material_Light_NoActionBar,
-                            0,
-                            0,
-                            -1
+                            ${themeJavaLiteral(shadowPlugin.activityTheme)},
+                            ${configChangesJavaLiteral(shadowPlugin.configChanges)},
+                            ${softInputJavaLiteral(shadowPlugin.softInputMode)},
+                            ${javaIntLiteral(shadowPlugin.screenOrientation, "android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED")}
                     )
             };
     private static final com.tencent.shadow.core.runtime.PluginManifest.ServiceInfo[] services =
@@ -48,6 +184,29 @@ public class PluginManifest implements com.tencent.shadow.core.runtime.PluginMan
     public final com.tencent.shadow.core.runtime.PluginManifest.ReceiverInfo[] getReceivers() { return receivers; }
     public final com.tencent.shadow.core.runtime.PluginManifest.ProviderInfo[] getProviders() { return providers; }
 }
+""", "UTF-8")
+
+        File manifest = generatedShadowManifestDir.get().file("AndroidManifest.xml").asFile
+        String applicationNameAttribute = shadowPlugin.applicationClassName
+                ? "android:name=\"${shadowPlugin.applicationClassName}\""
+                : ""
+        String configChangesAttribute = shadowPlugin.configChanges == "none"
+                ? ""
+                : "android:configChanges=\"${shadowPlugin.configChanges}\""
+        manifest.setText("""<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application ${applicationNameAttribute} android:allowBackup="false"
+        android:label="${xmlAttributeValue(shadowPlugin.displayName)}"
+        android:supportsRtl="true"
+        android:theme="${themeManifestValue(shadowPlugin.applicationTheme)}">
+        <activity android:name="${shadowPlugin.activityClassName}"
+            android:exported="false"
+            android:theme="${themeManifestValue(shadowPlugin.activityTheme)}"
+            android:screenOrientation="${shadowPlugin.screenOrientation}"
+            android:windowSoftInputMode="${shadowPlugin.softInputMode}"
+            ${configChangesAttribute} />
+    </application>
+</manifest>
 """, "UTF-8")
     }
 }
@@ -69,10 +228,16 @@ android {
                 .get()
         manifestPlaceholders = [
                 shadowActivityClassName: shadowPlugin.activityClassName,
-                shadowDisplayName      : shadowPlugin.displayName
+                shadowDisplayName      : shadowPlugin.displayName,
+                shadowApplicationTheme : themeManifestValue(shadowPlugin.applicationTheme),
+                shadowActivityTheme    : themeManifestValue(shadowPlugin.activityTheme),
+                shadowScreenOrientation: shadowPlugin.screenOrientation,
+                shadowSoftInputMode    : shadowPlugin.softInputMode,
+                shadowConfigChanges    : shadowPlugin.configChanges
         ]
         buildConfigField "String", "SHADOW_PLUGIN_ID", "\"${shadowPlugin.pluginId}\""
         buildConfigField "String", "SHADOW_PART_KEY", "\"${shadowPlugin.partKey}\""
+        buildConfigField "String", "SHADOW_DISPLAY_NAME", javaStringLiteral(shadowPlugin.displayName)
     }
 
     compileOptions {
@@ -104,6 +269,7 @@ android {
 
     sourceSets {
         main.java.srcDir(generatedShadowManifestDir)
+        main.manifest.srcFile(generatedShadowManifestDir.map { it.file("AndroidManifest.xml").asFile })
     }
 }
 
@@ -113,4 +279,9 @@ tasks.named("preBuild") {
 
 dependencies {
     compileOnly files('../shadow/compile-only/shadow-runtime.jar')
+}
+
+File projectDependencies = file("dependencies.gradle")
+if (projectDependencies.isFile()) {
+    apply from: projectDependencies
 }

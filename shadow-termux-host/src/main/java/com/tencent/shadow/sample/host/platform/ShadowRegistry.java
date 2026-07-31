@@ -220,6 +220,11 @@ final class ShadowRegistry {
         int lastHealthyProcessPid;
         String lastHealthyProcessName;
         String lastHealthOperationId;
+        boolean smokeRequested;
+        boolean smokePassed;
+        int smokeStepCount;
+        long smokeDurationMs;
+        String smokeError;
 
         VersionRecord(ShadowVerificationResult verification, String sourcePath, String operationId) {
             generation = verification.generation;
@@ -257,6 +262,11 @@ final class ShadowRegistry {
             lastHealthyProcessPid = health.pluginProcessPid;
             lastHealthyProcessName = health.pluginProcessName;
             lastHealthOperationId = operationId;
+            smokeRequested = health.smokeRequested;
+            smokePassed = health.smokePassed;
+            smokeStepCount = health.smokeStepCount;
+            smokeDurationMs = health.smokeDurationMs;
+            smokeError = health.smokeError;
         }
 
         boolean hasRuntimeHealthProof() {
@@ -283,6 +293,11 @@ final class ShadowRegistry {
             lastHealthyProcessPid = 0;
             lastHealthyProcessName = null;
             lastHealthOperationId = null;
+            smokeRequested = false;
+            smokePassed = false;
+            smokeStepCount = 0;
+            smokeDurationMs = 0L;
+            smokeError = null;
         }
 
         JSONObject toJson() throws JSONException {
@@ -314,6 +329,11 @@ final class ShadowRegistry {
             object.put("lastHealthyProcessPid", lastHealthyProcessPid);
             object.put("lastHealthyProcessName", nullable(lastHealthyProcessName));
             object.put("lastHealthOperationId", nullable(lastHealthOperationId));
+            object.put("smokeRequested", smokeRequested);
+            object.put("smokePassed", smokePassed);
+            object.put("smokeStepCount", smokeStepCount);
+            object.put("smokeDurationMs", smokeDurationMs);
+            object.put("smokeError", nullable(smokeError));
             return object;
         }
 
@@ -355,6 +375,11 @@ final class ShadowRegistry {
             record.lastHealthyProcessPid = object.optInt("lastHealthyProcessPid", 0);
             record.lastHealthyProcessName = nullableString(object, "lastHealthyProcessName");
             record.lastHealthOperationId = nullableString(object, "lastHealthOperationId");
+            record.smokeRequested = object.optBoolean("smokeRequested", false);
+            record.smokePassed = object.optBoolean("smokePassed", false);
+            record.smokeStepCount = object.optInt("smokeStepCount", 0);
+            record.smokeDurationMs = object.optLong("smokeDurationMs", 0L);
+            record.smokeError = nullableString(object, "smokeError");
             return record;
         }
 

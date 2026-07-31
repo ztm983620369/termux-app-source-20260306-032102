@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source_file="$root/terminal-emulator/src/main/java/com/termux/terminal/GhosttyTerminalBackend.java"
+patch_file="$root/third_party/ghostty-vt/java-default.patch"
+
+status() {
+    if rg -q 'sProductionEnabled = true;' "$source_file"; then
+        echo "ghostty"
+    elif rg -q 'sProductionEnabled = false;' "$source_file"; then
+        echo "java"
+    else
+        echo "unknown" >&2
+        return 1
+    fi
+}
+
+case "${1:-status}" in
+    status)
+        status
+        ;;
+    java|rollback)
+        if [[ "$(status)" != "java" ]]; then
+            git -C "$root" apply "$patch_file"
+        fi
+        echo "Terminal backend default: java (persistent source rollback)"
+        ;;
+    ghostty|enable)
+        if [[ "$(status)" != "ghostty" ]]; then
+            git -C "$root" apply -R "$patch_file"
+        fi
+        echo "Terminal backend default: ghostty"
+        ;;
+    *)
+        echo "usage: $0 {status|java|rollback|ghostty|enable}" >&2
+        exit 2
+        ;;
+esac

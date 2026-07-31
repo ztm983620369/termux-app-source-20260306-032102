@@ -30,12 +30,17 @@ public final class TerminalConfigCanvasView extends View {
         void onManageTrustProfile(@NonNull String profileId);
         void onEditProfile(@NonNull String profileId);
         void onOpenTmuxProfile(@NonNull String profileId);
+        void onOpenZellijProfile(@NonNull String profileId);
         void onBackFromTmux();
         void onRefreshTmux(@NonNull String profileId);
         void onInstallTmux(@NonNull String profileId);
         void onCreateTmux(@NonNull String profileId);
         void onConnectTmux(@NonNull String profileId, @NonNull String tmuxSession, @NonNull String displayName);
         void onDestroyTmux(@NonNull String profileId, @NonNull String tmuxSession);
+        void onRefreshZellij(@NonNull String profileId);
+        void onCreateZellij(@NonNull String profileId);
+        void onConnectZellij(@NonNull String profileId, @NonNull String session, @NonNull String displayName);
+        void onDestroyZellij(@NonNull String profileId, @NonNull String session);
         void onDeleteProfile(@NonNull String profileId);
         void onCloseConfigTab();
     }
@@ -47,6 +52,7 @@ public final class TerminalConfigCanvasView extends View {
     private static final int ACTION_PROFILE_TMUX = 12;
     private static final int ACTION_PROFILE_DELETE = 13;
     private static final int ACTION_PROFILE_TRUST = 14;
+    private static final int ACTION_PROFILE_ZELLIJ = 15;
     private static final int ACTION_CLOSE = 20;
     private static final int ACTION_TMUX_BACK = 21;
     private static final int ACTION_TMUX_REFRESH = 22;
@@ -54,6 +60,12 @@ public final class TerminalConfigCanvasView extends View {
     private static final int ACTION_TMUX_INSTALL = 24;
     private static final int ACTION_TMUX_CONNECT = 30;
     private static final int ACTION_TMUX_DESTROY = 31;
+    private static final int ACTION_ZELLIJ_REFRESH = 40;
+    private static final int ACTION_ZELLIJ_NEW = 41;
+    private static final int ACTION_ZELLIJ_CONNECT = 42;
+    private static final int ACTION_ZELLIJ_DESTROY = 43;
+    private static final String MULTIPLEXER_TMUX = "tmux";
+    private static final String MULTIPLEXER_ZELLIJ = "zellij";
 
     private static final class HitTarget {
         final RectF rect = new RectF();
@@ -109,6 +121,7 @@ public final class TerminalConfigCanvasView extends View {
     private float downX;
     private float downY;
     private int activeGesture = GESTURE_NONE;
+    @Nullable private String multiplexerKind;
     @Nullable private String tmuxProfileId;
     @Nullable private String tmuxProfileTitle;
     @Nullable private String tmuxTargetLabel;
@@ -187,11 +200,25 @@ public final class TerminalConfigCanvasView extends View {
                              boolean tmuxMissing,
                              @Nullable String errorMessage,
                              @Nullable List<TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem> sessions) {
+        setMultiplexerState(MULTIPLEXER_TMUX, profileId, profileTitle, targetLabel, loading,
+            tmuxMissing, errorMessage, sessions);
+    }
+
+    public void setMultiplexerState(@Nullable String kind,
+                                    @Nullable String profileId,
+                                    @Nullable String profileTitle,
+                                    @Nullable String targetLabel,
+                                    boolean loading,
+                                    boolean multiplexerMissing,
+                                    @Nullable String errorMessage,
+                                    @Nullable List<TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem> sessions) {
+        this.multiplexerKind = profileId == null ? null :
+            (MULTIPLEXER_ZELLIJ.equals(kind) ? MULTIPLEXER_ZELLIJ : MULTIPLEXER_TMUX);
         this.tmuxProfileId = profileId;
         this.tmuxProfileTitle = profileTitle;
         this.tmuxTargetLabel = targetLabel;
         this.tmuxLoading = loading;
-        this.tmuxMissing = tmuxMissing;
+        this.tmuxMissing = multiplexerMissing;
         this.tmuxErrorMessage = errorMessage;
         this.tmuxSessions.clear();
         if (sessions != null) this.tmuxSessions.addAll(sessions);
@@ -312,6 +339,7 @@ public final class TerminalConfigCanvasView extends View {
             float chipLeft = card.left + 16f * density;
             chipLeft = drawActionChip(canvas, chipLeft, chipTopRow1, "连接", ACTION_PROFILE_CONNECT, profile.id, false);
             chipLeft = drawActionChip(canvas, chipLeft, chipTopRow1, "tmux", ACTION_PROFILE_TMUX, profile.id, false);
+            chipLeft = drawActionChip(canvas, chipLeft, chipTopRow1, "Zellij", ACTION_PROFILE_ZELLIJ, profile.id, false);
             drawActionChip(canvas, chipLeft, chipTopRow1, "指纹", ACTION_PROFILE_TRUST, profile.id, false);
 
             chipLeft = card.left + 16f * density;
@@ -326,18 +354,26 @@ public final class TerminalConfigCanvasView extends View {
     private float drawTmuxSection(@NonNull Canvas canvas, int width, float top) {
         float left = contentPaddingPx;
         float right = width - contentPaddingPx;
-        String profileTitle = tmuxProfileTitle == null ? "tmux" : tmuxProfileTitle;
-        drawSingleLine(canvas, "TMUX · " + profileTitle, left, top + 16f * density, titlePaint, right - left);
+        boolean zellij = MULTIPLEXER_ZELLIJ.equals(multiplexerKind);
+        String productName = zellij ? "Zellij" : "tmux";
+        String profileTitle = tmuxProfileTitle == null ? productName : tmuxProfileTitle;
+        drawSingleLine(canvas, (zellij ? "ZELLIJ" : "TMUX") + " · " + profileTitle,
+            left, top + 16f * density, titlePaint, right - left);
         top += 28f * density;
 
         float chipTop = top;
         float chipLeft = left;
         chipLeft = drawActionChip(canvas, chipLeft, chipTop, "返回", ACTION_TMUX_BACK, tmuxProfileId, false);
-        chipLeft = drawActionChip(canvas, chipLeft, chipTop, "刷新", ACTION_TMUX_REFRESH, tmuxProfileId, false);
+        chipLeft = drawActionChip(canvas, chipLeft, chipTop, "刷新",
+            zellij ? ACTION_ZELLIJ_REFRESH : ACTION_TMUX_REFRESH, tmuxProfileId, false);
         if (tmuxMissing) {
-            chipLeft = drawActionChip(canvas, chipLeft, chipTop, "安装 tmux", ACTION_TMUX_INSTALL, tmuxProfileId, false);
+            if (!zellij) {
+                chipLeft = drawActionChip(canvas, chipLeft, chipTop, "安装 tmux",
+                    ACTION_TMUX_INSTALL, tmuxProfileId, false);
+            }
         } else {
-            chipLeft = drawActionChip(canvas, chipLeft, chipTop, "新建会话", ACTION_TMUX_NEW, tmuxProfileId, false);
+            chipLeft = drawActionChip(canvas, chipLeft, chipTop, "新建会话",
+                zellij ? ACTION_ZELLIJ_NEW : ACTION_TMUX_NEW, tmuxProfileId, false);
         }
         top += actionChipHeightPx + 14f * density;
 
@@ -350,7 +386,7 @@ public final class TerminalConfigCanvasView extends View {
         if (tmuxLoading) {
             RectF loadingRect = new RectF(left, top, right, top + 78f * density);
             canvas.drawRoundRect(loadingRect, cardRadiusPx, cardRadiusPx, cardPaint);
-            drawSingleLine(canvas, "正在获取远程 tmux 会话...", loadingRect.left + 16f * density,
+            drawSingleLine(canvas, "正在获取远程 " + productName + " 会话...", loadingRect.left + 16f * density,
                 loadingRect.top + 42f * density, bodyPaint, loadingRect.width() - 32f * density);
             return loadingRect.bottom;
         }
@@ -366,9 +402,12 @@ public final class TerminalConfigCanvasView extends View {
         if (tmuxMissing) {
             RectF missingRect = new RectF(left, top, right, top + 96f * density);
             canvas.drawRoundRect(missingRect, cardRadiusPx, cardRadiusPx, cardPaint);
-            drawSingleLine(canvas, "服务器未安装 tmux。", missingRect.left + 16f * density,
+            drawSingleLine(canvas, "服务器未安装 " + productName + "。", missingRect.left + 16f * density,
                 missingRect.top + 36f * density, bodyPaint, missingRect.width() - 32f * density);
-            drawSingleLine(canvas, "点上方“安装 tmux”后再刷新。", missingRect.left + 16f * density,
+            drawSingleLine(canvas, zellij
+                    ? "请先在服务器安装 Zellij，再点“刷新”。"
+                    : "点上方“安装 tmux”后再刷新。",
+                missingRect.left + 16f * density,
                 missingRect.top + 62f * density, smallPaint, missingRect.width() - 32f * density);
             return missingRect.bottom;
         }
@@ -376,7 +415,7 @@ public final class TerminalConfigCanvasView extends View {
         if (tmuxSessions.isEmpty()) {
             RectF emptyRect = new RectF(left, top, right, top + 86f * density);
             canvas.drawRoundRect(emptyRect, cardRadiusPx, cardRadiusPx, cardPaint);
-            drawSingleLine(canvas, "该服务器暂无 tmux 会话。", emptyRect.left + 16f * density,
+            drawSingleLine(canvas, "该服务器暂无 " + productName + " 会话。", emptyRect.left + 16f * density,
                 emptyRect.top + 36f * density, bodyPaint, emptyRect.width() - 32f * density);
             drawSingleLine(canvas, "可直接点上方“新建会话”。", emptyRect.left + 16f * density,
                 emptyRect.top + 62f * density, smallPaint, emptyRect.width() - 32f * density);
@@ -394,8 +433,10 @@ public final class TerminalConfigCanvasView extends View {
 
             float actionTop = card.bottom - actionChipHeightPx - 14f * density;
             float actionLeft = card.left + 16f * density;
-            actionLeft = drawActionChip(canvas, actionLeft, actionTop, "连接", ACTION_TMUX_CONNECT, item.name, false);
-            drawActionChip(canvas, actionLeft, actionTop, "销毁", ACTION_TMUX_DESTROY, item.name, true);
+            actionLeft = drawActionChip(canvas, actionLeft, actionTop, "连接",
+                zellij ? ACTION_ZELLIJ_CONNECT : ACTION_TMUX_CONNECT, item.name, false);
+            drawActionChip(canvas, actionLeft, actionTop, "销毁",
+                zellij ? ACTION_ZELLIJ_DESTROY : ACTION_TMUX_DESTROY, item.name, true);
             top += cardHeight + cardGapPx;
         }
         return top;
@@ -542,6 +583,9 @@ public final class TerminalConfigCanvasView extends View {
                 case ACTION_PROFILE_TMUX:
                     if (target.profileId != null) c.onOpenTmuxProfile(target.profileId);
                     return;
+                case ACTION_PROFILE_ZELLIJ:
+                    if (target.profileId != null) c.onOpenZellijProfile(target.profileId);
+                    return;
                 case ACTION_PROFILE_DELETE:
                     if (target.profileId != null) c.onDeleteProfile(target.profileId);
                     return;
@@ -575,6 +619,29 @@ public final class TerminalConfigCanvasView extends View {
                 case ACTION_TMUX_DESTROY:
                     if (tmuxProfileId != null && target.profileId != null) {
                         c.onDestroyTmux(tmuxProfileId, target.profileId);
+                    }
+                    return;
+                case ACTION_ZELLIJ_REFRESH:
+                    if (tmuxProfileId != null) c.onRefreshZellij(tmuxProfileId);
+                    return;
+                case ACTION_ZELLIJ_NEW:
+                    if (tmuxProfileId != null) c.onCreateZellij(tmuxProfileId);
+                    return;
+                case ACTION_ZELLIJ_CONNECT:
+                    if (tmuxProfileId != null && target.profileId != null) {
+                        String displayName = target.profileId;
+                        for (TermuxTerminalSessionActivityClient.ConfigTmuxSessionItem item : tmuxSessions) {
+                            if (item.name.equals(target.profileId)) {
+                                displayName = item.title;
+                                break;
+                            }
+                        }
+                        c.onConnectZellij(tmuxProfileId, target.profileId, displayName);
+                    }
+                    return;
+                case ACTION_ZELLIJ_DESTROY:
+                    if (tmuxProfileId != null && target.profileId != null) {
+                        c.onDestroyZellij(tmuxProfileId, target.profileId);
                     }
                     return;
                 default:

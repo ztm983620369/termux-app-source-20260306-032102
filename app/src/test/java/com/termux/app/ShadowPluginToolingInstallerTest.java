@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public class ShadowPluginToolingInstallerTest {
@@ -50,6 +51,25 @@ public class ShadowPluginToolingInstallerTest {
                 new File(shareRoot, "tooling-manifest.properties"),
                 ShadowPluginToolingInstaller.installedMarker(shareRoot)
         );
+    }
+
+    @Test
+    public void transportedGitignoreIsRestoredBeforeFingerprinting() throws Exception {
+        File template = temporaryFolder.newFolder("gitignore-template");
+        File transported = new File(template, "gitignore.shadow-template");
+        Files.write(transported.toPath(), "build/\n".getBytes(StandardCharsets.UTF_8));
+
+        ShadowPluginToolingInstaller.restoreTemplateGitignore(template);
+
+        assertFalse(transported.exists());
+        assertTrue(new File(template, ".gitignore").isFile());
+    }
+
+    @Test
+    public void missingGitignoreTransportRejectsIncompleteEmbeddedTemplate() throws Exception {
+        File template = temporaryFolder.newFolder("missing-gitignore-template");
+        assertThrows(java.io.IOException.class, () ->
+                ShadowPluginToolingInstaller.restoreTemplateGitignore(template));
     }
 
     @Test

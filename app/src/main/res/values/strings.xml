@@ -69,6 +69,7 @@
     <string name="msg_ssh_persistence_installing_tmux">正在远程安装 tmux...</string>
     <string name="msg_ssh_persistence_install_failed">tmux 安装失败，请检查服务器权限或手动安装。</string>
     <string name="msg_ssh_persistence_tmux_check_failed">tmux 检测失败，请确认 SSH 支持免交互登录后重试。</string>
+    <string name="msg_terminal_tmux_controls_unavailable">当前会话不是可控的 tmux 会话</string>
     <string name="msg_ssh_persistence_only_ssh">仅 SSH 会话支持锁定。</string>
     <string name="msg_ssh_persistence_locked">SSH 持久化已锁定。</string>
     <string name="msg_ssh_persistence_unlocked">SSH 持久化已解锁。</string>
@@ -123,6 +124,18 @@
     <string name="msg_ssh_persistence_tty_current">当前界面</string>
     <string name="msg_ssh_persistence_current_badge">当前</string>
     <string name="msg_ssh_persistence_destroy_confirm">确认销毁 tmux 会话“%1$s”？</string>
+    <string name="title_zellij_new_session">新建 Zellij 会话</string>
+    <string name="msg_zellij_missing">服务器未安装 Zellij，请安装后刷新。</string>
+    <string name="msg_zellij_list_failed">获取 Zellij 会话失败，请检查 SSH 连接后重试。</string>
+    <string name="msg_zellij_runtime_busy">Zellij 后台任务繁忙，请稍后重试。</string>
+    <string name="msg_zellij_connecting">正在连接 Zellij 会话：%1$s</string>
+    <string name="msg_zellij_connect_failed">创建 Zellij 连接失败。</string>
+    <string name="msg_zellij_create_failed">新建 Zellij 会话失败：%1$s</string>
+    <string name="msg_zellij_destroyed">已销毁 Zellij 会话：%1$s</string>
+    <string name="msg_zellij_destroy_failed">销毁 Zellij 会话失败：%1$s</string>
+    <string name="msg_zellij_session_connected">Zellij 会话 · 当前正在使用</string>
+    <string name="msg_zellij_session_background">Zellij 会话 · 已在后台连接，点击可切换</string>
+    <string name="msg_zellij_session_available">Zellij 会话 · 点击即可连接</string>
 
     <string name="title_plus_panel">快捷面板</string>
     <string name="msg_plus_panel_intro">可扩展的连接面板。当前支持 SSH，后续可继续扩展更多能力。</string>
@@ -130,8 +143,6 @@
     <string name="action_plus_panel_local">新建本地终端</string>
     <string name="action_plus_panel_reserved_sftp">SFTP/挂载（预留）</string>
     <string name="action_plus_panel_reserved_forward">端口转发（预留）</string>
-    <string name="msg_bottom_nav_fixed_under_ime">底栏已固定在输入法上方。</string>
-    <string name="msg_bottom_nav_follow_system_ime">底栏改为跟随系统输入法边距。</string>
     <string name="msg_editor_initialization_failed">编辑器初始化失败：%1$s</string>
     <string name="msg_file_manager_initialization_failed">文件管理初始化失败：%1$s</string>
     <string name="msg_ssh_saved_password_requires_username">使用保存密码登录时必须提供用户名（用户字段或 user@host）。</string>

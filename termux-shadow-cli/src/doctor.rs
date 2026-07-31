@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 use crate::build;
 use crate::cli::DoctorArgs;
 use crate::config::{PluginConfig, parse_properties, sibling_configs};
-use crate::context::{AppContext, PROJECT_CONFIG};
+use crate::context::{AppContext, PROJECT_CONFIG, same_logical_path};
 use crate::control;
 use crate::errors;
 use crate::status::read_registry;
@@ -173,7 +173,7 @@ fn failed_checks_error(checks: &[Diagnostic]) -> anyhow::Error {
             .message
             .split_once(" applies ")
             .map(|(path, _)| path.to_owned()),
-        "ANDROID_LIBRARY_PLUGIN_OFFLINE_MAPPING_MISSING" => Some("settings.gradle".to_owned()),
+        "ANDROID_LIBRARY_PLUGIN_MAPPING_MISSING" => Some("settings.gradle".to_owned()),
         "CONFIG_MISSING" => first.message.strip_prefix("missing ").map(str::to_owned),
         _ => None,
     };
@@ -187,6 +187,16 @@ pub fn fast_checks(
     publish: bool,
 ) -> (Option<PluginConfig>, Vec<Diagnostic>) {
     let mut checks = Vec::new();
+    let sync_marker = project.join(crate::sync::SYNC_MARKER);
+    if sync_marker.is_file() {
+        checks.push(fail(
+            "TOOLING_SYNC_INCOMPLETE",
+            format!(
+                "an interrupted tooling sync marker exists at {}; rerun `shadow-plugin sync` before building or publishing",
+                sync_marker.display()
+            ),
+        ));
+    }
     let config_path = project.join(PROJECT_CONFIG);
     if !config_path.is_file() {
         checks.push(fail(
@@ -280,6 +290,7 @@ pub fn fast_checks(
     if let Some(check) = android_library_plugin_check(project, android_library_marker_available) {
         checks.push(check);
     }
+    checks.extend(compile_only_boundary_checks(project));
 
     for (relative, code, label) in [
         (
@@ -320,7 +331,7 @@ pub fn fast_checks(
     }
 
     if !project_only {
-        match context.build_environment() {
+        match context.build_environment_for_project(project) {
             Ok(environment) => {
                 checks.push(ok(
                     "JAVA",
@@ -337,7 +348,7 @@ pub fn fast_checks(
                 if let Some(root) = environment.portable_root {
                     checks.push(ok(
                         "PORTABLE_TOOLCHAIN",
-                        format!("portable offline toolchain: {}", root.display()),
+                        format!("portable base toolchain: {}", root.display()),
                     ));
                 } else {
                     checks.push(warn(
@@ -409,10 +420,8 @@ pub fn fast_checks(
 
         match sibling_configs(&context.termux_home) {
             Ok(siblings) => {
-                let current = fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
                 for (root, sibling) in siblings {
-                    let root = fs::canonicalize(&root).unwrap_or(root);
-                    if root == current {
+                    if same_logical_path(&root, project) {
                         continue;
                     }
                     if sibling.plugin_id == config.plugin_id {
@@ -624,7 +633,7 @@ fn legacy_zip(project: &Path) -> bool {
 
 fn android_library_plugin_check(
     project: &Path,
-    offline_marker_available: bool,
+    plugin_marker_available: bool,
 ) -> Option<Diagnostic> {
     let root_groovy = project.join("build.gradle");
     let root_kotlin = project.join("build.gradle.kts");
@@ -643,7 +652,7 @@ fn android_library_plugin_check(
     .filter_map(|path| fs::read_to_string(path).ok())
     .collect::<Vec<_>>()
     .join("\n");
-    let offline_mapping = settings_text.contains("com.android.library")
+    let plugin_mapping = settings_text.contains("com.android.library")
         && settings_text.contains("com.android.tools.build:gradle")
         && settings_text.contains("useModule");
     let root_declares_library = plugin_version_declared(&root_text, "com.android.library")
@@ -691,7 +700,7 @@ fn android_library_plugin_check(
         return None;
     }
     unresolved_modules.sort();
-    if root_declares_library && (offline_marker_available || offline_mapping) {
+    if root_declares_library && (plugin_marker_available || plugin_mapping) {
         return Some(ok(
             "ANDROID_LIBRARY_PLUGIN_READY",
             format!(
@@ -712,9 +721,9 @@ fn android_library_plugin_check(
         });
     let mapping = "resolutionStrategy { eachPlugin { if (requested.id.id == 'com.android.library' && requested.version != null) useModule(\"com.android.tools.build:gradle:${requested.version}\") } }";
     if !root_declares_library {
-        let offline_fix = if !offline_marker_available && !offline_mapping {
+        let mapping_fix = if !plugin_marker_available && !plugin_mapping {
             format!(
-                " Also add `{mapping}` inside `pluginManagement` in settings.gradle because the portable cache has the AGP module but not the Library plugin marker."
+                " Also add `{mapping}` inside `pluginManagement` in settings.gradle so Gradle can reuse the AGP module when a plugin marker is absent."
             )
         } else {
             String::new()
@@ -722,17 +731,71 @@ fn android_library_plugin_check(
         return Some(fail(
             "ANDROID_LIBRARY_PLUGIN_UNDECLARED",
             format!(
-                "{} applies com.android.library without a central version; add `{declaration}` to the root plugins block and keep module declarations versionless.{offline_fix} Then rerun `shadow-plugin dev`",
+                "{} applies com.android.library without a central version; add `{declaration}` to the root plugins block and keep module declarations versionless.{mapping_fix} Then rerun `shadow-plugin dev`",
                 unresolved_modules.join(", ")
             ),
         ));
     }
     Some(fail(
-        "ANDROID_LIBRARY_PLUGIN_OFFLINE_MAPPING_MISSING",
+        "ANDROID_LIBRARY_PLUGIN_MAPPING_MISSING",
         format!(
-            "settings.gradle does not map com.android.library to the cached AGP module; add `{mapping}` inside `pluginManagement`, then rerun `shadow-plugin dev`"
+            "settings.gradle does not map com.android.library to the AGP module; add `{mapping}` inside `pluginManagement`, then rerun `shadow-plugin dev`"
         ),
     ))
+}
+
+fn compile_only_boundary_checks(project: &Path) -> Vec<Diagnostic> {
+    let mut unsafe_declarations = Vec::new();
+    for entry in WalkDir::new(project)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| include_doctor_entry(project, entry.path()))
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file()
+            || !matches!(
+                entry.path().extension().and_then(|value| value.to_str()),
+                Some("gradle" | "kts")
+            )
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for (line_number, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("compileOnly")
+                && !trimmed.contains("shadow-runtime.jar")
+                && !trimmed.starts_with("//")
+            {
+                unsafe_declarations.push(format!(
+                    "{}:{}: {}",
+                    entry
+                        .path()
+                        .strip_prefix(project)
+                        .unwrap_or(entry.path())
+                        .display(),
+                    line_number + 1,
+                    trimmed
+                ));
+            }
+        }
+    }
+    if unsafe_declarations.is_empty() {
+        vec![ok(
+            "DEPENDENCY_ABI_BOUNDARY",
+            "only the Shadow runtime API is compileOnly; plugin-owned libraries are bundled",
+        )]
+    } else {
+        vec![fail(
+            "UNSAFE_COMPILE_ONLY_DEPENDENCY",
+            format!(
+                "external compileOnly dependencies are not a supported Host ABI; use implementation or an explicitly versioned Shadow ABI: {}",
+                unsafe_declarations.join("; ")
+            ),
+        )]
+    }
 }
 
 fn android_library_marker_available(context: &AppContext, project: &Path) -> bool {
@@ -749,14 +812,16 @@ fn android_library_marker_available(context: &AppContext, project: &Path) -> boo
     else {
         return false;
     };
-    context.build_environment().is_ok_and(|environment| {
-        environment
-            .gradle_home
-            .join(
-                "caches/modules-2/files-2.1/com.android.library/com.android.library.gradle.plugin",
-            )
-            .join(version)
-            .is_dir()
+    context.build_environment_for_project(project).is_ok_and(|environment| {
+        std::iter::once(environment.gradle_home.as_path())
+            .chain(environment.base_gradle_home.as_deref())
+            .any(|home| {
+                home.join(
+                    "caches/modules-2/files-2.1/com.android.library/com.android.library.gradle.plugin",
+                )
+                .join(&version)
+                .is_dir()
+            })
     })
 }
 
@@ -812,7 +877,9 @@ fn fail(code: &'static str, message: impl Into<String>) -> Diagnostic {
 
 #[cfg(test)]
 mod tests {
-    use super::{Level, android_library_plugin_check, failed_checks_error};
+    use super::{
+        Level, android_library_plugin_check, compile_only_boundary_checks, failed_checks_error,
+    };
     use crate::errors::PreflightFailure;
     use std::fs;
 
@@ -858,5 +925,19 @@ mod tests {
         let diagnostic = android_library_plugin_check(root.path(), false).unwrap();
         assert_eq!(diagnostic.level, Level::Ok);
         assert_eq!(diagnostic.code, "ANDROID_LIBRARY_PLUGIN_READY");
+    }
+
+    #[test]
+    fn external_compile_only_dependencies_are_rejected_at_the_host_abi_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("plugin-app")).unwrap();
+        fs::write(
+            root.path().join("plugin-app/dependencies.gradle"),
+            "dependencies {\n    compileOnly 'androidx.appcompat:appcompat:1.7.0'\n}\n",
+        )
+        .unwrap();
+        let checks = compile_only_boundary_checks(root.path());
+        assert_eq!(checks[0].level, Level::Fail);
+        assert_eq!(checks[0].code, "UNSAFE_COMPILE_ONLY_DEPENDENCY");
     }
 }

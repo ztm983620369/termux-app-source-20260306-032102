@@ -35,6 +35,9 @@ final class JNI {
      */
     public static native int waitFor(int processId);
 
+    /** Duplicate a descriptor with close-on-exec ownership for an independent Java stream. */
+    public static native int dup(int fileDescriptor);
+
     /** Close a file descriptor through the close(2) system call. */
     public static native void close(int fileDescriptor);
 

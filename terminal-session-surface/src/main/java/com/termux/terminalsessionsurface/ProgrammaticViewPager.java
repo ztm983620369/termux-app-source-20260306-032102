@@ -3,8 +3,10 @@ package com.termux.terminalsessionsurface;
 import android.content.Context;
 import android.graphics.Rect;
 import android.util.AttributeSet;
+import android.util.Log;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -16,6 +18,8 @@ import androidx.viewpager.widget.ViewPager;
  * the terminal keeps its native gesture handling.
  */
 public class ProgrammaticViewPager extends ViewPager {
+    private static final String LOG_TAG = "TerminalSessionSurface";
+
     public interface SwipeRegionProvider {
         @Nullable View getSwipeRegionView();
     }
@@ -23,6 +27,7 @@ public class ProgrammaticViewPager extends ViewPager {
     public interface SwipeGestureListener {
         void onSwipeTouchDownInRegion();
         void onSwipeGestureCaptured();
+        void onSwipeTargetChanged(int pageDelta);
         void onSwipeGestureFinished();
     }
 
@@ -32,13 +37,19 @@ public class ProgrammaticViewPager extends ViewPager {
     private final TerminalSessionSwipeGestureStateMachine gestureStateMachine =
         new TerminalSessionSwipeGestureStateMachine();
     @NonNull private final Rect swipeRegionBounds = new Rect();
+    private final float touchSlop;
+    private float gestureDownX = Float.NaN;
+    private float gestureDownY = Float.NaN;
+    private int dispatchedPageDelta;
 
     public ProgrammaticViewPager(@NonNull Context context) {
         super(context);
+        touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
     }
 
     public ProgrammaticViewPager(@NonNull Context context, @Nullable AttributeSet attrs) {
         super(context, attrs);
+        touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
     }
 
     public void setSwipeRegionProvider(@Nullable SwipeRegionProvider provider) {
@@ -53,12 +64,14 @@ public class ProgrammaticViewPager extends ViewPager {
     public boolean onInterceptTouchEvent(MotionEvent ev) {
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                dispatchGestureSignals(gestureStateMachine.onDown(ev.getDownTime(), isTouchInSwipeRegion(ev)));
+                dispatchDown(ev);
                 if (!gestureStateMachine.isEligible(ev.getDownTime())) return false;
                 return dispatchIntercept(ev);
             case MotionEvent.ACTION_MOVE:
                 if (!gestureStateMachine.isEligible(ev.getDownTime())) return false;
-                return dispatchIntercept(ev);
+                boolean moveIntercepted = dispatchIntercept(ev);
+                dispatchSwipeTargetIfChanged(ev);
+                return moveIntercepted;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
                 if (!gestureStateMachine.isEligible(ev.getDownTime())) {
@@ -81,7 +94,7 @@ public class ProgrammaticViewPager extends ViewPager {
 
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                dispatchGestureSignals(gestureStateMachine.onDown(ev.getDownTime(), isTouchInSwipeRegion(ev)));
+                dispatchDown(ev);
                 if (!gestureStateMachine.isEligible(ev.getDownTime())) return false;
                 return dispatchTouch(ev);
             case MotionEvent.ACTION_UP:
@@ -94,6 +107,7 @@ public class ProgrammaticViewPager extends ViewPager {
                 boolean handledMove = dispatchTouch(ev);
                 if (handledMove && ev.getActionMasked() == MotionEvent.ACTION_MOVE) {
                     dispatchGestureSignals(gestureStateMachine.onCaptured(ev.getDownTime()));
+                    dispatchSwipeTargetIfChanged(ev);
                 }
                 return handledMove;
         }
@@ -122,17 +136,55 @@ public class ProgrammaticViewPager extends ViewPager {
         }
     }
 
-    private void dispatchGestureSignals(int signals) {
-        if (swipeGestureListener == null || signals == TerminalSessionSwipeGestureStateMachine.SIGNAL_NONE) return;
-        if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_FINISHED) != 0) {
-            swipeGestureListener.onSwipeGestureFinished();
-        }
+    private void dispatchDown(@NonNull MotionEvent event) {
+        boolean touchInSwipeRegion = isTouchInSwipeRegion(event);
+        int signals = gestureStateMachine.onDown(event.getDownTime(), touchInSwipeRegion);
         if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_TOUCH_DOWN) != 0) {
-            swipeGestureListener.onSwipeTouchDownInRegion();
+            gestureDownX = event.getX();
+            gestureDownY = event.getY();
+            dispatchedPageDelta = 0;
         }
-        if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_CAPTURED) != 0) {
-            swipeGestureListener.onSwipeGestureCaptured();
+        dispatchGestureSignals(signals);
+    }
+
+    private void dispatchSwipeTargetIfChanged(@NonNull MotionEvent event) {
+        if (swipeGestureListener == null ||
+            gestureStateMachine.getState() != TerminalSessionSwipeGestureStateMachine.State.CAPTURED ||
+            Float.isNaN(gestureDownX)) return;
+        int pageDelta = TerminalSessionTransitionFrameState.pageDeltaForDrag(
+            gestureDownX, event.getX());
+        if (pageDelta == dispatchedPageDelta) return;
+        dispatchedPageDelta = pageDelta;
+        Log.i(LOG_TAG, "pager-swipe-v1 target=" + pageDelta +
+            " dx=" + Math.round(event.getX() - gestureDownX) +
+            " dy=" + Math.round(event.getY() - gestureDownY) +
+            " slop=" + Math.round(touchSlop));
+        swipeGestureListener.onSwipeTargetChanged(pageDelta);
+    }
+
+    private void dispatchGestureSignals(int signals) {
+        if (signals == TerminalSessionSwipeGestureStateMachine.SIGNAL_NONE) return;
+        SwipeGestureListener listener = swipeGestureListener;
+        if (listener != null) {
+            if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_FINISHED) != 0) {
+                listener.onSwipeGestureFinished();
+            }
+            if (shouldStartPagerOwnedSwipe(signals)) {
+                // Only the pager that actually captures the drag may start keyboard preservation.
+                listener.onSwipeTouchDownInRegion();
+                listener.onSwipeGestureCaptured();
+            }
         }
+        if ((signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_FINISHED) != 0 &&
+            (signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_TOUCH_DOWN) == 0) {
+            gestureDownX = Float.NaN;
+            gestureDownY = Float.NaN;
+            dispatchedPageDelta = 0;
+        }
+    }
+
+    static boolean shouldStartPagerOwnedSwipe(int signals) {
+        return (signals & TerminalSessionSwipeGestureStateMachine.SIGNAL_CAPTURED) != 0;
     }
 
     private boolean isTouchInSwipeRegion(@NonNull MotionEvent event) {

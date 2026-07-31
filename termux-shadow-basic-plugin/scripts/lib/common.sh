@@ -36,12 +36,21 @@ shadow_setup_build_env() {
             && [ -x "$portable_root/project/android-sdk/build-tools/35.0.0/aapt2" ] \
             && [ -d "$portable_root/gradle-home" ]; then
         JAVA_HOME=$portable_root/toolchain/usr/lib/jvm/java-17-openjdk
-        GRADLE_USER_HOME=$portable_root/gradle-home
+        portable_gradle_home=$portable_root/gradle-home
+        GRADLE_USER_HOME=${GRADLE_USER_HOME:-${TERMUX_SHADOW_GRADLE_CACHE:-$TERMUX_HOME/.termux-shadow/gradle-cache}}
         ANDROID_HOME=$portable_root/project/android-sdk
         TMPDIR=$portable_root/runtime/tmp
         PATH="$JAVA_HOME/bin:$ANDROID_HOME/build-tools/35.0.0:$portable_root/toolchain/usr/bin:/system/bin:/system/xbin"
         LD_LIBRARY_PATH="$portable_root/toolchain/usr/lib:$JAVA_HOME/lib:$JAVA_HOME/lib/server"
-        mkdir -p "$TMPDIR"
+        mkdir -p "$TMPDIR" "$GRADLE_USER_HOME/caches" "$GRADLE_USER_HOME/wrapper"
+        if [ ! -d "$GRADLE_USER_HOME/caches/modules-2" ] \
+                && [ -d "$portable_gradle_home/caches/modules-2" ]; then
+            cp -R "$portable_gradle_home/caches/modules-2" "$GRADLE_USER_HOME/caches/"
+        fi
+        if [ ! -d "$GRADLE_USER_HOME/wrapper/dists" ] \
+                && [ -d "$portable_gradle_home/wrapper/dists" ]; then
+            cp -R "$portable_gradle_home/wrapper/dists" "$GRADLE_USER_HOME/wrapper/"
+        fi
         export GRADLE_USER_HOME TMPDIR LD_LIBRARY_PATH
     else
         ANDROID_HOME=${ANDROID_HOME:-$TERMUX_HOME/android-minimal-basic/android-sdk}

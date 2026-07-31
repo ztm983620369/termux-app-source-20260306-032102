@@ -51,4 +51,32 @@ public class ByteQueueTest extends TestCase {
 		assertEquals(0, q.read(new byte[128], false));
 	}
 
+	public void testTryWriteIsAllOrNothing() {
+		ByteQueue q = new ByteQueue(5);
+		assertTrue(q.tryWrite(new byte[]{1, 2, 3}, 0, 3));
+		assertFalse(q.tryWrite(new byte[]{4, 5, 6}, 0, 3));
+
+		byte[] actual = new byte[5];
+		assertEquals(3, q.read(actual, false));
+		assertArrayEquals(new byte[]{1, 2, 3}, new byte[]{actual[0], actual[1], actual[2]});
+	}
+
+	public void testTryWriteSupportsWraparound() {
+		ByteQueue q = new ByteQueue(5);
+		assertTrue(q.tryWrite(new byte[]{1, 2, 3, 4}, 0, 4));
+		byte[] first = new byte[3];
+		assertEquals(3, q.read(first, false));
+		assertTrue(q.tryWrite(new byte[]{5, 6, 7}, 0, 3));
+
+		byte[] actual = new byte[4];
+		assertEquals(4, q.read(actual, false));
+		assertArrayEquals(new byte[]{4, 5, 6, 7}, actual);
+	}
+
+	public void testTryWriteRejectsClosedQueue() {
+		ByteQueue q = new ByteQueue(5);
+		q.close();
+		assertFalse(q.tryWrite(new byte[]{1}, 0, 1));
+	}
+
 }

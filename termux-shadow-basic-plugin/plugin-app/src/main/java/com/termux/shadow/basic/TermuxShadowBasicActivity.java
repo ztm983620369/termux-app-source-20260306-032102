@@ -8,11 +8,7 @@ import android.widget.TextView;
 
 import com.tencent.shadow.core.runtime.ShadowActivity;
 
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.Locale;
-
-public class TermuxShadowBasicActivity extends ShadowActivity {
+public final class TermuxShadowBasicActivity extends ShadowActivity {
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -25,7 +21,8 @@ public class TermuxShadowBasicActivity extends ShadowActivity {
         root.setBackgroundColor(Color.rgb(246, 248, 250));
 
         TextView title = new TextView(this);
-        title.setText("Termux Shadow Plugin");
+        title.setId(R.id.plugin_title);
+        title.setText(BuildConfig.SHADOW_DISPLAY_NAME);
         title.setTextSize(24);
         title.setTextColor(Color.rgb(24, 29, 39));
         title.setGravity(Gravity.CENTER);
@@ -35,12 +32,12 @@ public class TermuxShadowBasicActivity extends ShadowActivity {
         ));
 
         TextView status = new TextView(this);
+        status.setId(R.id.plugin_status);
         status.setText(
-                "运行中\n\n"
-                        + "版本：" + BuildConfig.VERSION_NAME + "\n"
-                        + "pluginId：" + BuildConfig.SHADOW_PLUGIN_ID + "\n"
-                        + "partKey：" + BuildConfig.SHADOW_PART_KEY + "\n"
-                        + "启动时间：" + now()
+                "READY\n\n"
+                        + "pluginId=" + BuildConfig.SHADOW_PLUGIN_ID + "\n"
+                        + "partKey=" + BuildConfig.SHADOW_PART_KEY + "\n"
+                        + "version=" + BuildConfig.VERSION_NAME
         );
         status.setTextSize(15);
         status.setTextColor(Color.rgb(56, 65, 80));
@@ -51,10 +48,6 @@ public class TermuxShadowBasicActivity extends ShadowActivity {
         ));
 
         setContentView(root);
-    }
-
-    private static String now() {
-        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
     }
 
     private int dp(int value) {

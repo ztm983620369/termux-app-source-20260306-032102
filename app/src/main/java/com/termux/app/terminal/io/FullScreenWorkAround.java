@@ -1,68 +1,23 @@
 package com.termux.app.terminal.io;
 
-import android.graphics.Rect;
-import android.view.View;
-import android.view.ViewGroup;
-
 import com.termux.app.TermuxActivity;
+import com.termux.app.terminal.TermuxActivityRootView;
 
 /**
- * Work around for fullscreen mode in Termux to fix ExtraKeysView not being visible.
- * This class is derived from:
- * https://stackoverflow.com/questions/7417123/android-how-to-adjust-layout-in-full-screen-mode-when-softkeyboard-is-visible
- * and has some additional tweaks
- * ---
- * For more information, see https://issuetracker.google.com/issues/36911528
+ * Compatibility entry point for the historical fullscreen IME workaround.
+ *
+ * The old implementation installed an unbounded global-layout listener and rewrote the activity
+ * content height whenever the keyboard moved. For a terminal, that is a process-visible PTY resize
+ * and causes SSH/tmux reflow storms. The root/surface insets transaction now handles fullscreen and
+ * non-fullscreen windows identically without changing measured terminal geometry.
  */
-public class FullScreenWorkAround {
-    private final View mChildOfContent;
-    private int mUsableHeightPrevious;
-    private final ViewGroup.LayoutParams mViewGroupLayoutParams;
-
-    private final int mNavBarHeight;
-
+public final class FullScreenWorkAround {
 
     public static void apply(TermuxActivity activity) {
-        new FullScreenWorkAround(activity);
+        if (activity == null) return;
+        TermuxActivityRootView root = activity.getTermuxActivityRootView();
+        if (root != null) root.dispatchCurrentImeViewportState();
     }
 
-    private FullScreenWorkAround(TermuxActivity activity) {
-        ViewGroup content = activity.findViewById(android.R.id.content);
-        mChildOfContent = content.getChildAt(0);
-        mViewGroupLayoutParams = mChildOfContent.getLayoutParams();
-        mNavBarHeight = activity.getNavBarHeight();
-        mChildOfContent.getViewTreeObserver().addOnGlobalLayoutListener(this::possiblyResizeChildOfContent);
-    }
-
-    private void possiblyResizeChildOfContent() {
-        int usableHeightNow = computeUsableHeight();
-        if (usableHeightNow != mUsableHeightPrevious) {
-            int usableHeightSansKeyboard = mChildOfContent.getRootView().getHeight();
-            int heightDifference = usableHeightSansKeyboard - usableHeightNow;
-            if (heightDifference > (usableHeightSansKeyboard / 4)) {
-                // keyboard probably just became visible
-
-                // ensures that usable layout space does not extend behind the
-                // soft keyboard, causing the extra keys to not be visible
-                mViewGroupLayoutParams.height = (usableHeightSansKeyboard - heightDifference) + getNavBarHeight();
-            } else {
-                // keyboard probably just became hidden
-                mViewGroupLayoutParams.height = usableHeightSansKeyboard;
-            }
-            mChildOfContent.requestLayout();
-            mUsableHeightPrevious = usableHeightNow;
-        }
-    }
-
-    private int getNavBarHeight() {
-        return mNavBarHeight;
-    }
-
-    private int computeUsableHeight() {
-        Rect r = new Rect();
-        mChildOfContent.getWindowVisibleDisplayFrame(r);
-        return (r.bottom - r.top);
-    }
-
+    private FullScreenWorkAround() {}
 }
-

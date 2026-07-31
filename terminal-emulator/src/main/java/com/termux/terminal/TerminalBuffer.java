@@ -186,6 +186,17 @@ public final class TerminalBuffer {
         return mActiveTranscriptRows + mScreenRows;
     }
 
+    /** Returns the last visible screen row containing text, or {@code -1} when none does. */
+    public int findLastNonBlankScreenRow(int firstScreenRow) {
+        if (mScreenRows <= 0) return -1;
+        int first = Math.max(0, Math.min(mScreenRows - 1, firstScreenRow));
+        for (int row = mScreenRows - 1; row >= first; row--) {
+            TerminalRow line = mLines[externalToInternalRow(row)];
+            if (line != null && !line.isBlank()) return row;
+        }
+        return -1;
+    }
+
     public boolean hasDirtyRows() {
         return mDirtyStartRow < mDirtyEndRow;
     }

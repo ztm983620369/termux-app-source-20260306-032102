@@ -1,0 +1,4 @@
+544a8e0cd751912e98e7c50870fb561cf249b5087f1f449c48c611ea30c02f33  ./arm64-v8a/libghostty-vt.so
+7c1d4bce0f8003c00b14be7f6080ff70922ecedf23a8ae1a6625ca1eff3aa7bd  ./armeabi-v7a/libghostty-vt.so
+c0fa3ed0fe01a455f754836f341d1a6e01c64836a222160ae2adbce79588637f  ./x86/libghostty-vt.so
+6dd3ab77dabd74e90e529533fe77b93462c9b777b7b329fbaeaecb807287ce09  ./x86_64/libghostty-vt.so

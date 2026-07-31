@@ -35,6 +35,12 @@ final public class Constant {
     public static final String KEY_STABLE_ELAPSED_MS = "shadowStableElapsedMs";
     public static final String KEY_PLUGIN_PROCESS_PID = "shadowPluginProcessPid";
     public static final String KEY_PLUGIN_PROCESS_NAME = "shadowPluginProcessName";
+    public static final String KEY_SMOKE_SPEC = "shadowSmokeSpec";
+    public static final String KEY_SMOKE_REQUESTED = "shadowSmokeRequested";
+    public static final String KEY_SMOKE_PASSED = "shadowSmokePassed";
+    public static final String KEY_SMOKE_STEP_COUNT = "shadowSmokeStepCount";
+    public static final String KEY_SMOKE_DURATION_MS = "shadowSmokeDurationMs";
+    public static final String KEY_SMOKE_ERROR = "shadowSmokeError";
     public static final String KEY_ACTIVITY_CLASSNAME = "KEY_ACTIVITY_CLASSNAME";
     public static final String KEY_EXTRAS = "KEY_EXTRAS";
     public static final String KEY_PLUGIN_PART_KEY = "KEY_PLUGIN_PART_KEY";

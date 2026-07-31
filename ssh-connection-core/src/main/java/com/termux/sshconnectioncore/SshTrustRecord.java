@@ -11,6 +11,7 @@ public final class SshTrustRecord {
     @NonNull public final String authorityKey;
     @NonNull public final String hostIdentity;
     public final int port;
+    public final boolean usesHostKeyAlias;
     @NonNull public final String algorithm;
     @NonNull public final String fingerprintSha256;
     @NonNull public final SshTrustSource source;
@@ -25,11 +26,25 @@ public final class SshTrustRecord {
                           @NonNull SshTrustSource source,
                           long trustedAtMs,
                           long lastSeenAtMs) {
+        this(authorityKey, hostIdentity, port, false, algorithm, fingerprintSha256,
+            source, trustedAtMs, lastSeenAtMs);
+    }
+
+    public SshTrustRecord(@NonNull String authorityKey,
+                          @NonNull String hostIdentity,
+                          int port,
+                          boolean usesHostKeyAlias,
+                          @NonNull String algorithm,
+                          @NonNull String fingerprintSha256,
+                          @NonNull SshTrustSource source,
+                          long trustedAtMs,
+                          long lastSeenAtMs) {
         this.authorityKey = safe(authorityKey);
         this.hostIdentity = safe(hostIdentity).toLowerCase(Locale.ROOT);
         this.port = normalizePort(port);
+        this.usesHostKeyAlias = usesHostKeyAlias;
         this.algorithm = safe(algorithm);
-        this.fingerprintSha256 = safe(fingerprintSha256).toLowerCase(Locale.ROOT);
+        this.fingerprintSha256 = SshHostKeyFingerprint.normalizeSha256(fingerprintSha256);
         this.source = source == null ? SshTrustSource.LEGACY_AUTO_TRUSTED : source;
         this.trustedAtMs = Math.max(0L, trustedAtMs);
         this.lastSeenAtMs = Math.max(0L, lastSeenAtMs);
@@ -41,6 +56,7 @@ public final class SshTrustRecord {
             authorityKey,
             hostIdentity,
             port,
+            usesHostKeyAlias,
             algorithm,
             fingerprintSha256,
             source,
@@ -59,6 +75,7 @@ public final class SshTrustRecord {
             authorityKey,
             hostIdentity,
             port,
+            usesHostKeyAlias,
             newAlgorithm,
             newFingerprintSha256,
             newSource,
@@ -69,8 +86,14 @@ public final class SshTrustRecord {
 
     public boolean matchesObserved(@Nullable String observedAlgorithm,
                                    @Nullable String observedFingerprintSha256) {
-        return algorithm.equals(safe(observedAlgorithm))
-            && fingerprintSha256.equals(safe(observedFingerprintSha256).toLowerCase(Locale.ROOT));
+        String observedAlgorithmValue = safe(observedAlgorithm);
+        String observedFingerprintValue = SshHostKeyFingerprint.normalizeSha256(observedFingerprintSha256);
+        if (algorithm.isEmpty() || fingerprintSha256.isEmpty()
+            || observedAlgorithmValue.isEmpty() || observedFingerprintValue.isEmpty()) {
+            return false;
+        }
+        return algorithm.equals(observedAlgorithmValue)
+            && fingerprintSha256.equals(observedFingerprintValue);
     }
 
     @Override
@@ -79,6 +102,7 @@ public final class SshTrustRecord {
         if (!(other instanceof SshTrustRecord)) return false;
         SshTrustRecord that = (SshTrustRecord) other;
         return port == that.port
+            && usesHostKeyAlias == that.usesHostKeyAlias
             && trustedAtMs == that.trustedAtMs
             && lastSeenAtMs == that.lastSeenAtMs
             && Objects.equals(authorityKey, that.authorityKey)
@@ -90,7 +114,7 @@ public final class SshTrustRecord {
 
     @Override
     public int hashCode() {
-        return Objects.hash(authorityKey, hostIdentity, port, algorithm, fingerprintSha256,
+        return Objects.hash(authorityKey, hostIdentity, port, usesHostKeyAlias, algorithm, fingerprintSha256,
             source, trustedAtMs, lastSeenAtMs);
     }
 

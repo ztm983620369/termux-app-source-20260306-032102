@@ -1,13 +1,17 @@
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::cache;
 use crate::cli::ContextArgs;
 use crate::config::PluginConfig;
-use crate::context::{AppContext, PROJECT_CONFIG};
+use crate::context::{AppContext, PROJECT_CONFIG, normalize_termux_path_identity};
+use crate::fsutil::write_atomic;
 use crate::history;
 use crate::status::{
     HealthReport, PluginRecord, PublishReceipt, RegistryReport, VersionRecord, find_receipt,
@@ -20,11 +24,14 @@ struct ContextCapsule {
     protocol_version: u32,
     changed: bool,
     registry_revision: u64,
+    next_revision: u64,
+    next_cursor: String,
     cli_version: &'static str,
     worker: WorkerInfo,
     host_status: String,
     project: Option<String>,
     plugin_id: Option<String>,
+    project_fingerprint: Option<String>,
     source_fingerprint: Option<String>,
     active_fingerprint: Option<String>,
     dirty_since_active: Option<bool>,
@@ -58,7 +65,28 @@ struct ArtifactSummary {
     sha256: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextSession {
+    schema_version: u32,
+    project: Option<String>,
+    plugin_id: Option<String>,
+    cursor: String,
+    registry_revision: u64,
+    updated_at_epoch_ms: u64,
+}
+
+const CONTEXT_PROTOCOL_VERSION: u32 = 2;
+const SESSION_SCHEMA_VERSION: u32 = 1;
+
 pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
+    if let Some(cursor) = args.since_cursor.as_deref()
+        && !valid_cursor(cursor)
+    {
+        anyhow::bail!(
+            "INVALID_CONTEXT_CURSOR: --since-cursor must be exactly 64 hexadecimal characters"
+        );
+    }
     let health = read_optional::<HealthReport>(&context.shadow_home.join("reports/health.json"));
     let registry =
         read_optional::<RegistryReport>(&context.shadow_home.join("reports/registry.json"))
@@ -68,7 +96,7 @@ pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
         .and_then(|health| health.registry_revision)
         .unwrap_or(registry.revision);
     if args.since_revision.is_some_and(|known| known >= revision) {
-        let value = unchanged_context(revision);
+        let value = unchanged_context(revision, None, "registryRevision");
         if context.json {
             if context.verbose {
                 println!("{}", serde_json::to_string_pretty(&value)?);
@@ -84,7 +112,8 @@ pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
     let project = context.project_if_present();
     let config = project
         .as_ref()
-        .and_then(|path| PluginConfig::load(&path.join(PROJECT_CONFIG)).ok());
+        .map(|path| PluginConfig::load(&path.join(PROJECT_CONFIG)))
+        .transpose()?;
     let plugin = config.as_ref().and_then(|config| {
         registry
             .plugins
@@ -122,13 +151,21 @@ pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
         None => None,
     };
 
+    let project_fingerprint = project
+        .as_deref()
+        .map(cache::project_content_fingerprint)
+        .transpose()?;
     let mut source_fingerprint = None;
     let mut active_fingerprint = None;
     let mut dirty_since_active = None;
     let mut matching_cached_artifact = None;
-    if let (Some(project), Some(config), Ok(environment)) =
-        (&project, &config, context.build_environment())
-    {
+    if let (Some(project), Some(config), Some(environment)) = (
+        &project,
+        &config,
+        project
+            .as_deref()
+            .and_then(|path| context.build_environment_for_project(path).ok()),
+    ) {
         let source = cache::source_fingerprint(project, &environment)?;
         source_fingerprint = Some(source.clone());
         if let Some(active) = &active {
@@ -170,17 +207,74 @@ pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
     } else {
         "NO_CHANGES"
     };
+    let worker = worker::inspect(context);
+    let last_worker_operation_id = last_operation
+        .as_ref()
+        .map(|operation| operation.operation_id.clone());
+    let last_failure_code = last_operation.and_then(|operation| operation.error_code);
+    let next_cursor = context_cursor(
+        revision,
+        project.as_deref(),
+        config.as_ref().map(|value| value.plugin_id.as_str()),
+        project_fingerprint.as_deref(),
+        source_fingerprint.as_deref(),
+        active.as_ref(),
+        previous.as_ref(),
+        candidate.as_ref(),
+        activating.as_ref(),
+        last_published.as_ref(),
+        last_worker_operation_id.as_deref(),
+        last_failure_code.as_deref(),
+        &worker,
+    )?;
+    let session_path = session_path(context, project.as_deref(), config.as_ref());
+    let previous_cursor = if args.resume {
+        read_session(&session_path).map(|session| session.cursor)
+    } else {
+        args.since_cursor.clone()
+    };
+    let changed = previous_cursor.as_deref() != Some(next_cursor.as_str());
+    if args.resume && changed {
+        write_session(
+            &session_path,
+            ContextSession {
+                schema_version: SESSION_SCHEMA_VERSION,
+                project: project.as_ref().map(|path| path.display().to_string()),
+                plugin_id: config.as_ref().map(|value| value.plugin_id.clone()),
+                cursor: next_cursor.clone(),
+                registry_revision: revision,
+                updated_at_epoch_ms: now_millis(),
+            },
+        )?;
+    }
+    if (args.resume || args.since_cursor.is_some()) && !changed {
+        let value = unchanged_context(revision, Some(&next_cursor), "contextCursor");
+        if context.json {
+            if context.verbose {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", serde_json::to_string(&value)?);
+            }
+        } else {
+            println!("context: unchanged at cursor {next_cursor}");
+            println!("  nextRevision={revision}");
+        }
+        return Ok(());
+    }
     let capsule = ContextCapsule {
-        protocol_version: 1,
+        protocol_version: CONTEXT_PROTOCOL_VERSION,
         changed: true,
         registry_revision: revision,
+        next_revision: revision,
+        next_cursor,
         cli_version: env!("CARGO_PKG_VERSION"),
-        worker: worker::inspect(context),
+        worker,
         host_status: health
             .and_then(|health| health.status)
             .unwrap_or_else(|| "UNAVAILABLE".to_owned()),
         project: project.as_ref().map(|path| path.display().to_string()),
         plugin_id: config.as_ref().map(|config| config.plugin_id.clone()),
+        project_fingerprint,
         source_fingerprint,
         active_fingerprint,
         dirty_since_active,
@@ -191,10 +285,8 @@ pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
         pending_candidate: candidate,
         activating_generation: activating,
         matching_cached_artifact,
-        last_worker_operation_id: last_operation
-            .as_ref()
-            .map(|operation| operation.operation_id.clone()),
-        last_failure_code: last_operation.and_then(|operation| operation.error_code),
+        last_worker_operation_id,
+        last_failure_code,
         recommended_action: recommended_action.to_owned(),
     };
     if context.json {
@@ -209,9 +301,10 @@ pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
         println!("context: {}", capsule.recommended_action);
         println!("  project={}", capsule.project.as_deref().unwrap_or("-"));
         println!(
-            "  pluginId={} revision={}",
+            "  pluginId={} revision={} nextRevision={}",
             capsule.plugin_id.as_deref().unwrap_or("-"),
-            capsule.registry_revision
+            capsule.registry_revision,
+            capsule.next_revision
         );
         println!(
             "  dirtySinceActive={} nextVersionCode={}",
@@ -230,6 +323,7 @@ pub fn run(context: &AppContext, args: ContextArgs) -> Result<()> {
             "  worker={} daemon={}",
             capsule.worker.status, capsule.worker.gradle_daemon
         );
+        println!("  nextCursor={}", capsule.next_cursor);
     }
     Ok(())
 }
@@ -287,12 +381,135 @@ fn remove_nulls(value: &mut serde_json::Value) {
     }
 }
 
-fn unchanged_context(revision: u64) -> serde_json::Value {
-    json!({
-        "protocolVersion": 1,
+fn unchanged_context(
+    revision: u64,
+    next_cursor: Option<&str>,
+    change_basis: &'static str,
+) -> serde_json::Value {
+    let mut value = json!({
+        "protocolVersion": CONTEXT_PROTOCOL_VERSION,
         "changed": false,
         "registryRevision": revision,
-    })
+        "nextRevision": revision,
+        "changeBasis": change_basis,
+    });
+    if let Some(next_cursor) = next_cursor {
+        value["nextCursor"] = json!(next_cursor);
+    }
+    value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn context_cursor(
+    revision: u64,
+    project: Option<&Path>,
+    plugin_id: Option<&str>,
+    project_fingerprint: Option<&str>,
+    source_fingerprint: Option<&str>,
+    active: Option<&GenerationSummary>,
+    previous: Option<&GenerationSummary>,
+    candidate: Option<&GenerationSummary>,
+    activating: Option<&GenerationSummary>,
+    last_published: Option<&PublishReceipt>,
+    last_operation_id: Option<&str>,
+    last_failure_code: Option<&str>,
+    worker: &WorkerInfo,
+) -> Result<String> {
+    let stable = json!({
+        "schemaVersion": 1,
+        "registryRevision": revision,
+        "project": project.map(normalize_termux_path_identity),
+        "pluginId": plugin_id,
+        "projectFingerprint": project_fingerprint,
+        "sourceFingerprint": source_fingerprint,
+        "active": active,
+        "previous": previous,
+        "candidate": candidate,
+        "activating": activating,
+        "lastPublished": last_published,
+        "lastOperationId": last_operation_id,
+        "lastFailureCode": last_failure_code,
+        "worker": {
+            "status": worker.status,
+            "protocolVersion": worker.protocol_version,
+            "cliVersion": worker.cli_version,
+            "gradleDaemon": worker.gradle_daemon,
+            "binarySha256": worker.binary_sha256,
+            "executionMode": worker.execution_mode,
+            "currentOperationId": worker.current_operation_id,
+            "currentAction": worker.current_action,
+        }
+    });
+    let mut digest = Sha256::new();
+    digest.update(b"termux-shadow-context-cursor-v1\0");
+    digest.update(serde_json::to_vec(&stable)?);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn session_path(
+    context: &AppContext,
+    project: Option<&Path>,
+    config: Option<&PluginConfig>,
+) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(b"termux-shadow-context-session-v1\0");
+    match project {
+        Some(path) => digest.update(
+            normalize_termux_path_identity(path)
+                .to_string_lossy()
+                .as_bytes(),
+        ),
+        None => digest.update(b"global"),
+    }
+    digest.update([0]);
+    if let Some(config) = config {
+        digest.update(config.plugin_id.as_bytes());
+    }
+    let key = format!("{:x}", digest.finalize());
+    context
+        .shadow_home
+        .join("sessions/context")
+        .join(format!("{key}.json"))
+}
+
+fn read_session(path: &Path) -> Option<ContextSession> {
+    if fs::metadata(path).ok()?.len() > 16 * 1024 {
+        return None;
+    }
+    let session = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ContextSession>(&bytes).ok())?;
+    (session.schema_version == SESSION_SCHEMA_VERSION && valid_cursor(&session.cursor))
+        .then_some(session)
+}
+
+fn valid_cursor(cursor: &str) -> bool {
+    cursor.len() == 64 && cursor.chars().all(|value| value.is_ascii_hexdigit())
+}
+
+fn write_session(path: &Path, session: ContextSession) -> Result<()> {
+    let directory = path
+        .parent()
+        .context("context session path has no parent")?;
+    fs::create_dir_all(directory)
+        .with_context(|| format!("create context session directory {}", directory.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&session)?;
+    bytes.push(b'\n');
+    write_atomic(path, &bytes)
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn generation(plugin: &PluginRecord, generation: Option<&str>) -> Option<GenerationSummary> {
@@ -355,18 +572,25 @@ mod tests {
             runtime_stable_at: 2,
             last_healthy_process_pid: 42,
             last_healthy_process_name: None,
+            smoke_requested: false,
+            smoke_passed: false,
+            smoke_step_count: 0,
+            smoke_duration_ms: 0,
+            smoke_error: None,
         };
         assert!(summary(&version).runtime_proven);
     }
 
     #[test]
-    fn unchanged_context_contains_only_the_revision_envelope() {
-        let value = unchanged_context(258);
+    fn unchanged_context_contains_the_next_resume_tokens() {
+        let value = unchanged_context(258, Some("cursor-258"), "contextCursor");
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 3);
+        assert_eq!(object.len(), 6);
         assert_eq!(object["changed"], false);
         assert_eq!(object["registryRevision"], 258);
-        assert!(serde_json::to_vec(&value).unwrap().len() < 80);
+        assert_eq!(object["nextRevision"], 258);
+        assert_eq!(object["nextCursor"], "cursor-258");
+        assert!(serde_json::to_vec(&value).unwrap().len() < 180);
     }
 
     #[test]

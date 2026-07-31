@@ -1,0 +1,12 @@
+diff --git a/terminal-emulator/src/main/java/com/termux/terminal/GhosttyTerminalBackend.java b/terminal-emulator/src/main/java/com/termux/terminal/GhosttyTerminalBackend.java
+--- a/terminal-emulator/src/main/java/com/termux/terminal/GhosttyTerminalBackend.java
++++ b/terminal-emulator/src/main/java/com/termux/terminal/GhosttyTerminalBackend.java
+@@ -38,7 +38,7 @@ final class GhosttyTerminalBackend implements AutoCloseable {
+     static final long MODE_SYNC_OUTPUT = 1L << 8;
+     static final long MODE_WRAPAROUND = 1L << 9;
+ 
+-    private static volatile boolean sProductionEnabled = true;
++    private static volatile boolean sProductionEnabled = false;
+     private static volatile boolean sValidationEnabled;
+     private static volatile boolean sLoadAttempted;
+     private static volatile boolean sNativeMethodsAvailable;

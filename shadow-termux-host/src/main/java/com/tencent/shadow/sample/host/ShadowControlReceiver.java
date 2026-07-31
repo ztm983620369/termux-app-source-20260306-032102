@@ -33,6 +33,7 @@ public final class ShadowControlReceiver extends BroadcastReceiver {
     public static final String EXTRA_METHOD = "method";
     public static final String EXTRA_PLUGIN_ID = "pluginId";
     public static final String EXTRA_REQUEST_ID = "requestId";
+    public static final String EXTRA_SMOKE_SPEC = "smokeSpec";
 
     private static final int MAX_CONTROL_REPORTS = 64;
     private static final long LAUNCH_ADMISSION_TIMEOUT_MS = 10_000L;
@@ -50,6 +51,7 @@ public final class ShadowControlReceiver extends BroadcastReceiver {
         final String method = intent.getStringExtra(EXTRA_METHOD);
         final String pluginId = intent.getStringExtra(EXTRA_PLUGIN_ID);
         final String requestId = intent.getStringExtra(EXTRA_REQUEST_ID);
+        final String smokeSpec = intent.getStringExtra(EXTRA_SMOKE_SPEC);
         if (!isSafeRequestId(requestId)) {
             return;
         }
@@ -62,7 +64,7 @@ public final class ShadowControlReceiver extends BroadcastReceiver {
                 String status = "OK";
                 String message;
                 try {
-                    message = execute(context, method, pluginId, requestId);
+                    message = execute(context, method, pluginId, requestId, smokeSpec);
                 } catch (Throwable throwable) {
                     status = "ERROR";
                     message = rootMessage(throwable);
@@ -82,7 +84,8 @@ public final class ShadowControlReceiver extends BroadcastReceiver {
             Context context,
             String method,
             String pluginId,
-            String requestId
+            String requestId,
+            String smokeSpec
     ) throws Exception {
         if (method == null || method.trim().length() == 0) {
             throw new IllegalArgumentException("control method is required");
@@ -105,6 +108,7 @@ public final class ShadowControlReceiver extends BroadcastReceiver {
         pluginId = requirePluginId(method, pluginId);
         if ("run".equals(method) || "rollback".equals(method)) {
             validateLaunchRequest(method, pluginId);
+            validateSmokeSpec(smokeSpec);
             String leaseId = "control-" + requestId;
             PluginHelper.getInstance().acquireLaunch(pluginId, leaseId);
             Intent launch = new Intent(context, PluginLoadActivity.class);
@@ -112,6 +116,10 @@ public final class ShadowControlReceiver extends BroadcastReceiver {
             launch.putExtra(Constant.KEY_PLUGIN_ID, pluginId);
             launch.putExtra(Constant.KEY_ROLLBACK, "rollback".equals(method));
             launch.putExtra(Constant.KEY_LAUNCH_LEASE_ID, leaseId);
+            if (smokeSpec != null) {
+                launch.putExtra(Constant.KEY_SMOKE_SPEC, smokeSpec);
+                launch.putExtra(Constant.KEY_SMOKE_REQUESTED, true);
+            }
             try {
                 sendUserInitiatedLaunch(context, launch, requestId);
                 armLaunchAdmissionWatchdog(pluginId, leaseId);
@@ -136,6 +144,13 @@ public final class ShadowControlReceiver extends BroadcastReceiver {
             return "removed all managed versions for " + pluginId;
         }
         throw new IllegalArgumentException("unknown control method: " + method);
+    }
+
+    private static void validateSmokeSpec(String smokeSpec) throws Exception {
+        if (smokeSpec == null) {
+            return;
+        }
+        ShadowUiSmokeRunner.validateSpecification(smokeSpec);
     }
 
     private static void sendUserInitiatedLaunch(

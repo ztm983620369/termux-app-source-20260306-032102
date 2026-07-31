@@ -1,9 +1,31 @@
 # Native `shadow-plugin` CLI
 
 `shadow-plugin` is the native development and operator entry for the managed Termux + Tencent
-Shadow chain. Version `0.8.0` is designed for short-lived Codex commands: the command process is a
+Shadow chain. Version `0.12.0` is designed for short-lived Codex commands: the command process is a
 small RPC client, while a same-UID Android service supervises a persistent native Worker and its
 Gradle Daemon.
+
+## Build this CLI from source
+
+This repository contains the complete Rust native CLI. The Android Host application and the
+canonical plugin template are separate platform inputs; they are not required to compile the CLI.
+
+```sh
+git clone https://github.com/ztm983620369/termux-shadow-cli.git
+cd termux-shadow-cli
+cargo test --locked
+cargo build --locked --release
+./target/release/shadow-plugin --version
+```
+
+For a Termux/aarch64 binary:
+
+```sh
+./scripts/build-android.sh
+```
+
+The script writes the generated ARM64 binary to `dist/shadow-plugin`; generated `target/` and
+`dist/` contents are intentionally excluded from the source repository.
 
 The recommended loop is one command:
 
@@ -38,6 +60,7 @@ $PREFIX/bin/shadow-plugin
 $PREFIX/share/termux-shadow-plugin/template/
 ~/android-minimal-basic-portable/
 ~/.termux-shadow/
+~/.termux-shadow/gradle-cache/
 ```
 
 The Termux APK now embeds the ARM64 native binary and canonical template. Once the bootstrap exists,
@@ -82,25 +105,98 @@ forbidden.
 ## Commands
 
 ```text
-new                         create a standard isolated project
-dev                         recommended source-to-healthy loop; runtime proof is the default
+new [--dry-run]             atomically create a project and return its coding handoff
+dev [--watch --diff]        recommended source-to-healthy loop; optional continuous controller
+dev --workspace             run every configured project through the serialized Worker
 retry / resume              aliases for dev; continue from the last safe stage
 deploy                      advanced compatible stage/version control
-doctor [--full]             fast config gate; --full may build/validate
+deps resolve|vendor|status  resolve/lock, snapshot, and inspect dependency layers
+deps audit [--workspace]    verify locks and exact cached artifacts without network access
+deps import-gradle-cache    seed the managed cache from an existing Gradle home
+import-android              transactionally migrate an Android application module
+doctor [--full|--workspace] fast config gate; --full may build/validate
 build [--fresh]             validate locally; native cache skips Gradle
 publish / upgrade           native atomic publish and exact registration wait
 run [--force] / rollback    correlated real-health activation
-status [--compact]          active/candidate/activating/previous healthy state
+test-ui                     launch plus declarative first-frame UI smoke validation
+status [--all|--compact]    explicit project/all scope plus lifecycle state
 status --history            explicitly include retained generation history
-context [--since-revision]  compact agent context capsule or revision delta
+context [--resume]          composite-cursor agent context; includes local source changes
 evidence <evidenceId>       summary, diagnostics, tail, or complete redacted evidence
 info                        resolved project plus live Worker/Daemon state
 stop                        stop Worker and only its managed Gradle Daemon
-sync [--dry-run]            update tooling while preserving config and plugin-app/
+sync [--dry-run]            update tooling; preserve identity, business source, and dependencies
 ```
 
-Project resolution is reported by `info`: explicit option/environment, nearest ancestor containing
-`shadow-plugin.properties`, then `~/termux-shadow-basic-plugin`.
+Project resolution is reported by `info`: explicit option/environment or the nearest ancestor
+containing `shadow-plugin.properties`. There is intentionally no writable home-directory fallback;
+commands that need a project fail with `PROJECT_REQUIRED` instead of mutating the wrong workspace.
+`new --dry-run --verbose` is the deterministic, non-interactive review surface: it prints the
+template, target, complete derived identity, artifact names, default version, Host compatibility,
+and publication intent without writing. This keeps scaffolding atomic and automation-safe while
+making every inferred value inspectable.
+After a real creation, `new` returns handoff contract v1: truthful source/registration/runtime
+states, the complete bounded source tree, edit ownership, full
+identity/Activity/dependency/view-ID/theme/smoke sources, and one shell-safe `nextCommand`.
+Generated `.gradle`, `build`, `dist`, and
+`local.properties` data is excluded. `--publish` reports `REGISTERED` only after the exact package
+SHA appears in the Host registry; runtime remains `UNPROVEN` until `dev` or `run` completes the
+first-frame and stability protocol. JSON and agent output remain one document.
+`status` is read-only and deliberately differs: without project context it falls back to all
+registered plugins, labels that fallback in human output, and emits `scope`, `filterActive`,
+`filtered`, `totalPlugins`, `matchedPlugins`, and `fallbackToAll` in JSON. An empty registry is
+reported as `none registered`; a project filter that excludes existing records is reported as
+`none matched` with a `status --all` hint.
+
+## Workspace defaults and batch operations
+
+Place `.shadow-workspace.toml` at the common ancestor of the projects. CLI options and their
+environment variables take precedence, workspace defaults come next, and built-in defaults remain
+last. Project paths must be relative, stay inside the workspace after canonicalization, be unique,
+and already contain `shadow-plugin.properties`; unknown keys and misspellings fail closed.
+
+```toml
+schema-version = 1
+
+[defaults]
+dependency-policy = "cache-first"
+toolchain = "./toolchain"
+template = "./template"
+output = "agent" # human | json | agent
+
+[projects]
+notes = "plugins/notes"
+calculator = "plugins/calculator"
+```
+
+Use `--project @notes` for an unambiguous named project. `doctor --workspace`, `dev --workspace`,
+and `deps audit --workspace` produce one aggregate JSON document when JSON/agent output is selected.
+Pass `--human` to override a workspace `output = "json"` or `output = "agent"` default.
+The batch execution policy is intentionally `SERIALIZED_WORKER`: it preserves dependency-cache,
+version-allocation, publication, and evidence transactions instead of claiming unsafe parallel
+Gradle publication.
+
+`dev --watch` is a foreground human event stream. It performs one initial resumable `dev`, watches
+exactly the project inputs covered by the native source fingerprint, debounces filesystem bursts,
+and continues after a failed compilation so the next edit can recover. `--diff` prints bounded
+added/modified/deleted input paths. Each trigger starts a separate CLI request, so the persistent
+Worker remains available to `info`, `stop`, and other sessions. Because the stable `--json` contract
+is exactly one document, `--watch` rejects `--json`/`--agent`; automation should issue ordinary
+idempotent `dev --agent` requests.
+
+`context --resume` persists a private per-project composite cursor below
+`~/.termux-shadow/sessions/context/`, not in the source tree. Protocol v2 returns `nextRevision` and
+`nextCursor`; the cursor covers registry state, project content, toolchain-aware source state,
+publication/history, and stable Worker state. `--since-cursor` is the stateless equivalent.
+`--since-revision` remains a Host-only compatibility check and intentionally does not claim to
+detect local edits.
+
+`sync` upgrades schema-1 properties in place, replaces only the managed module build script, saves
+its previous text as `plugin-app/build.gradle.pre-shadow-sync`, and preserves detected dependency
+declarations in `plugin-app/dependencies.gradle`. Java/Kotlin/resources below `plugin-app/src/` are
+never overwritten, and the project `.gitignore` remains project-owned. An interrupted write leaves
+`.shadow-tooling-sync-incomplete.json`; doctor blocks builds until an idempotent `shadow-plugin sync`
+finishes the transaction.
 
 `dev` includes that resolution, current healthy version, `nextVersionCode`, stage result, runtime
 health, next action, and `evidenceId` in its normal result. Use `--no-run` only for an intentional
@@ -108,6 +204,27 @@ build/register-only operation. Fast doctor is always part of `dev`; the Gradle-b
 remains explicit as `doctor --full`.
 
 ## Build, cache, and publication
+
+Dependency resolution is independent from local publication. The default `cache-first` mode uses
+the selected cache and does not contact repositories unless `--allow-network` is explicit. Use
+`--online` for normal repository resolution and `--offline` for a hard cache-only gate. The managed
+layers are the portable base cache, writable `~/.termux-shadow/gradle-cache`, then an optional
+project `vendor/gradle-home`. Useful commands are:
+
+```sh
+shadow-plugin deps status
+shadow-plugin deps import-gradle-cache --from ~/.gradle
+shadow-plugin deps resolve --allow-network --lock
+shadow-plugin deps vendor
+shadow-plugin dev --offline
+```
+
+`shadow-dependencies.lock.json`, Gradle lockfiles, and the project-owned
+`plugin-app/dependencies.gradle` declarations are fingerprinted inputs. Development may
+resolve and update them with explicit network approval; `publish`, `upgrade`, and the publish stage
+of `dev` require a valid lock, re-resolve and SHA-256-compare the complete artifact set, and execute
+the package build offline. Thus repository availability or changed cache content cannot silently
+alter a release while ordinary development is no longer trapped in an isolated portable cache.
 
 The input fingerprint is module-name independent. It covers every Gradle module's conventional
 `src` and `libs` trees (including nested modules), build scripts/build logic, resources/manifest,
@@ -124,8 +241,10 @@ project is a valid empty runtime-artifact state and can use `deploy` immediately
 Fast doctor also checks multi-module Android Library declarations before Gradle starts. A module that
 uses `com.android.library` without a centrally versioned root declaration receives
 `ANDROID_LIBRARY_PLUGIN_UNDECLARED` and the exact root-plugin fix. Gradle resolution distinguishes an
-undeclared plugin from `ANDROID_LIBRARY_PLUGIN_NOT_IN_OFFLINE_CACHE` instead of reporting a generic
-dependency failure. Invalid slugs, including digit-first names, fail before template access and
+undeclared plugin from `ANDROID_LIBRARY_PLUGIN_NOT_IN_CACHE` or
+`ANDROID_LIBRARY_PLUGIN_RESOLUTION_FAILED` instead of reporting a generic dependency failure.
+Dependency errors point directly to `deps status`, online lock resolution, cache import, and vendor
+snapshot commands. Invalid slugs, including digit-first names, fail before template access and
 return a valid suggested `shadow-plugin new ...` command.
 
 Rust is the sole inbox publisher. A cold publish asks Gradle only for
@@ -194,6 +313,29 @@ a first frame, and its process survives the stability window. Only then does the
 promote the generation to active. Crash, process death, or timeout invalidates stale health proof,
 increments failure accounting, and cannot replace the prior healthy active. Registry schema 3 safely
 migrates the former schema 2 in-progress pointer representation.
+
+`shadow-plugin test-ui [pluginId]` (or `run --smoke`) reads a bounded schema-1
+`shadow-smoke.json`. After the first frame, the plugin process executes only declarative actions
+(`assertDisplayed`, `assertText`, `click`, `focus`, `input`, `scroll`, `assertImeActive`, and bounded
+`wait`). The schema is closed, every interactive action requires a view, and cumulative declared
+wait time is capped at 10 seconds. A failed step is a runtime-health failure and follows the same
+proof-only rollback path; successful proof records the step count and duration in launch and
+registry reports.
+
+`import-android SOURCE --slug NAME` creates an isolated scaffold in a hidden staging directory,
+copies Java sources, resources, and dependencies, rewrites the namespace and launcher to
+`ShadowActivity`, and commits the target only after migration succeeds. It writes
+`shadow-import-report.json` for AppCompat, Application, Service, Provider, Receiver, and dependency
+compatibility decisions; `--dry-run` performs analysis without writing. Kotlin is detected during
+analysis and reported as a blocking compatibility item instead of producing a project that fails
+later during compilation. Project/file dependencies, interpolated or otherwise dynamic coordinates,
+non-`implementation` configurations, annotation-processor declarations, and variant-specific
+dependency declarations are also blocking: the report identifies the source line and no target is
+written until the dependency graph can be migrated losslessly. Auto-derived namespaces escape Java
+reserved words, and transplanted Activity callbacks are widened only where the Shadow public ABI
+requires it. Custom Application classes, multiple Activity declarations, and Service/Receiver/
+Provider components are blocking compatibility items instead of being silently dropped from the
+generated Shadow manifest.
 
 ## Build locally
 

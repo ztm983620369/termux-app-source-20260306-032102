@@ -144,14 +144,18 @@ public final class SshTrustStateMachine {
     public Snapshot apply(@NonNull Event event) {
         switch (event.type) {
             case BEGIN_EVALUATION:
+                SshTrustRecord usableRecord = isRecordForEndpoint(event.storedRecord, event.endpoint)
+                    && isUsableRecord(event.storedRecord) ? event.storedRecord : null;
                 snapshot = new Snapshot(
-                    event.storedRecord == null ? State.TRUST_ABSENT : State.EVALUATING,
+                    usableRecord == null ? State.TRUST_ABSENT : State.EVALUATING,
                     event.endpoint,
-                    event.storedRecord,
-                    event.storedRecord,
+                    usableRecord,
+                    usableRecord,
                     "",
                     "",
-                    "",
+                    event.storedRecord != null && usableRecord == null
+                        ? "stored trust record does not match endpoint"
+                        : "",
                     SshControlAction.NONE,
                     event.atMs
                 );
@@ -214,6 +218,21 @@ public final class SshTrustStateMachine {
             return snapshot;
         }
 
+        if (!isUsableObservation(event.algorithm, event.fingerprintSha256)) {
+            snapshot = new Snapshot(
+                State.TRUST_ABSENT,
+                snapshot.endpoint,
+                snapshot.storedRecord,
+                null,
+                safe(event.algorithm),
+                safe(event.fingerprintSha256),
+                "invalid host-key observation",
+                SshControlAction.NONE,
+                event.atMs
+            );
+            return snapshot;
+        }
+
         if (snapshot.storedRecord == null) {
             snapshot = new Snapshot(
                 State.TRUST_PENDING_APPROVAL,
@@ -261,6 +280,33 @@ public final class SshTrustStateMachine {
         return snapshot;
     }
 
+    private static boolean isRecordForEndpoint(@Nullable SshTrustRecord record,
+                                               @Nullable ResolvedSshEndpoint endpoint) {
+        if (record == null || endpoint == null) return false;
+        if (record.authorityKey.isEmpty() || endpoint.authorityKey.isEmpty()
+            || record.hostIdentity.isEmpty() || endpoint.hostIdentity.isEmpty()) return false;
+        return record.usesHostKeyAlias == endpoint.usesHostKeyAlias
+            && (record.usesHostKeyAlias || record.port == endpoint.port)
+            && record.authorityKey.equalsIgnoreCase(endpoint.authorityKey)
+            && record.hostIdentity.equalsIgnoreCase(endpoint.hostIdentity);
+    }
+
+    private static boolean isUsableRecord(@Nullable SshTrustRecord record) {
+        return record != null && isUsableObservation(record.algorithm, record.fingerprintSha256);
+    }
+
+    private static boolean isUsableObservation(@Nullable String algorithm,
+                                               @Nullable String fingerprintSha256) {
+        String normalizedAlgorithm = safe(algorithm);
+        String normalizedFingerprint = SshHostKeyFingerprint.normalizeSha256(fingerprintSha256);
+        if (normalizedAlgorithm.isEmpty() || normalizedFingerprint.isEmpty()) return false;
+        for (int i = 0; i < normalizedAlgorithm.length(); i++) {
+            if (Character.isWhitespace(normalizedAlgorithm.charAt(i))
+                || Character.isISOControl(normalizedAlgorithm.charAt(i))) return false;
+        }
+        return true;
+    }
+
     @NonNull
     private Snapshot applyApproval(@NonNull Event event, boolean replace) {
         if (snapshot.endpoint == null) {
@@ -283,6 +329,7 @@ public final class SshTrustStateMachine {
                 snapshot.endpoint.authorityKey,
                 snapshot.endpoint.hostIdentity,
                 snapshot.endpoint.port,
+                snapshot.endpoint.usesHostKeyAlias,
                 snapshot.observedAlgorithm,
                 snapshot.observedFingerprintSha256,
                 event.trustSource == null ? SshTrustSource.USER_APPROVED : event.trustSource,

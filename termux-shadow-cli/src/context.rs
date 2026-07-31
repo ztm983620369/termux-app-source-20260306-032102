@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::cli::DependencyPolicy;
 use crate::config::PluginConfig;
+use crate::workspace::Workspace;
 
 pub const PROJECT_CONFIG: &str = "shadow-plugin.properties";
 pub const DEFAULT_CONTROL_COMPONENT: &str =
@@ -20,9 +22,24 @@ pub struct AppContext {
     toolchain_override: Option<PathBuf>,
     pub json: bool,
     pub verbose: bool,
+    pub dependency_policy: DependencyPolicy,
+    pub allow_network: bool,
     pub termux_home: PathBuf,
     pub prefix: PathBuf,
     pub shadow_home: PathBuf,
+    pub workspace: Option<Workspace>,
+}
+
+#[derive(Debug)]
+pub struct AppContextOptions {
+    pub project_override: Option<PathBuf>,
+    pub template_override: Option<PathBuf>,
+    pub toolchain_override: Option<PathBuf>,
+    pub json: bool,
+    pub verbose: bool,
+    pub dependency_policy: DependencyPolicy,
+    pub allow_network: bool,
+    pub workspace: Option<Workspace>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +52,10 @@ pub struct ResolvedProject {
 pub struct BuildEnvironment {
     pub portable_root: Option<PathBuf>,
     pub java_home: PathBuf,
+    /// Writable Gradle user home selected for this invocation.
     pub gradle_home: PathBuf,
+    /// Read-only seed cache shipped by the portable toolchain, when available.
+    pub base_gradle_home: Option<PathBuf>,
     pub android_home: PathBuf,
     pub aapt2: PathBuf,
     pub gradle_distribution: Option<PathBuf>,
@@ -64,17 +84,17 @@ struct Info<'a> {
     control_component: String,
     termux_pipeline: &'static str,
     gradle_worker_policy: &'static str,
+    dependency_policy: &'static str,
+    allow_network: bool,
+    shared_gradle_cache: String,
+    workspace_config: Option<String>,
+    workspace_root: Option<String>,
+    workspace_projects: usize,
     worker: crate::worker::WorkerInfo,
 }
 
 impl AppContext {
-    pub fn new(
-        project_override: Option<PathBuf>,
-        template_override: Option<PathBuf>,
-        toolchain_override: Option<PathBuf>,
-        json: bool,
-        verbose: bool,
-    ) -> Result<Self> {
+    pub fn new(options: AppContextOptions) -> Result<Self> {
         let termux_home = resolve_termux_home();
         let prefix = env::var_os("PREFIX")
             .map(PathBuf::from)
@@ -84,14 +104,17 @@ impl AppContext {
             .map(PathBuf::from)
             .unwrap_or_else(|| termux_home.join(".termux-shadow"));
         Ok(Self {
-            project_override,
-            template_override,
-            toolchain_override,
-            json,
-            verbose,
+            project_override: options.project_override,
+            template_override: options.template_override,
+            toolchain_override: options.toolchain_override,
+            json: options.json,
+            verbose: options.verbose,
+            dependency_policy: options.dependency_policy,
+            allow_network: options.allow_network,
             termux_home,
             prefix,
             shadow_home,
+            workspace: options.workspace,
         })
     }
 
@@ -121,15 +144,8 @@ impl AppContext {
                 });
             }
         }
-        let standard = self.termux_home.join("termux-shadow-basic-plugin");
-        if standard.join(PROJECT_CONFIG).is_file() {
-            return Ok(ResolvedProject {
-                path: canonical(&standard)?,
-                source: "standard ~/termux-shadow-basic-plugin fallback",
-            });
-        }
         bail!(
-            "no Shadow plugin project found; run `shadow-plugin new <slug>` or pass --project PATH"
+            "PROJECT_REQUIRED: no Shadow plugin project was found in the current directory or its ancestors; cd into the intended project, use its ./shadow-plugin shim, or pass --project PATH"
         )
     }
 
@@ -151,8 +167,6 @@ impl AppContext {
                 candidates.push(prefix_bin.join("../share/termux-shadow-plugin/template"));
             }
         }
-        candidates.push(self.termux_home.join("termux-shadow-basic-plugin"));
-
         for candidate in candidates {
             if candidate.join(PROJECT_CONFIG).is_file() {
                 return canonical(&candidate);
@@ -175,17 +189,41 @@ impl AppContext {
         portable_candidates.push(self.termux_home.join("android-minimal-basic-portable"));
 
         for root in portable_candidates {
-            if let Ok(environment) = BuildEnvironment::from_portable(&root) {
+            if let Ok(environment) =
+                BuildEnvironment::from_portable(&root, &self.shadow_home.join("gradle-cache"))
+            {
                 return Ok(environment);
             }
         }
 
-        BuildEnvironment::from_host_environment()
+        BuildEnvironment::from_host_environment(&self.shadow_home.join("gradle-cache"))
+    }
+
+    pub fn build_environment_for_project(&self, project: &Path) -> Result<BuildEnvironment> {
+        let mut environment = self.build_environment()?;
+        let vendor_home = project.join("vendor/gradle-home");
+        if self.dependency_policy != DependencyPolicy::Online
+            && crate::dependency::vendor_is_usable(project)
+        {
+            environment.gradle_home = vendor_home;
+        }
+        Ok(environment)
     }
 
     pub fn with_project(&self, project: PathBuf) -> Self {
         let mut cloned = self.clone();
         cloned.project_override = Some(project);
+        cloned
+    }
+
+    pub fn with_dependency_policy(
+        &self,
+        dependency_policy: DependencyPolicy,
+        allow_network: bool,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.dependency_policy = dependency_policy;
+        cloned.allow_network = allow_network;
         cloned
     }
 
@@ -246,6 +284,25 @@ impl AppContext {
             control_component: self.control_component(),
             termux_pipeline: "local-only; adb is never invoked",
             gradle_worker_policy: "Android-supervised native Worker; 60-minute idle timeout",
+            dependency_policy: self.dependency_policy.as_str(),
+            allow_network: self.allow_network,
+            shared_gradle_cache: build_environment
+                .as_ref()
+                .map(|environment| display(&environment.gradle_home))
+                .unwrap_or_else(|| display(&self.shadow_home.join("gradle-cache"))),
+            workspace_config: self
+                .workspace
+                .as_ref()
+                .map(|workspace| display(workspace.path())),
+            workspace_root: self
+                .workspace
+                .as_ref()
+                .map(|workspace| display(workspace.root())),
+            workspace_projects: self
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.projects().len())
+                .unwrap_or_default(),
             worker: crate::worker::inspect(self),
         };
         if self.json {
@@ -301,6 +358,21 @@ impl AppContext {
         println!("  pipeline: {}", info.termux_pipeline);
         println!("  Gradle worker: {}", info.gradle_worker_policy);
         println!(
+            "  dependency policy: {} (network fallback: {})",
+            info.dependency_policy,
+            if info.allow_network {
+                "allowed"
+            } else {
+                "disabled"
+            }
+        );
+        println!("  shared Gradle cache: {}", info.shared_gradle_cache);
+        println!(
+            "  workspace: {} ({} project(s))",
+            info.workspace_config.as_deref().unwrap_or("not found"),
+            info.workspace_projects
+        );
+        println!(
             "  Worker state: {} pid={} daemon={} requests={}",
             info.worker.status,
             info.worker
@@ -316,14 +388,14 @@ impl AppContext {
 }
 
 impl BuildEnvironment {
-    fn from_portable(root: &Path) -> Result<Self> {
+    fn from_portable(root: &Path, shared_gradle_home: &Path) -> Result<Self> {
         let root = canonical(root)?;
         let java_home = root.join("toolchain/usr/lib/jvm/java-17-openjdk");
-        let gradle_home = root.join("gradle-home");
+        let base_gradle_home = root.join("gradle-home");
         let android_home = root.join("project/android-sdk");
         let aapt2 = android_home.join("build-tools/35.0.0/aapt2");
         require_file(&java_home.join("bin/java"), "portable Java")?;
-        require_dir(&gradle_home, "portable Gradle home")?;
+        require_dir(&base_gradle_home, "portable Gradle home")?;
         require_file(&aapt2, "portable aapt2")?;
         require_file(
             &android_home.join("platforms/android-35/android.jar"),
@@ -344,11 +416,12 @@ impl BuildEnvironment {
             java_home.join("lib"),
             java_home.join("lib/server"),
         ])?);
-        let gradle_distribution = Some(find_gradle_distribution(&gradle_home)?);
+        let gradle_distribution = Some(find_gradle_distribution(&base_gradle_home)?);
         Ok(Self {
             portable_root: Some(root),
             java_home,
-            gradle_home,
+            gradle_home: shared_gradle_home.to_path_buf(),
+            base_gradle_home: Some(base_gradle_home),
             android_home,
             aapt2,
             gradle_distribution,
@@ -358,7 +431,7 @@ impl BuildEnvironment {
         })
     }
 
-    fn from_host_environment() -> Result<Self> {
+    fn from_host_environment(shared_gradle_home: &Path) -> Result<Self> {
         let android_home = env::var_os("ANDROID_HOME")
             .or_else(|| env::var_os("ANDROID_SDK_ROOT"))
             .map(PathBuf::from)
@@ -369,9 +442,13 @@ impl BuildEnvironment {
             .map(PathBuf::from)
             .or_else(detect_java_home)
             .context("JAVA_HOME is unset and Java could not be discovered")?;
-        let gradle_home = env::var_os("GRADLE_USER_HOME")
-            .map(PathBuf::from)
+        let configured_gradle_home = env::var_os("GRADLE_USER_HOME").map(PathBuf::from);
+        let base_gradle_home = configured_gradle_home
+            .clone()
             .unwrap_or_else(|| resolve_termux_home().join(".gradle"));
+        let gradle_home =
+            configured_gradle_home.unwrap_or_else(|| shared_gradle_home.to_path_buf());
+        let base_gradle_home = (base_gradle_home != gradle_home).then_some(base_gradle_home);
         let aapt2 = find_aapt2(&android_home)?;
         let tmp_dir = env::temp_dir();
         let mut paths = vec![java_home.join("bin")];
@@ -382,6 +459,7 @@ impl BuildEnvironment {
             portable_root: None,
             java_home,
             gradle_home,
+            base_gradle_home,
             android_home,
             aapt2,
             gradle_distribution: None,
@@ -400,7 +478,15 @@ impl BuildEnvironment {
             .env("TMPDIR", &self.tmp_dir)
             .env("PATH", &self.path)
             .env("TERMUX_HOME", &context.termux_home)
-            .env("PREFIX", &context.prefix);
+            .env("PREFIX", &context.prefix)
+            .env(
+                "TERMUX_SHADOW_DEPENDENCY_POLICY",
+                context.dependency_policy.as_str(),
+            )
+            .env(
+                "TERMUX_SHADOW_ALLOW_NETWORK",
+                if context.allow_network { "1" } else { "0" },
+            );
         if let Some(value) = &self.ld_library_path {
             command.env("LD_LIBRARY_PATH", value);
         }
@@ -426,9 +512,45 @@ pub fn resolve_termux_home() -> PathBuf {
 }
 
 pub fn is_termux_home(path: &Path) -> bool {
+    let normalized = normalize_termux_path_identity(path);
+    let text = normalized.to_string_lossy();
+    let Some(relative) = text.strip_prefix("/data/user/") else {
+        return false;
+    };
+    let Some((user, suffix)) = relative.split_once('/') else {
+        return false;
+    };
+    !user.is_empty()
+        && user.chars().all(|character| character.is_ascii_digit())
+        && suffix == "com.termux/files/home"
+}
+
+/// Returns a stable logical identity for Android's two aliases of the Termux data tree.
+/// The returned path is for comparisons and fingerprints; callers should keep using the
+/// original/canonical filesystem path for I/O.
+pub fn normalize_termux_path_identity(path: &Path) -> PathBuf {
+    const LEGACY: &str = "/data/data/com.termux/files";
+    const USER_ZERO: &str = "/data/user/0/com.termux/files";
     let text = path.to_string_lossy();
-    text == "/data/data/com.termux/files/home"
-        || (text.starts_with("/data/user/") && text.ends_with("/com.termux/files/home"))
+    if let Some(relative) = text
+        .strip_prefix(LEGACY)
+        .filter(|relative| relative.is_empty() || relative.starts_with('/'))
+    {
+        return PathBuf::from(format!("{USER_ZERO}{relative}"));
+    }
+    if let Some(relative) = text
+        .strip_prefix(USER_ZERO)
+        .filter(|relative| relative.is_empty() || relative.starts_with('/'))
+    {
+        return PathBuf::from(format!("{USER_ZERO}{relative}"));
+    }
+    path.to_path_buf()
+}
+
+pub fn same_logical_path(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    normalize_termux_path_identity(&left) == normalize_termux_path_identity(&right)
 }
 
 fn validate_project(path: &Path) -> Result<PathBuf> {
@@ -523,7 +645,11 @@ fn display(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppContext, is_termux_home};
+    use super::{
+        AppContext, AppContextOptions, is_termux_home, normalize_termux_path_identity,
+        same_logical_path,
+    };
+    use crate::cli::DependencyPolicy;
     use std::fs;
     use std::path::Path;
 
@@ -535,7 +661,24 @@ mod tests {
         assert!(is_termux_home(Path::new(
             "/data/user/0/com.termux/files/home"
         )));
+        assert!(is_termux_home(Path::new(
+            "/data/user/10/com.termux/files/home"
+        )));
         assert!(!is_termux_home(Path::new("/root")));
+    }
+
+    #[test]
+    fn normalizes_android_termux_path_aliases_for_identity() {
+        assert_eq!(
+            normalize_termux_path_identity(Path::new(
+                "/data/data/com.termux/files/home/termux-shadow-notes"
+            )),
+            Path::new("/data/user/0/com.termux/files/home/termux-shadow-notes")
+        );
+        assert!(same_logical_path(
+            Path::new("/data/data/com.termux/files/home/termux-shadow-notes"),
+            Path::new("/data/user/0/com.termux/files/home/termux-shadow-notes")
+        ));
     }
 
     #[test]
@@ -546,7 +689,17 @@ mod tests {
             "schemaVersion=1\n",
         )
         .unwrap();
-        let context = AppContext::new(Some(temp.path().into()), None, None, false, false).unwrap();
+        let context = AppContext::new(AppContextOptions {
+            project_override: Some(temp.path().into()),
+            template_override: None,
+            toolchain_override: None,
+            json: false,
+            verbose: false,
+            dependency_policy: DependencyPolicy::CacheFirst,
+            allow_network: false,
+            workspace: None,
+        })
+        .unwrap();
         let resolved = context.resolve_project().unwrap();
         assert_eq!(resolved.path, temp.path().canonicalize().unwrap());
         assert!(resolved.source.starts_with("explicit override"));

@@ -47,8 +47,13 @@ try {
 } catch (NumberFormatException ignored) {
     throw new GradleException("shadow-plugin.properties schemaVersion must be an integer")
 }
-if (configSchemaVersion != 1) {
-    throw new GradleException("Unsupported shadow-plugin.properties schemaVersion: ${configSchemaVersion}")
+if (!(configSchemaVersion in [1, 2])) {
+    throw new GradleException("Unsupported shadow-plugin.properties schemaVersion: ${configSchemaVersion}; expected 1 or 2")
+}
+
+def optionalShadowProperty = { String key, String fallback ->
+    String value = rawShadowPluginConfig.getProperty(key)?.trim()
+    return (value == null || value.isEmpty()) ? fallback : value
 }
 
 def pluginSlug = requiredShadowProperty("pluginSlug")
@@ -66,6 +71,14 @@ def defaultVersionCode = positiveLongProperty("defaultVersionCode")
 def defaultVersionName = requiredShadowProperty("defaultVersionName")
 def minHostVersionCode = positiveLongProperty("minHostVersionCode")
 def maxHostVersionCode = positiveLongProperty("maxHostVersionCode")
+def applicationClassName = optionalShadowProperty("applicationClassName", "")
+def applicationTheme = optionalShadowProperty(
+        "applicationTheme", "android.R.style.Theme_Material_Light_NoActionBar")
+def activityTheme = optionalShadowProperty(
+        "activityTheme", "android.R.style.Theme_Material_Light_NoActionBar")
+def screenOrientation = optionalShadowProperty("screenOrientation", "unspecified")
+def softInputMode = optionalShadowProperty("softInputMode", "adjustNothing")
+def configChanges = optionalShadowProperty("configChanges", "orientation|screenSize|keyboardHidden")
 
 def javaNamePattern = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/
 if (!(pluginSlug ==~ /^[a-z][a-z0-9-]*$/)) {
@@ -107,6 +120,28 @@ if (!(defaultVersionName ==~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/)) {
 if (minHostVersionCode > maxHostVersionCode) {
     throw new GradleException("minHostVersionCode cannot exceed maxHostVersionCode")
 }
+if (applicationClassName && !(applicationClassName ==~ javaNamePattern)) {
+    throw new GradleException("Invalid applicationClassName: ${applicationClassName}")
+}
+if (!(screenOrientation in ["unspecified", "portrait", "landscape", "user", "behind", "sensor", "nosensor", "sensorLandscape", "sensorPortrait", "reverseLandscape", "reversePortrait", "fullSensor", "userLandscape", "userPortrait", "fullUser", "locked"])
+        && !(screenOrientation ==~ /^-?\d+$/)) {
+    throw new GradleException("Invalid screenOrientation: ${screenOrientation}")
+}
+if (!softInputMode.split(/\|/).every { value -> value.trim() in ["adjustUnspecified", "adjustNothing", "adjustResize", "adjustPan", "stateUnspecified", "stateUnchanged", "stateHidden", "stateAlwaysHidden", "stateVisible", "stateAlwaysVisible"] }
+        && !(softInputMode ==~ /^0[xX][0-9A-Fa-f]+$/)
+        && !(softInputMode ==~ /^\d+$/)) {
+    throw new GradleException("Invalid softInputMode: ${softInputMode}")
+}
+if (!(softInputMode ==~ /^0[xX][0-9A-Fa-f]+$/)
+        && !(softInputMode ==~ /^\d+$/)) {
+    List<String> softInputParts = softInputMode.split(/\|/).collect { it.trim() }
+    int stateFlags = softInputParts.count { it.startsWith("state") }
+    int adjustFlags = softInputParts.count { it.startsWith("adjust") }
+    if (stateFlags > 1 || adjustFlags > 1) {
+        throw new GradleException(
+                "softInputMode may contain at most one state flag and one adjust flag: ${softInputMode}")
+    }
+}
 
 ext.shadowPluginConfig = Collections.unmodifiableMap([
         schemaVersion      : configSchemaVersion,
@@ -124,7 +159,13 @@ ext.shadowPluginConfig = Collections.unmodifiableMap([
         defaultVersionCode : defaultVersionCode,
         defaultVersionName : defaultVersionName,
         minHostVersionCode : minHostVersionCode,
-        maxHostVersionCode : maxHostVersionCode
+        maxHostVersionCode : maxHostVersionCode,
+        applicationClassName: applicationClassName,
+        applicationTheme  : applicationTheme,
+        activityTheme     : activityTheme,
+        screenOrientation : screenOrientation,
+        softInputMode     : softInputMode,
+        configChanges     : configChanges
 ])
 
 def pluginVersionCode = providers.gradleProperty("shadowPluginVersionCode")
@@ -167,6 +208,60 @@ def digestHex = { File file, String algorithm ->
 
 def md5Upper = { File file -> digestHex(file, "MD5").toUpperCase(Locale.US) }
 def sha256 = { File file -> digestHex(file, "SHA-256") }
+
+// Gradle's lockfiles are part of the reproducible publish input.  Daily development may
+// resolve online, but the lock is still written explicitly by `shadow-plugin deps resolve --lock`.
+allprojects {
+    dependencyLocking {
+        lockAllConfigurations()
+    }
+}
+
+tasks.register("resolveShadowPluginDependencies") {
+    group = "shadow"
+    description = "Resolve all plugin dependencies and emit a bounded SHA-256 report"
+    doLast {
+        List<Map> artifacts = []
+        allprojects.each { Project candidate ->
+            candidate.configurations.findAll { configuration ->
+                String name = configuration.name
+                String lower = name.toLowerCase(Locale.US)
+                configuration.canBeResolved
+                        && !name.startsWith("_internal")
+                        && !lower.contains("test")
+                        && (name.endsWith("CompileClasspath")
+                        || name.endsWith("RuntimeClasspath")
+                        || name.endsWith("AnnotationProcessor"))
+            }.each { configuration ->
+                configuration.incoming.artifacts.artifacts.each { resolved ->
+                    File artifact = resolved.file
+                    if (artifact.isFile()) {
+                        artifacts << [
+                                component: resolved.id.componentIdentifier.displayName,
+                                fileName : artifact.name,
+                                sha256   : sha256(artifact)
+                        ]
+                    }
+                }
+            }
+        }
+        artifacts = artifacts.unique { value ->
+            "${value.component}|${value.fileName}|${value.sha256}"
+        }.sort { left, right ->
+            "${left.component}|${left.fileName}" <=> "${right.component}|${right.fileName}"
+        }
+        File report = file("build/reports/shadow-dependencies.json")
+        report.parentFile.mkdirs()
+        report.setText(
+                JsonOutput.prettyPrint(JsonOutput.toJson([
+                        schemaVersion: 1,
+                        generatedAt : System.currentTimeMillis(),
+                        artifacts   : artifacts
+                ])) + "\n",
+                "UTF-8"
+        )
+    }
+}
 
 def resolveAapt2 = {
     String override = providers.gradleProperty("android.aapt2FromMavenOverride").getOrNull()

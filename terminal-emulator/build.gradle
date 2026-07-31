@@ -13,7 +13,7 @@ android {
 
         externalNativeBuild {
             ndkBuild {
-                cFlags "-std=c11", "-Wall", "-Wextra", "-Werror", "-Os", "-fno-stack-protector", "-Wl,--gc-sections"
+                cFlags "-std=c11", "-Wall", "-Wextra", "-Werror", "-O3", "-ffunction-sections", "-fdata-sections", "-fno-stack-protector", "-Wl,--gc-sections"
             }
         }
 
@@ -42,6 +42,10 @@ android {
 
     testOptions {
         unitTests.returnDefaultValues = true
+    }
+
+    sourceSets {
+        main.assets.srcDir "${rootDir}/third_party/ghostty-vt/assets"
     }
 }
 

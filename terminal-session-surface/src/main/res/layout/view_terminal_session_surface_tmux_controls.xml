@@ -1,70 +1,184 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@android:color/black"
-    android:orientation="vertical">
+    android:orientation="vertical"
+    android:padding="1dp">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
+        android:baselineAligned="false"
         android:orientation="horizontal">
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/tmux_action_prefix"
-            style="?android:attr/buttonBarButtonStyle"
+            android:id="@+id/tmux_action_display_panes"
+            style="@style/Widget.Termux.TmuxControlButton"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="PREFIX" />
+            android:contentDescription="@string/tmux_action_display_panes_description"
+            android:text="@string/tmux_action_display_panes_label" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/tmux_action_prev"
-            style="?android:attr/buttonBarButtonStyle"
+            android:id="@+id/tmux_action_split_vertical"
+            style="@style/Widget.Termux.TmuxControlButton.Primary"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="PREV" />
+            android:contentDescription="@string/tmux_action_split_vertical_description"
+            android:text="@string/tmux_action_split_vertical_label"
+            app:icon="@drawable/ic_tmux_split_left_right" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/tmux_action_next"
-            style="?android:attr/buttonBarButtonStyle"
+            android:id="@+id/tmux_action_split_horizontal"
+            style="@style/Widget.Termux.TmuxControlButton.Primary"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="NEXT" />
+            android:contentDescription="@string/tmux_action_split_horizontal_description"
+            android:text="@string/tmux_action_split_horizontal_label"
+            app:icon="@drawable/ic_tmux_split_top_bottom" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_last_pane"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_last_pane_description"
+            android:text="@string/tmux_action_last_pane_label" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_next_pane"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_next_pane_description"
+            android:text="@string/tmux_action_next_pane_label"
+            app:icon="@drawable/ic_tmux_arrow_right" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_zoom_pane"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_zoom_pane_description"
+            android:text="@string/tmux_action_zoom_pane_label"
+            app:icon="@drawable/ic_tmux_zoom" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_copy"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_copy_description"
+            android:text="@string/tmux_action_copy_label"
+            app:icon="@drawable/ic_tmux_copy" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_kill_pane"
+            style="@style/Widget.Termux.TmuxControlButton.Danger"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_kill_pane_description"
+            android:text="@string/tmux_action_kill_pane_label"
+            app:icon="@drawable/ic_tmux_close" />
     </LinearLayout>
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
+        android:baselineAligned="false"
         android:orientation="horizontal">
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/tmux_action_new"
-            style="?android:attr/buttonBarButtonStyle"
+            android:id="@+id/tmux_action_resize_left"
+            style="@style/Widget.Termux.TmuxControlButton"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="NEW" />
+            android:contentDescription="@string/tmux_action_resize_left_description"
+            android:text="@string/tmux_action_resize_left_label"
+            app:icon="@drawable/ic_tmux_arrow_left" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/tmux_action_copy"
-            style="?android:attr/buttonBarButtonStyle"
+            android:id="@+id/tmux_action_resize_right"
+            style="@style/Widget.Termux.TmuxControlButton"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="COPY" />
+            android:contentDescription="@string/tmux_action_resize_right_description"
+            android:text="@string/tmux_action_resize_right_label"
+            app:icon="@drawable/ic_tmux_arrow_right" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_resize_up"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_resize_up_description"
+            android:text="@string/tmux_action_resize_up_label"
+            app:icon="@drawable/ic_tmux_arrow_up" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_resize_down"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_resize_down_description"
+            android:text="@string/tmux_action_resize_down_label"
+            app:icon="@drawable/ic_tmux_arrow_down" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_prev"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_previous_window_description"
+            android:text="@string/tmux_action_previous_window_label"
+            app:icon="@drawable/ic_tmux_arrow_left" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_next"
+            style="@style/Widget.Termux.TmuxControlButton"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_next_window_description"
+            android:text="@string/tmux_action_next_window_label"
+            app:icon="@drawable/ic_tmux_arrow_right" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tmux_action_new"
+            style="@style/Widget.Termux.TmuxControlButton.Primary"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:contentDescription="@string/tmux_action_new_window_description"
+            android:text="@string/tmux_action_new_window_label"
+            app:icon="@drawable/ic_tmux_add" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/tmux_action_detach"
-            style="?android:attr/buttonBarButtonStyle"
+            style="@style/Widget.Termux.TmuxControlButton.Warning"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="DETACH" />
+            android:contentDescription="@string/tmux_action_detach_description"
+            android:text="@string/tmux_action_detach_label"
+            app:icon="@drawable/ic_tmux_detach" />
     </LinearLayout>
 
 </LinearLayout>

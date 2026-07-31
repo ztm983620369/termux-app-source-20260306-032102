@@ -138,7 +138,7 @@ public final class TerminalLinkResolver {
             TerminalSelectionContextExtractor.extractSemanticLinkTargets(
                 screen, selX1, selY1, selX2, selY2);
         if (!semanticUrls.isEmpty()) {
-            return new SelectionResult(semanticUrls, false, false, false);
+            return resolveSemanticTargets(semanticUrls);
         }
 
         TerminalSelectionContext styledContext =
@@ -174,6 +174,22 @@ public final class TerminalLinkResolver {
             (columnAdded && column.requiresConfirmation()) ||
             (linearAdded && linear.requiresConfirmation());
         return new SelectionResult(structuredUrls, requiresConfirmation, false, false);
+    }
+
+    /** Validates exact OSC 8 destinations supplied by a terminal backend. */
+    @NonNull
+    public static SelectionResult resolveSemanticTargets(@Nullable Iterable<String> targets) {
+        LinkedHashSet<String> normalized = new LinkedHashSet<>();
+        if (targets != null) {
+            for (String target : targets) {
+                String url = normalizeSemanticUrl(target);
+                if (url != null) normalized.add(url);
+                if (normalized.size() >= MAX_SELECTION_RESULTS) break;
+            }
+        }
+        return normalized.isEmpty()
+            ? SelectionResult.empty()
+            : new SelectionResult(normalized, false, false, false);
     }
 
     /** Includes whether terminal hard-fold ambiguity requires an explicit confirmation dialog. */
@@ -300,7 +316,15 @@ public final class TerminalLinkResolver {
         HashMap<Long, ArrayList<Candidate>> candidatesByStart = new HashMap<>();
         for (Candidate candidate : candidates) {
             long key = ((long) candidate.sourceStart << 1) | (candidate.explicitScheme ? 1L : 0L);
-            candidatesByStart.computeIfAbsent(key, ignored -> new ArrayList<>(2)).add(candidate);
+            // HashMap.computeIfAbsent() is only available from Android API 24, while Termux still
+            // supports API 23. Keep the exact grouping semantics without introducing a runtime
+            // linkage failure on Android 6.
+            ArrayList<Candidate> group = candidatesByStart.get(key);
+            if (group == null) {
+                group = new ArrayList<>(2);
+                candidatesByStart.put(key, group);
+            }
+            group.add(candidate);
         }
 
         HashSet<Candidate> supersededCandidates = new HashSet<>();

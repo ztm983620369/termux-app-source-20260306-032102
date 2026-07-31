@@ -195,16 +195,17 @@ else
     fi
 fi
 
-printf 'New Shadow plugin\n'
-printf '  target: %s\n' "$target"
-printf '  pluginId: %s\n' "$plugin_id"
-printf '  partKey: %s\n' "$part_key"
-printf '  namespace: %s\n' "$namespace"
-printf '  activity: %s\n' "$activity_class"
-printf '  resource ID: %s\n' "$resource_id"
-printf '  publish: %s\n' "$publish"
-
-[ "$dry_run" -eq 0 ] || exit 0
+if [ "$dry_run" -eq 1 ]; then
+    printf 'new: PLANNED (no writes)\n'
+    printf '  target: %s\n' "$target"
+    printf '  pluginId: %s\n' "$plugin_id"
+    printf '  partKey: %s\n' "$part_key"
+    printf '  namespace: %s\n' "$namespace"
+    printf '  activity: %s\n' "$activity_class"
+    printf '  resource ID: %s\n' "$resource_id"
+    printf '  publish: %s\n' "$publish"
+    exit 0
+fi
 
 source_config=$ROOT_DIR/shadow-plugin.properties
 old_namespace=$(shadow_property "$source_config" namespace)
@@ -214,6 +215,12 @@ old_plugin_id=$(shadow_property "$source_config" pluginId)
 old_part_key=$(shadow_property "$source_config" partKey)
 min_host=$(shadow_property "$source_config" minHostVersionCode)
 max_host=$(shadow_property "$source_config" maxHostVersionCode)
+application_class=$(shadow_property "$source_config" applicationClassName)
+application_theme=$(shadow_property "$source_config" applicationTheme)
+activity_theme=$(shadow_property "$source_config" activityTheme)
+screen_orientation=$(shadow_property "$source_config" screenOrientation)
+soft_input_mode=$(shadow_property "$source_config" softInputMode)
+config_changes=$(shadow_property "$source_config" configChanges)
 
 umask 077
 temporary=$target_parent/.${target_name}.new.$$
@@ -236,7 +243,7 @@ mkdir "$temporary"
 
 cat > "$temporary/shadow-plugin.properties" <<EOF
 # UTF-8 Shadow plugin identity. This is the only editable identity/config source.
-schemaVersion=1
+schemaVersion=2
 pluginSlug=$slug
 projectName=$project_name
 pluginId=$plugin_id
@@ -252,6 +259,12 @@ defaultVersionCode=1
 defaultVersionName=1.0.0
 minHostVersionCode=$min_host
 maxHostVersionCode=$max_host
+applicationClassName=$application_class
+applicationTheme=$application_theme
+activityTheme=$activity_theme
+screenOrientation=$screen_orientation
+softInputMode=$soft_input_mode
+configChanges=$config_changes
 EOF
 
 find "$temporary/plugin-app/src" -type f \
@@ -288,10 +301,48 @@ mv "$temporary" "$target"
 created=1
 trap - EXIT HUP INT TERM
 
-printf '\nCreated: %s\n' "$target"
 if [ "$publish" -eq 1 ]; then
-    printf '\nBuilding, publishing, and verifying registration...\n'
-    sh "$target/scripts/build-debug.sh"
+    printf 'new: source=CREATED registration=RUNNING project=%s\n' "$target"
+    sh "$target/shadow-plugin" publish
+    registration=REGISTERED
 else
-    printf 'Next: cd %s && ./shadow-plugin publish\n' "$target"
+    registration=NOT_REQUESTED
 fi
+
+activity_source=plugin-app/src/main/java/$new_namespace_path/$activity_simple.java
+printf 'new: %s\n' "$([ "$registration" = REGISTERED ] && printf REGISTERED || printf CREATED)"
+printf '  project: %s\n' "$target"
+printf '  identity: pluginId=%s partKey=%s activity=%s resource=%s\n' \
+    "$plugin_id" "$part_key" "$activity_class" "$resource_id"
+printf '  source: CREATED\n'
+printf '  registration: %s\n' "$registration"
+printf '  runtime: UNPROVEN\n'
+printf '\nfiles:\n'
+(
+    cd "$target"
+    find . \
+        \( -path './.gradle' -o -path './build' -o -path './dist' \
+            -o -path './plugin-app/build' -o -path './.cxx' \) -prune \
+        -o \( -type f -o -type l \) ! -path './local.properties' -print \
+        | LC_ALL=C sort | sed 's#^\./#  #'
+)
+printf '\nedit:\n'
+printf '  identity: shadow-plugin.properties\n'
+printf '  source: plugin-app/src/**\n'
+printf '  dependencies: plugin-app/dependencies.gradle\n'
+printf '  managed by sync: README.md, build.gradle, settings.gradle, gradle.properties, gradlew, gradlew.bat, shadow-plugin, plugin-app/build.gradle, gradle/**, scripts/**, shadow/**\n'
+for source_spec in \
+    "identity:shadow-plugin.properties" \
+    "activity:$activity_source" \
+    "dependencies:plugin-app/dependencies.gradle" \
+    "viewIds:plugin-app/src/main/res/values/ids.xml" \
+    "theme:plugin-app/src/main/res/values/styles.xml" \
+    "smokeTest:shadow-smoke.json"; do
+    role=${source_spec%%:*}
+    relative=${source_spec#*:}
+    printf '\n--- %s: %s\n' "$role" "$relative"
+    sed -n '1,400p' "$target/$relative"
+done
+printf '\nnextAction: EDIT_SOURCE\n'
+quoted_target=$(printf '%s' "$target" | sed "s/'/'\"'\"'/g")
+printf "after edit: cd '%s' && shadow-plugin dev\n" "$quoted_target"

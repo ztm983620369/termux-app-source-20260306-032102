@@ -228,6 +228,11 @@ def shadowSourceDir = rootProject.file("third_party/Shadow")
 def shadowGradle = new File(shadowSourceDir, "gradlew")
 def shadowCliDir = rootProject.file("termux-shadow-cli")
 def shadowTemplateDir = rootProject.file("termux-shadow-basic-plugin")
+def shadowTemplateGitignore = new File(shadowTemplateDir, ".gitignore")
+def shadowTemplateGitignoreTransport = new File(
+    projectDir,
+    "src/main/shadow-tooling/gitignore.shadow-template"
+)
 def shadowToolingAssetRoot = layout.buildDirectory.dir(
     "generated/assets/shadow-tooling/shadow-plugin-tooling"
 )
@@ -310,6 +315,11 @@ def copyShadowPluginToolingAssets = tasks.register("copyShadowPluginToolingAsset
     from(shadowToolingTemplateFiles) {
         into "template"
     }
+    // aapt filters dotfiles. Carry .gitignore under a safe asset name; the
+    // atomic installer restores its original name before fingerprinting.
+    from(shadowTemplateGitignoreTransport) {
+        into "template"
+    }
     into(shadowToolingAssetRoot)
 }
 
@@ -319,9 +329,16 @@ def writeShadowPluginToolingManifest = tasks.register("writeShadowPluginToolingM
     dependsOn copyShadowPluginToolingAssets
     inputs.file(new File(shadowCliDir, "dist/shadow-plugin"))
     inputs.files(shadowToolingTemplateFiles)
+    inputs.file(shadowTemplateGitignore)
+    inputs.file(shadowTemplateGitignoreTransport)
     outputs.file(shadowToolingAssetRoot.map { it.file("manifest.properties") })
 
     doLast {
+        if (shadowTemplateGitignore.bytes != shadowTemplateGitignoreTransport.bytes) {
+            throw new GradleException(
+                "Shadow template .gitignore transport copy is out of sync"
+            )
+        }
         def digestFile = { File file ->
             def digest = java.security.MessageDigest.getInstance("SHA-256")
             file.withInputStream { input ->
@@ -334,7 +351,9 @@ def writeShadowPluginToolingManifest = tasks.register("writeShadowPluginToolingM
             digest.digest().collect { String.format("%02x", it & 0xff) }.join()
         }
         def templateDigest = java.security.MessageDigest.getInstance("SHA-256")
-        shadowToolingTemplateFiles.files
+        def templateSourceFiles = new LinkedHashSet(shadowToolingTemplateFiles.files)
+        templateSourceFiles.add(shadowTemplateGitignore)
+        templateSourceFiles
             .findAll { it.isFile() }
             .sort { left, right ->
                 shadowTemplateDir.toPath().relativize(left.toPath()).toString() <=>

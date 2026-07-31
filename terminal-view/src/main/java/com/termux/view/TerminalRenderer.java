@@ -13,18 +13,19 @@ import com.termux.terminal.TextStyle;
 import com.termux.terminal.WcWidth;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
 /**
  * Renderer of a {@link TerminalEmulator} into a {@link Canvas}.
  * <p/>
- * Saves font metrics, so needs to be recreated each time the typeface or font size changes.
+ * Saves font metrics and retains reusable row-render resources across metric changes.
  */
 public final class TerminalRenderer {
 
-    final int mTextSize;
-    final Typeface mTypeface;
+    int mTextSize;
+    Typeface mTypeface;
     private final Paint mTextPaint = new Paint();
 
     // Cache glyph widths for non-ASCII code points. Terminal output often reuses a small set of
@@ -35,22 +36,45 @@ public final class TerminalRenderer {
     private final float[] mWidthCacheValues = new float[WIDTH_CACHE_SIZE];
 
     /** The width of a single mono spaced character obtained by {@link Paint#measureText(String)} on a single 'X'. */
-    final float mFontWidth;
+    float mFontWidth;
     /** The {@link Paint#getFontSpacing()}. See http://www.fampennings.nl/maarten/android/08numgrid/font.png */
-    final int mFontLineSpacing;
+    int mFontLineSpacing;
     /** The {@link Paint#ascent()}. See http://www.fampennings.nl/maarten/android/08numgrid/font.png */
-    private final int mFontAscent;
+    int mFontAscent;
     /** The {@link #mFontLineSpacing} + {@link #mFontAscent}. */
-    final int mFontLineSpacingAndAscent;
+    int mFontLineSpacingAndAscent;
 
     private final float[] asciiMeasures = new float[127];
+    private boolean legacyMeasuresValid;
+    private final GhosttyRenderNodeRenderer mGhosttyRenderer;
 
     public TerminalRenderer(int textSize, Typeface typeface) {
-        mTextSize = textSize;
-        mTypeface = typeface;
+        configureMetrics(textSize, typeface);
+        mGhosttyRenderer = new GhosttyRenderNodeRenderer(this);
+    }
 
-        mTextPaint.setTypeface(typeface);
+    /** Reconfigure metrics in place so real-time pinch does not allocate a renderer per VSync. */
+    final boolean reconfigure(int textSize, Typeface typeface) {
+        Typeface resolvedTypeface = typeface == null ? Typeface.MONOSPACE : typeface;
+        if (mTextSize == textSize && mTypeface == resolvedTypeface) return false;
+        configureMetrics(textSize, resolvedTypeface);
+        mGhosttyRenderer.onMetricsChanged();
+        return true;
+    }
+
+    /** Drop model-specific retained rows while keeping metric and allocation caches reusable. */
+    final void resetRenderState() {
+        mGhosttyRenderer.resetForSession();
+    }
+
+    private void configureMetrics(int textSize, Typeface typeface) {
+        mTextSize = textSize;
+        mTypeface = typeface == null ? Typeface.MONOSPACE : typeface;
+
+        mTextPaint.reset();
+        mTextPaint.setTypeface(mTypeface);
         mTextPaint.setAntiAlias(true);
+        mTextPaint.setSubpixelText(true);
         mTextPaint.setTextSize(textSize);
 
         mFontLineSpacing = (int) Math.ceil(mTextPaint.getFontSpacing());
@@ -58,11 +82,20 @@ public final class TerminalRenderer {
         mFontLineSpacingAndAscent = mFontLineSpacing + mFontAscent;
         mFontWidth = mTextPaint.measureText("X");
 
+        Arrays.fill(mWidthCacheKeys, 0);
+        Arrays.fill(mWidthCacheValues, 0f);
+        legacyMeasuresValid = false;
+    }
+
+    /** Build compatibility widths only if the authoritative Ghostty renderer actually fails. */
+    private void ensureLegacyMeasures() {
+        if (legacyMeasuresValid) return;
         StringBuilder sb = new StringBuilder(" ");
         for (int i = 0; i < asciiMeasures.length; i++) {
             sb.setCharAt(0, (char) i);
             asciiMeasures[i] = mTextPaint.measureText(sb, 0, 1);
         }
+        legacyMeasuresValid = true;
     }
 
     private float getMeasuredCodePointWidth(int codePoint, char[] line, int start, int charsForCodePoint) {
@@ -93,18 +126,244 @@ public final class TerminalRenderer {
     /** Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection. */
     public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
                              int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
-        renderInternal(mEmulator, canvas, topRow, selectionY1, selectionY2, selectionX1, selectionX2, true);
+        render(mEmulator, canvas, topRow, 0f,
+            selectionY1, selectionY2, selectionX1, selectionX2);
+    }
+
+    final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
+                      float viewportPixelOffset,
+                      int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
+        renderInternal(mEmulator, canvas, topRow, viewportPixelOffset,
+            selectionY1, selectionY2, selectionX1, selectionX2, true);
+    }
+
+    /** Render entry used by TerminalView when presentation accounting must reflect real output. */
+    final boolean renderFrame(TerminalEmulator mEmulator, Canvas canvas, int topRow,
+                              float viewportPixelOffset,
+                              int selectionY1, int selectionY2,
+                              int selectionX1, int selectionX2) {
+        return renderInternal(mEmulator, canvas, topRow, viewportPixelOffset,
+            selectionY1, selectionY2, selectionX1, selectionX2, true);
     }
 
     /** Scalar row decoder used for pixel-level differential tests. */
     final void renderReferenceForTesting(TerminalEmulator mEmulator, Canvas canvas, int topRow,
                                          int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
-        renderInternal(mEmulator, canvas, topRow, selectionY1, selectionY2, selectionX1, selectionX2, false);
+        renderInternal(mEmulator, canvas, topRow, 0f,
+            selectionY1, selectionY2, selectionX1, selectionX2, false);
     }
 
-    private void renderInternal(TerminalEmulator mEmulator, Canvas canvas, int topRow,
-                                int selectionY1, int selectionY2, int selectionX1, int selectionX2,
-                                boolean useSimpleRowFastPath) {
+    final long getGhosttyDecodedRowsForTesting() {
+        return mGhosttyRenderer.getDecodedRowsForTesting();
+    }
+
+    final long getGhosttyRetainedRowsForTesting() {
+        return mGhosttyRenderer.getRetainedRowsForTesting();
+    }
+
+    final long getGhosttyViewportPartialPacketsForTesting() {
+        return mGhosttyRenderer.getViewportPartialPacketsForTesting();
+    }
+
+    final long getGhosttyViewportFullRetriesForTesting() {
+        return mGhosttyRenderer.getViewportFullRetriesForTesting();
+    }
+
+    final long getGhosttyViewportCacheHitsForTesting() {
+        return mGhosttyRenderer.getViewportCacheHitsForTesting();
+    }
+
+    final long getGhosttyCachedModelRevision() {
+        return mGhosttyRenderer.getCachedModelRevision();
+    }
+
+    /** Bottommost non-background Ghostty row at or below a terminal cursor row. */
+    final int findLastGhosttySemanticScreenRow(int topRow, int firstScreenRow, int rows) {
+        return mGhosttyRenderer.findLastSemanticScreenRow(topRow, firstScreenRow, rows);
+    }
+
+    final long getGhosttyRetainedCommandGeneration() {
+        return mGhosttyRenderer.getRetainedCommandGeneration();
+    }
+
+    final void setGhosttyGlyphFastPathEnabledForTesting(boolean enabled) {
+        mGhosttyRenderer.setGlyphFastPathEnabledForTesting(enabled);
+    }
+
+    final long getGhosttyShapedTextRunsForTesting() {
+        return mGhosttyRenderer.getShapedTextRunsForTesting();
+    }
+
+    final long getGhosttyShapedGlyphsForTesting() {
+        return mGhosttyRenderer.getShapedGlyphsForTesting();
+    }
+
+    final long getGhosttyGlyphShapeFailuresForTesting() {
+        return mGhosttyRenderer.getGlyphShapeFailuresForTesting();
+    }
+
+    final long getGhosttyGlyphCanvasDrawsForTesting() {
+        return mGhosttyRenderer.getGlyphCanvasDrawsForTesting();
+    }
+
+    final long getGhosttyGlyphBatchDrawCallsForTesting() {
+        return mGhosttyRenderer.getGlyphBatchDrawCallsForTesting();
+    }
+
+    final long getGhosttyGlyphBatchedCommandsForTesting() {
+        return mGhosttyRenderer.getGlyphBatchedCommandsForTesting();
+    }
+
+    final long getGhosttyGlyphBatchedGlyphsForTesting() {
+        return mGhosttyRenderer.getGlyphBatchedGlyphsForTesting();
+    }
+
+    final long getGhosttyGlyphBatchFallbackFramesForTesting() {
+        return mGhosttyRenderer.getGlyphBatchFallbackFramesForTesting();
+    }
+
+    final int prepareGhosttyRetainedGlyphsForTesting() {
+        return mGhosttyRenderer.prepareRetainedGlyphsForTesting();
+    }
+
+    final int beginScaleGlyphWarmup() {
+        return mGhosttyRenderer.beginScaleGlyphWarmup();
+    }
+
+    final int warmScaleGlyphCache(int maxRuns) {
+        return mGhosttyRenderer.warmScaleGlyphCache(maxRuns);
+    }
+
+    final int getScaleGlyphWarmPrepared() {
+        return mGhosttyRenderer.getScaleGlyphWarmPrepared();
+    }
+
+    /** Build Ghostty's retained rows before an offscreen pager child becomes visible. */
+    final boolean prewarmGhosttyFrame(TerminalEmulator emulator, int topRow, boolean forceFull,
+                                      int selectionY1, int selectionY2,
+                                      int selectionX1, int selectionX2) {
+        return prewarmGhosttyFrame(emulator, topRow, 0f, forceFull,
+            selectionY1, selectionY2, selectionX1, selectionX2);
+    }
+
+    /** Bottommost retained row with real draw commands, without another native snapshot. */
+    final int findLastGhosttyVisualScreenRow(int topRow, int firstScreenRow, int rows) {
+        return mGhosttyRenderer.findLastVisualScreenRow(topRow, firstScreenRow, rows);
+    }
+
+    /** Build the visible viewport and preserve the adjacent row needed by a sub-row offset. */
+    final boolean prewarmGhosttyFrame(TerminalEmulator emulator, int topRow,
+                                      float viewportPixelOffset, boolean forceFull,
+                                      int selectionY1, int selectionY2,
+                                      int selectionX1, int selectionX2) {
+        if (!emulator.isGhosttyRenderAuthorityActive()) return false;
+        mGhosttyRenderer.beginDamageCapture();
+        boolean prepared = false;
+        try {
+        if (forceFull) mGhosttyRenderer.requestFullFrame();
+        if (!mGhosttyRenderer.prewarm(emulator, topRow, forceFull,
+                selectionY1, selectionY2, selectionX1, selectionX2)) {
+            return false;
+        }
+
+        if (Math.abs(viewportPixelOffset) < 0.01f) {
+            prepared = true;
+            return true;
+        }
+        int adjacentTopRow = viewportPixelOffset < 0f ? topRow - 1 : topRow + 1;
+        int oldestTopRow = -Math.max(0, emulator.getActiveTranscriptRows());
+        if (adjacentTopRow < oldestTopRow || adjacentTopRow > 0) {
+            prepared = true;
+            return true;
+        }
+
+        // The retained cache normally already owns the fractional row. Avoid two complete
+        // viewport scans and a redundant native query on every raw touch sample.
+        if (mGhosttyRenderer.hasRetainedOverscanRow(topRow, viewportPixelOffset)) {
+            prepared = true;
+            return true;
+        }
+
+        // Move one viewport row toward the required overscan and back. The native delta packet
+        // sends only the newly exposed row; the retained cache keeps that row after returning.
+        prepared = mGhosttyRenderer.prewarm(emulator, adjacentTopRow, false,
+                selectionY1, selectionY2, selectionX1, selectionX2) &&
+            mGhosttyRenderer.prewarm(emulator, topRow, false,
+                selectionY1, selectionY2, selectionX1, selectionX2);
+        return prepared;
+        } finally {
+            mGhosttyRenderer.finishDamageCapture(prepared);
+        }
+    }
+
+    /** Prepare Ghostty's retained rows and export an immutable batch for the Vulkan thread. */
+    final TerminalGpuFrame prepareGpuFrame(TerminalEmulator emulator, int viewWidth, int viewHeight,
+                                           int topRow,
+                                           float viewportPixelOffset, boolean forceFull,
+                                           int selectionY1, int selectionY2,
+                                           int selectionX1, int selectionX2,
+                                           long frameId, long consumedCommandGeneration,
+                                           int consumedTopRow) {
+        if (!emulator.isGhosttyRenderAuthorityActive()) return null;
+        if (!prewarmGhosttyFrame(emulator, topRow, viewportPixelOffset, forceFull,
+            selectionY1, selectionY2, selectionX1, selectionX2)) {
+            return null;
+        }
+        return mGhosttyRenderer.buildGpuFrame(frameId, viewWidth, viewHeight,
+            topRow, viewportPixelOffset, consumedCommandGeneration, consumedTopRow, forceFull);
+    }
+
+    final TerminalGpuFrame exportGpuFrame(int viewWidth, int viewHeight, int topRow,
+                                          float viewportPixelOffset, long frameId,
+                                          long consumedCommandGeneration, int consumedTopRow,
+                                          boolean forceFull) {
+        return mGhosttyRenderer.buildGpuFrame(frameId, viewWidth, viewHeight, topRow,
+            viewportPixelOffset, consumedCommandGeneration, consumedTopRow, forceFull);
+    }
+
+    final boolean isPreparedGhosttyDamageFull() {
+        return mGhosttyRenderer.isPreparedDamageFull();
+    }
+
+    final int getPreparedGhosttyDamageStart() {
+        return mGhosttyRenderer.getPreparedDamageStart();
+    }
+
+    final int getPreparedGhosttyDamageEnd() {
+        return mGhosttyRenderer.getPreparedDamageEnd();
+    }
+
+    private boolean renderInternal(TerminalEmulator mEmulator, Canvas canvas, int topRow,
+                                   float viewportPixelOffset,
+                                   int selectionY1, int selectionY2,
+                                   int selectionX1, int selectionX2,
+                                   boolean useSimpleRowFastPath) {
+        if (mEmulator.isGhosttyRenderAuthorityActive()) {
+            // Canvas can be reached after a full invalidation without the offscreen prewarm path.
+            // Preserve the adjacent retained row before applying a fractional viewport translation.
+            if (Math.abs(viewportPixelOffset) >= 0.01f) {
+                prewarmGhosttyFrame(mEmulator, topRow, viewportPixelOffset, false,
+                    selectionY1, selectionY2, selectionX1, selectionX2);
+            }
+            if (mGhosttyRenderer.render(mEmulator, canvas, topRow, viewportPixelOffset,
+                selectionY1, selectionY2, selectionX1, selectionX2)) {
+                return true;
+            }
+            String failedStatus = mEmulator.getGhosttyRenderStatusForDiagnostics();
+            if (mEmulator.recoverGhosttyRenderBackend(failedStatus)) {
+                mGhosttyRenderer.requestFullFrame();
+                if (Math.abs(viewportPixelOffset) >= 0.01f) {
+                    prewarmGhosttyFrame(mEmulator, topRow, viewportPixelOffset, false,
+                        selectionY1, selectionY2, selectionX1, selectionX2);
+                }
+                if (mGhosttyRenderer.render(mEmulator, canvas, topRow, viewportPixelOffset,
+                    selectionY1, selectionY2, selectionX1, selectionX2)) {
+                    return true;
+                }
+            }
+            mEmulator.activateGhosttyRenderFallback(failedStatus);
+        }
+        ensureLegacyMeasures();
         final boolean reverseVideo = mEmulator.isReverseVideo();
         final int columns = mEmulator.mColumns;
         final int cursorCol = mEmulator.getCursorCol();
@@ -114,7 +373,7 @@ public final class TerminalRenderer {
         final int[] palette = mEmulator.mColors.mCurrentColors;
         final int cursorShape = mEmulator.getCursorStyle();
         final Rect clipRect = canvas.getClipBounds();
-        if (clipRect.isEmpty()) return;
+        if (clipRect.isEmpty()) return false;
 
         if (reverseVideo) {
             canvas.drawColor(palette[TextStyle.COLOR_INDEX_FOREGROUND], PorterDuff.Mode.SRC);
@@ -217,6 +476,7 @@ public final class TerminalRenderer {
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
                 measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo || invertCursorTextColor || lastRunInsideSelection);
         }
+        return true;
     }
 
     final TerminalRenderSnapshot buildRenderSnapshot(TerminalEmulator mEmulator, int viewWidth, int viewHeight,
@@ -530,6 +790,44 @@ public final class TerminalRenderer {
             if (text[start + i] != ' ') return true;
         }
         return false;
+    }
+
+    final void dispose() {
+        mGhosttyRenderer.dispose();
+    }
+
+    final void requestFullFrame() {
+        mGhosttyRenderer.requestFullFrame();
+    }
+
+    final boolean hasCompleteGhosttyFrame(int topRow, int rows, long modelRevision) {
+        return mGhosttyRenderer.hasCompleteFrame(topRow, rows, modelRevision);
+    }
+
+    /** A complete retained viewport may trail a continuously advancing PTY by one revision. */
+    final boolean hasCompleteGhosttyFrame(int topRow, int rows) {
+        return mGhosttyRenderer.hasCompleteFrame(topRow, rows);
+    }
+
+    /** Generic retained-frame state retained for viewport-render diagnostics. */
+    final boolean hasCompleteGhosttyFrame() {
+        return mGhosttyRenderer.hasCompleteFrame();
+    }
+
+    final void setRealtimeScaleActive(boolean active) {
+        mGhosttyRenderer.setRealtimeScaleActive(active);
+    }
+
+    final String getGhosttyRenderDiagnostics() {
+        return mGhosttyRenderer.getDiagnostics();
+    }
+
+    final boolean requestRetiredRowRelease() {
+        return mGhosttyRenderer.requestRetiredRowRelease();
+    }
+
+    final void releaseRetiredRows() {
+        mGhosttyRenderer.releaseRetiredRows();
     }
 
     public float getFontWidth() {

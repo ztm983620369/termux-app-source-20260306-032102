@@ -332,7 +332,7 @@ fn materialize_healthy(
         active_artifact_path: Some(format!("dist/{ACTIVE_ARTIFACT_NAME}")),
         status: "HEALTHY".to_owned(),
         runtime_proven: true,
-        health_semantics: Some("FIRST_FRAME_AND_PROCESS_STABILITY".to_owned()),
+        health_semantics: Some(runtime_health_semantics(version).to_owned()),
         runtime_health_protocol_version: Some(version.runtime_health_protocol_version),
         runtime_stable_at: Some(version.runtime_stable_at),
         last_healthy_process_pid: Some(version.last_healthy_process_pid),
@@ -377,9 +377,13 @@ fn runtime_receipt(
         active_artifact_path: current_active_view(project, input.plugin_id)?.map(|view| view.path),
         status: input.status.to_owned(),
         runtime_proven: input.runtime_proven,
-        health_semantics: input
-            .runtime_proven
-            .then(|| "FIRST_FRAME_AND_PROCESS_STABILITY".to_owned()),
+        health_semantics: input.runtime_proven.then(|| {
+            input
+                .version
+                .map(runtime_health_semantics)
+                .unwrap_or("FIRST_FRAME_AND_PROCESS_STABILITY")
+                .to_owned()
+        }),
         runtime_health_protocol_version: input
             .version
             .map(|version| version.runtime_health_protocol_version),
@@ -391,6 +395,14 @@ fn runtime_receipt(
         error: input.error,
         checked_at_epoch_ms: now_millis(),
     })
+}
+
+fn runtime_health_semantics(version: &VersionRecord) -> &'static str {
+    if version.smoke_requested && version.smoke_passed {
+        "FIRST_FRAME_UI_SMOKE_AND_PROCESS_STABILITY"
+    } else {
+        "FIRST_FRAME_AND_PROCESS_STABILITY"
+    }
 }
 
 fn runtime_status(plugin: &PluginRecord, version: &VersionRecord) -> (&'static str, bool) {

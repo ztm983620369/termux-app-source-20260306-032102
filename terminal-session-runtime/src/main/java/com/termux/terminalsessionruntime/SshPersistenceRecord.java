@@ -5,8 +5,6 @@ import androidx.annotation.Nullable;
 
 import org.json.JSONObject;
 
-import java.util.UUID;
-
 public final class SshPersistenceRecord {
 
     @NonNull public final String id;
@@ -33,7 +31,6 @@ public final class SshPersistenceRecord {
         if (sshCommand.isEmpty()) return null;
 
         String id = json.optString("id", "").trim();
-        if (id.isEmpty()) id = UUID.randomUUID().toString();
 
         String tmuxSession = json.optString("tmuxSession", "").trim();
         String displayName = json.optString("displayName", "").trim();

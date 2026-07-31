@@ -1,14 +1,35 @@
 package com.termux.terminal;
 
+import android.os.Trace;
+import android.os.Process;
 import android.util.Base64;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.EOFException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Stack;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Renders text into a screen. Contains all the terminal-specific knowledge and state. Emulates a subset of the X Window
@@ -101,6 +122,35 @@ public final class TerminalEmulator {
     private static final int MAX_OSC_STRING_LENGTH = 8192;
     private static final int MAX_HYPERLINK_CACHE_ENTRIES = 256;
     private static final int OSC_TERMUX_HOST_CONTROL = 8900;
+    private static final String HOST_CONTROL_TERMINAL_BACKEND = "terminal-backend";
+    /**
+     * Maximum foreground journal batch. Reaching it atomically hands the immutable batch to the
+     * compatibility checkpoint worker; the PTY parser never replays Java state inline.
+     */
+    private static final long MAX_COMPATIBILITY_REPLAY_BYTES = 256L * 1024L * 1024L;
+    /** Bound one journal record and the replay worker's reusable input buffer. */
+    private static final int COMPATIBILITY_REPLAY_BLOCK_BYTES = 64 * 1024;
+    private static final int COMPATIBILITY_JOURNAL_BUFFER_BYTES = 256 * 1024;
+    private static final int COMPATIBILITY_JOURNAL_MAGIC = 0x54564a31; // TVJ1
+    private static final String COMPATIBILITY_JOURNAL_PREFIX = "termux-ghostty-";
+    private static final String COMPATIBILITY_JOURNAL_SUFFIX = ".vtj";
+    private static final Object COMPATIBILITY_JOURNAL_REGISTRY_LOCK = new Object();
+    /** Absolute paths owned by any live terminal in this app process. */
+    private static final Set<String> ACTIVE_COMPATIBILITY_JOURNALS = new HashSet<>();
+    private static final int COMPATIBILITY_EVENT_BYTES = 1;
+    private static final int COMPATIBILITY_EVENT_RESIZE = 2;
+    private static final int COMPATIBILITY_EVENT_RESET = 3;
+    private static final int COMPATIBILITY_EVENT_COLORS = 4;
+    private static final long COMPATIBILITY_METRICS_LOG_INTERVAL_NANOS = 3_000_000_000L;
+    /**
+     * A compatibility checkpoint is cold recovery state. Do not let it compete with the live
+     * Ghostty parser while PTY bytes are arriving. Once output has been quiet for this interval,
+     * the background worker may catch up. A synchronous fallback request always bypasses it.
+     */
+    private static final long COMPATIBILITY_REPLAY_QUIET_NANOS = 1_000_000_000L;
+    /** Bound deferred journals even for a terminal producing output without an idle gap. */
+    private static final long COMPATIBILITY_REPLAY_PRESSURE_BYTES =
+        MAX_COMPATIBILITY_REPLAY_BYTES * 4L;
 
     /** DECSET 1 - application cursor keys. */
     private static final int DECSET_BIT_APPLICATION_CURSOR_KEYS = 1;
@@ -141,7 +191,7 @@ public final class TerminalEmulator {
     private static final int DECSET_BIT_SYNCHRONIZED_OUTPUT = 1 << 13;
 
 
-    private String mTitle;
+    private volatile String mTitle;
     private final Stack<String> mTitleStack = new Stack<>();
 
     /** The cursor position. Between (0,0) and (mRows-1, mColumns-1). */
@@ -186,7 +236,7 @@ public final class TerminalEmulator {
     /** The terminal session this emulator is bound to. */
     private final TerminalOutput mSession;
 
-    TerminalSessionClient mClient;
+    volatile TerminalSessionClient mClient;
 
     /** Keeps track of the current argument of the current escape sequence. Ranges from 0 to MAX_ESCAPE_PARAMETERS-1. */
     private int mArgIndex;
@@ -280,10 +330,10 @@ public final class TerminalEmulator {
      * The number of scrolled lines since last calling {@link #clearScrollCounter()}. Used for moving selection up along
      * with the scrolling text.
      */
-    private int mScrollCounter = 0;
-    private boolean mScrollCounterFullScreen = true;
+    /** Packed as {@code count << 1 | fullScreen}; consumed atomically by TerminalView. */
+    private final AtomicLong mScrollSignal = new AtomicLong(1L);
     /** Set when a state change requires a full viewport redraw rather than dirty-row repaint. */
-    private boolean mFullRedrawRequired = true;
+    private final AtomicBoolean mFullRedrawRequired = new AtomicBoolean(true);
     private TerminalBuffer mSynchronizedOutputBuffer;
     private int mSynchronizedOutputCursorRow;
     private int mSynchronizedOutputCursorCol;
@@ -296,6 +346,54 @@ public final class TerminalEmulator {
     private byte mUtf8ToFollow, mUtf8Index;
     private final byte[] mUtf8InputBuffer = new byte[4];
     private int mLastEmittedCodePoint = -1;
+    /** One scanned-until value plus up to 1024 [start, end) printable ASCII spans. */
+    private final ByteBuffer mAsciiRunStorage = ByteBuffer.allocateDirect(2049 * Integer.BYTES)
+        .order(ByteOrder.nativeOrder());
+    private final IntBuffer mAsciiRunScratch = mAsciiRunStorage.asIntBuffer();
+    /** Per-emulator evidence that real PTY chunks traversed and benefited from the native path. */
+    long mNativeAsciiScanCalls;
+    long mNativeAsciiScanBytes;
+    long mNativeAsciiRangeCount;
+    long mNativeAsciiEmittedBytes;
+    /** Complete Ghostty parser/render authority and its cached mutation state. */
+    private volatile GhosttyTerminalBackend mGhosttyBackend;
+    private volatile GhosttyTerminalBackend.State mGhosttyState;
+    private File mCompatibilityJournalFile;
+    private DataOutputStream mCompatibilityJournalOutput;
+    private boolean mCompatibilityJournalHasEvents;
+    private long mCompatibilityReplayBytes;
+    private final Object mCompatibilityReplayLock = new Object();
+    private final ArrayDeque<CompatibilityReplayBatch> mCompatibilityReplayQueue =
+        new ArrayDeque<>();
+    private volatile Thread mCompatibilityReplayThread;
+    private boolean mCompatibilityReplayStop;
+    private long mCompatibilityReplayEnqueuedGeneration;
+    private long mCompatibilityReplayAppliedGeneration;
+    private long mCompatibilityReplayQueuedBytes;
+    private long mCompatibilityReplayHighWaterBytes;
+    private long mCompatibilityReplayAppliedBytes;
+    private long mCompatibilityReplayAppliedBatches;
+    private long mCompatibilityReplayMaxBatchNanos;
+    private long mCompatibilityReplayLastLogNanos;
+    private long mCompatibilityReplayLastThreadId = -1L;
+    private String mCompatibilityReplayLastThreadName = "none";
+    private volatile long mCompatibilityReplayLastForegroundNanos = System.nanoTime();
+    private boolean mCompatibilityReplayUrgent;
+    private long mCompatibilityReplayDeferredWaits;
+    private long mCompatibilityReplayDeferredNanos;
+    private volatile Throwable mCompatibilityReplayFailure;
+    private volatile TerminalEmulator mCompatibilityEmulator;
+    private volatile boolean mCompatibilityFallback;
+    private volatile boolean mCompatibilityReplayInProgress = true;
+    private final boolean mReplayOnly;
+    /** Grid changes handled by Ghostty without redundantly reflowing the dormant owner Java buffer. */
+    private long mGhosttyDormantJavaResizeSkips;
+    private final int mInitialColumns;
+    private final int mInitialRows;
+    private final int mInitialCellWidthPixels;
+    private final int mInitialCellHeightPixels;
+    private final int mConfiguredTranscriptRows;
+    private final int[] mInitialColors;
 
     public final TerminalColors mColors = new TerminalColors();
 
@@ -356,8 +454,23 @@ public final class TerminalEmulator {
     }
 
     public TerminalEmulator(TerminalOutput session, int columns, int rows, int cellWidthPixels, int cellHeightPixels, Integer transcriptRows, TerminalSessionClient client) {
+        this(session, columns, rows, cellWidthPixels, cellHeightPixels, transcriptRows, client,
+            true, false);
+    }
+
+    private TerminalEmulator(TerminalOutput session, int columns, int rows,
+                             int cellWidthPixels, int cellHeightPixels, Integer transcriptRows,
+                             TerminalSessionClient client, boolean allowGhostty,
+                             boolean replayOnly) {
         mSession = session;
-        mScreen = mMainBuffer = new TerminalBuffer(columns, getTerminalTranscriptRows(transcriptRows), rows);
+        int totalRows = getTerminalTranscriptRows(transcriptRows);
+        mConfiguredTranscriptRows = totalRows;
+        mInitialColumns = columns;
+        mInitialRows = rows;
+        mInitialCellWidthPixels = cellWidthPixels;
+        mInitialCellHeightPixels = cellHeightPixels;
+        mReplayOnly = replayOnly;
+        mScreen = mMainBuffer = new TerminalBuffer(columns, totalRows, rows);
         mAltBuffer = new TerminalBuffer(columns, rows, rows);
         mClient = client;
         mRows = rows;
@@ -365,21 +478,761 @@ public final class TerminalEmulator {
         mCellWidthPixels = cellWidthPixels;
         mCellHeightPixels = cellHeightPixels;
         mTabStop = new boolean[mColumns];
-        reset();
+        resetJavaState();
+        mInitialColors = mColors.mCurrentColors.clone();
+        if (allowGhostty) {
+            mGhosttyBackend = GhosttyTerminalBackend.createIfEnabled(
+                columns, rows, cellWidthPixels, cellHeightPixels,
+                Math.max(0, totalRows - rows), mCursorStyle, mColors.mCurrentColors,
+                new GhosttyEffects());
+            if (mGhosttyBackend != null) mGhosttyState = mGhosttyBackend.state();
+        }
     }
 
-    public void updateTerminalSessionClient(TerminalSessionClient client) {
+    private final class GhosttyEffects implements GhosttyTerminalBackend.Effects {
+        @Override
+        public void writePty(byte[] data) {
+            if (data != null && data.length > 0) mSession.write(data, 0, data.length);
+        }
+
+        @Override
+        public void bell() {
+            mSession.onBell();
+        }
+
+        @Override
+        public void titleChanged(String title) {
+            setTitle(title);
+        }
+
+        @Override
+        public boolean clipboardWrite(String text) {
+            mSession.onCopyTextToClipboard(text);
+            return true;
+        }
+
+        @Override
+        public void onColorsChanged() {
+            mSession.onColorsChanged();
+        }
+
+        @Override
+        public void hostControl(String payload) {
+            handleTermuxHostControl(payload);
+        }
+    }
+
+    private static final class CompatibilityReplayBatch {
+        final File journal;
+        final long bytes;
+        final long generation;
+
+        CompatibilityReplayBatch(File journal, long bytes,
+                                 long generation) {
+            this.journal = journal;
+            this.bytes = bytes;
+            this.generation = generation;
+        }
+    }
+
+    private final class CompatibilityOutput extends TerminalOutput {
+        @Override public void write(byte[] data, int offset, int count) {
+            if (!mCompatibilityReplayInProgress) mSession.write(data, offset, count);
+        }
+
+        @Override public void titleChanged(String oldTitle, String newTitle) {
+            if (!mCompatibilityReplayInProgress) setTitle(newTitle);
+        }
+
+        @Override public void onCopyTextToClipboard(String text) {
+            if (!mCompatibilityReplayInProgress) mSession.onCopyTextToClipboard(text);
+        }
+
+        @Override public void onPasteTextFromClipboard() {
+            if (!mCompatibilityReplayInProgress) mSession.onPasteTextFromClipboard();
+        }
+
+        @Override public void onBell() {
+            if (!mCompatibilityReplayInProgress) mSession.onBell();
+        }
+
+        @Override public void onColorsChanged() {
+            if (mCompatibilityReplayInProgress || mCompatibilityEmulator == null) return;
+            System.arraycopy(mCompatibilityEmulator.mColors.mCurrentColors, 0,
+                mColors.mCurrentColors, 0, mColors.mCurrentColors.length);
+            mSession.onColorsChanged();
+        }
+
+        @Override public void onTerminalHostControlCommand(String command, String argument) {
+            if (!mCompatibilityReplayInProgress) {
+                mSession.onTerminalHostControlCommand(command, argument);
+            }
+        }
+    }
+
+    private boolean hasGhosttyAuthority() {
+        GhosttyTerminalBackend backend = mGhosttyBackend;
+        if (backend == null || mCompatibilityFallback) return false;
+        if (GhosttyTerminalBackend.isProductionEnabled()) return true;
+        if (mReplayOnly) return false;
+
+        // The healthy read is entirely lock-free so UI getters never wait for a PTY parse. Only
+        // the exceptional process kill-switch transition acquires the mutation monitor.
+        synchronized (this) {
+            if (mGhosttyBackend != null && !GhosttyTerminalBackend.isProductionEnabled() &&
+                !mReplayOnly && !mCompatibilityFallback) {
+                activateCompatibilityFallback("process kill switch");
+            }
+            return mGhosttyBackend != null && GhosttyTerminalBackend.isProductionEnabled() &&
+                !mCompatibilityFallback;
+        }
+    }
+
+    private void recordBytesForCompatibility(byte[] buffer, int length) {
+        if (length <= 0 || mCompatibilityReplayFailure != null) return;
+        markCompatibilityForegroundActivity();
+        int offset = 0;
+        while (offset < length) {
+            if (mCompatibilityReplayBytes == MAX_COMPATIBILITY_REPLAY_BYTES) {
+                enqueueCompatibilityReplayBatch(false);
+            }
+            int journalSpace = (int) Math.min(Integer.MAX_VALUE,
+                MAX_COMPATIBILITY_REPLAY_BYTES - mCompatibilityReplayBytes);
+            int copied = Math.min(length - offset,
+                Math.min(COMPATIBILITY_REPLAY_BLOCK_BYTES, journalSpace));
+            try {
+                DataOutputStream output = compatibilityJournalOutput();
+                output.writeByte(COMPATIBILITY_EVENT_BYTES);
+                output.writeInt(copied);
+                output.write(buffer, offset, copied);
+                mCompatibilityJournalHasEvents = true;
+            } catch (IOException error) {
+                failCompatibilityJournal(error);
+                return;
+            }
+            offset += copied;
+            mCompatibilityReplayBytes += copied;
+        }
+    }
+
+    private DataOutputStream compatibilityJournalOutput() throws IOException {
+        if (mCompatibilityReplayFailure != null) {
+            throw new IOException("Compatibility journal is unavailable",
+                mCompatibilityReplayFailure);
+        }
+        if (mCompatibilityJournalOutput != null) return mCompatibilityJournalOutput;
+        File directory = new File(System.getProperty("java.io.tmpdir", "."));
+        synchronized (COMPATIBILITY_JOURNAL_REGISTRY_LOCK) {
+            mCompatibilityJournalFile = File.createTempFile(
+                COMPATIBILITY_JOURNAL_PREFIX, COMPATIBILITY_JOURNAL_SUFFIX, directory);
+            ACTIVE_COMPATIBILITY_JOURNALS.add(mCompatibilityJournalFile.getAbsolutePath());
+        }
+        try {
+            mCompatibilityJournalOutput = new DataOutputStream(new BufferedOutputStream(
+                new FileOutputStream(mCompatibilityJournalFile),
+                COMPATIBILITY_JOURNAL_BUFFER_BYTES));
+            mCompatibilityJournalOutput.writeInt(COMPATIBILITY_JOURNAL_MAGIC);
+            return mCompatibilityJournalOutput;
+        } catch (IOException error) {
+            deleteCompatibilityJournal(mCompatibilityJournalFile);
+            mCompatibilityJournalFile = null;
+            throw error;
+        }
+    }
+
+    private void failCompatibilityJournal(IOException error) {
+        closeCompatibilityJournalOutput();
+        deleteCompatibilityJournal(mCompatibilityJournalFile);
+        mCompatibilityJournalFile = null;
+        mCompatibilityJournalHasEvents = false;
+        mCompatibilityReplayBytes = 0L;
+        mCompatibilityReplayFailure = error;
+        Logger.logStackTraceWithMessage(mClient, LOG_TAG,
+            "Compatibility journal failed; Ghostty remains authoritative", error);
+    }
+
+    private void closeCompatibilityJournalOutput() {
+        DataOutputStream output = mCompatibilityJournalOutput;
+        mCompatibilityJournalOutput = null;
+        if (output == null) return;
+        try {
+            output.close();
+        } catch (IOException error) {
+            if (mCompatibilityReplayFailure == null) mCompatibilityReplayFailure = error;
+        }
+    }
+
+    private static void deleteCompatibilityJournal(File journal) {
+        if (journal == null) return;
+        synchronized (COMPATIBILITY_JOURNAL_REGISTRY_LOCK) {
+            ACTIVE_COMPATIBILITY_JOURNALS.remove(journal.getAbsolutePath());
+            if (journal.exists()) journal.delete();
+        }
+    }
+
+    /** Result of deleting crash-orphaned compatibility journals from the app cache. */
+    public static final class CompatibilityJournalCleanupResult {
+        public final int deletedFiles;
+        public final long deletedBytes;
+
+        CompatibilityJournalCleanupResult(int deletedFiles, long deletedBytes) {
+            this.deletedFiles = deletedFiles;
+            this.deletedBytes = deletedBytes;
+        }
+    }
+
+    /**
+     * Delete only this pipeline's private temporary journals that are not owned by a live terminal
+     * in the current process. The registry lock closes the create-vs-clean race when a new session
+     * starts while cleanup is scanning after a prior process crash.
+     */
+    public static CompatibilityJournalCleanupResult cleanupStaleCompatibilityJournals(
+        File directory) {
+        if (directory == null || !directory.isDirectory()) {
+            return new CompatibilityJournalCleanupResult(0, 0L);
+        }
+        File[] candidates = directory.listFiles((parent, name) ->
+            name.startsWith(COMPATIBILITY_JOURNAL_PREFIX) &&
+                name.endsWith(COMPATIBILITY_JOURNAL_SUFFIX));
+        if (candidates == null || candidates.length == 0) {
+            return new CompatibilityJournalCleanupResult(0, 0L);
+        }
+
+        int deletedFiles = 0;
+        long deletedBytes = 0L;
+        for (File candidate : candidates) {
+            if (candidate == null || !candidate.isFile()) continue;
+            synchronized (COMPATIBILITY_JOURNAL_REGISTRY_LOCK) {
+                if (ACTIVE_COMPATIBILITY_JOURNALS.contains(candidate.getAbsolutePath())) continue;
+                long bytes = Math.max(0L, candidate.length());
+                if (candidate.delete()) {
+                    deletedFiles++;
+                    deletedBytes += bytes;
+                }
+            }
+        }
+        return new CompatibilityJournalCleanupResult(deletedFiles, deletedBytes);
+    }
+
+    private void markCompatibilityForegroundActivity() {
+        mCompatibilityReplayLastForegroundNanos = System.nanoTime();
+    }
+
+    private void recordResizeForCompatibility(int columns, int rows,
+                                              int cellWidth, int cellHeight) {
+        if (mCompatibilityReplayFailure != null) return;
+        markCompatibilityForegroundActivity();
+        try {
+            DataOutputStream output = compatibilityJournalOutput();
+            output.writeByte(COMPATIBILITY_EVENT_RESIZE);
+            output.writeInt(columns);
+            output.writeInt(rows);
+            output.writeInt(cellWidth);
+            output.writeInt(cellHeight);
+            mCompatibilityJournalHasEvents = true;
+        } catch (IOException error) {
+            failCompatibilityJournal(error);
+        }
+    }
+
+    private void recordResetForCompatibility() {
+        if (mCompatibilityReplayFailure != null) return;
+        markCompatibilityForegroundActivity();
+        try {
+            compatibilityJournalOutput().writeByte(COMPATIBILITY_EVENT_RESET);
+            mCompatibilityJournalHasEvents = true;
+        } catch (IOException error) {
+            failCompatibilityJournal(error);
+        }
+    }
+
+    private void recordColorsForCompatibility(int[] colors) {
+        if (mCompatibilityReplayFailure != null) return;
+        markCompatibilityForegroundActivity();
+        try {
+            DataOutputStream output = compatibilityJournalOutput();
+            output.writeByte(COMPATIBILITY_EVENT_COLORS);
+            output.writeInt(colors.length);
+            for (int color : colors) output.writeInt(color);
+            mCompatibilityJournalHasEvents = true;
+        } catch (IOException error) {
+            failCompatibilityJournal(error);
+        }
+    }
+
+    /** Caller owns this emulator's mutation monitor, making the sealed file immutable. */
+    private long enqueueCompatibilityReplayBatch(boolean force) {
+        if (!mCompatibilityJournalHasEvents && !force && mCompatibilityEmulator != null) {
+            synchronized (mCompatibilityReplayLock) {
+                return mCompatibilityReplayEnqueuedGeneration;
+            }
+        }
+
+        closeCompatibilityJournalOutput();
+        if (mCompatibilityReplayFailure != null) {
+            throw new IllegalStateException(
+                "Compatibility journal is unavailable", mCompatibilityReplayFailure);
+        }
+        File journal = mCompatibilityJournalFile;
+        long bytes = mCompatibilityReplayBytes;
+        mCompatibilityJournalFile = null;
+        mCompatibilityJournalHasEvents = false;
+        mCompatibilityReplayBytes = 0L;
+        synchronized (mCompatibilityReplayLock) {
+            if (mCompatibilityReplayStop && !mCompatibilityFallback) {
+                throw new IllegalStateException("Compatibility checkpoint worker is stopped");
+            }
+            long generation = ++mCompatibilityReplayEnqueuedGeneration;
+            mCompatibilityReplayQueue.addLast(
+                new CompatibilityReplayBatch(journal, bytes, generation));
+            mCompatibilityReplayQueuedBytes += bytes;
+            mCompatibilityReplayHighWaterBytes = Math.max(
+                mCompatibilityReplayHighWaterBytes, mCompatibilityReplayQueuedBytes);
+            startCompatibilityReplayWorkerLocked();
+            mCompatibilityReplayLock.notifyAll();
+            return generation;
+        }
+    }
+
+    private void startCompatibilityReplayWorkerLocked() {
+        if (mCompatibilityReplayThread != null) return;
+        mCompatibilityReplayStop = false;
+        Thread worker = new Thread(this::runCompatibilityReplayWorker,
+            "TermuxCompatibilityCheckpoint");
+        worker.setDaemon(true);
+        mCompatibilityReplayThread = worker;
+        worker.start();
+    }
+
+    /**
+     * Wait until replay cannot steal foreground parser/render time. The pressure escape hatch
+     * bounds disk use; an urgent caller is waiting for exact Java recovery state.
+     */
+    private boolean awaitCompatibilityReplayPermit() {
+        boolean interrupted = false;
+        boolean permitted;
+        synchronized (mCompatibilityReplayLock) {
+            while (true) {
+                if (mCompatibilityReplayStop) {
+                    permitted = false;
+                    break;
+                }
+                if (mCompatibilityReplayUrgent ||
+                    mCompatibilityReplayQueuedBytes >= COMPATIBILITY_REPLAY_PRESSURE_BYTES) {
+                    permitted = true;
+                    break;
+                }
+
+                long remaining = COMPATIBILITY_REPLAY_QUIET_NANOS -
+                    (System.nanoTime() - mCompatibilityReplayLastForegroundNanos);
+                if (remaining <= 0L) {
+                    permitted = true;
+                    break;
+                }
+
+                long waitStarted = System.nanoTime();
+                mCompatibilityReplayDeferredWaits++;
+                try {
+                    long millis = remaining / 1_000_000L;
+                    int nanos = (int) (remaining % 1_000_000L);
+                    mCompatibilityReplayLock.wait(millis, nanos);
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                } finally {
+                    mCompatibilityReplayDeferredNanos += Math.max(0L,
+                        System.nanoTime() - waitStarted);
+                }
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+        return permitted;
+    }
+
+    private boolean replayCompatibilityJournal(File journal, TerminalEmulator compatibility) {
+        if (journal == null) return true;
+        byte[] bytes = new byte[COMPATIBILITY_REPLAY_BLOCK_BYTES];
+        try (DataInputStream input = new DataInputStream(new BufferedInputStream(
+            new FileInputStream(journal), COMPATIBILITY_JOURNAL_BUFFER_BYTES))) {
+            int magic = input.readInt();
+            if (magic != COMPATIBILITY_JOURNAL_MAGIC) {
+                throw new IOException("Invalid compatibility journal magic");
+            }
+            while (true) {
+                int type;
+                try {
+                    type = input.readUnsignedByte();
+                } catch (EOFException end) {
+                    return true;
+                }
+                // Re-check between bounded records so resumed PTY traffic preempts cold replay
+                // within at most 64 KiB of Java parsing.
+                if (!awaitCompatibilityReplayPermit()) return false;
+                switch (type) {
+                    case COMPATIBILITY_EVENT_BYTES: {
+                        int length = input.readInt();
+                        if (length <= 0 || length > bytes.length) {
+                            throw new IOException("Invalid PTY journal record length=" + length);
+                        }
+                        input.readFully(bytes, 0, length);
+                        compatibility.appendJavaOnly(bytes, length);
+                        break;
+                    }
+                    case COMPATIBILITY_EVENT_RESIZE:
+                        compatibility.resize(input.readInt(), input.readInt(),
+                            input.readInt(), input.readInt());
+                        break;
+                    case COMPATIBILITY_EVENT_RESET:
+                        compatibility.resetJavaState();
+                        break;
+                    case COMPATIBILITY_EVENT_COLORS: {
+                        int count = input.readInt();
+                        if (count < 0 || count > compatibility.mColors.mCurrentColors.length) {
+                            throw new IOException("Invalid color journal count=" + count);
+                        }
+                        for (int index = 0; index < count; index++) {
+                            compatibility.mColors.mCurrentColors[index] = input.readInt();
+                        }
+                        break;
+                    }
+                    default:
+                        throw new IOException("Unknown compatibility journal event=" + type);
+                }
+            }
+        } catch (IOException error) {
+            throw new IllegalStateException("Failed to replay compatibility journal", error);
+        } finally {
+            deleteCompatibilityJournal(journal);
+        }
+    }
+
+    private void runCompatibilityReplayWorker() {
+        try {
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+            } catch (RuntimeException ignored) {
+                // Host JVM tests and restrictive devices may reject Android scheduling hints.
+            }
+
+            TerminalEmulator compatibility = new TerminalEmulator(
+                new CompatibilityOutput(), mInitialColumns, mInitialRows,
+                mInitialCellWidthPixels, mInitialCellHeightPixels,
+                mConfiguredTranscriptRows, mClient, false, true);
+            compatibility.mCursorStyle = mCursorStyle;
+            System.arraycopy(mInitialColors, 0, compatibility.mColors.mCurrentColors,
+                0, mInitialColors.length);
+            synchronized (mCompatibilityReplayLock) {
+                mCompatibilityEmulator = compatibility;
+                mCompatibilityReplayLock.notifyAll();
+            }
+
+            while (true) {
+                CompatibilityReplayBatch batch;
+                long queuedBytes;
+                synchronized (mCompatibilityReplayLock) {
+                    while (mCompatibilityReplayQueue.isEmpty() && !mCompatibilityReplayStop) {
+                        try {
+                            mCompatibilityReplayLock.wait();
+                        } catch (InterruptedException ignored) {
+                            // Stop state is checked under the same monitor.
+                        }
+                    }
+                    if (mCompatibilityReplayStop && mCompatibilityReplayQueue.isEmpty()) return;
+                    batch = mCompatibilityReplayQueue.removeFirst();
+                    queuedBytes = mCompatibilityReplayQueuedBytes;
+                }
+
+                try {
+                    Process.setThreadPriority(queuedBytes > MAX_COMPATIBILITY_REPLAY_BYTES * 2L
+                        ? Process.THREAD_PRIORITY_DEFAULT : Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (RuntimeException ignored) {
+                }
+
+                long started = System.nanoTime();
+                long workerThreadId = Thread.currentThread().getId();
+                String workerThreadName = Thread.currentThread().getName();
+                Trace.beginSection("TermuxJavaCheckpointParse");
+                boolean completed;
+                try {
+                    completed = replayCompatibilityJournal(batch.journal, compatibility);
+                    // Checkpoint construction is not a visible presentation. Only scroll edges
+                    // accepted by the live authority may move TerminalView's viewport.
+                    if (completed) {
+                        compatibility.clearScrollCounter();
+                        compatibility.clearFullRedrawRequired();
+                    }
+                } finally {
+                    Trace.endSection();
+                }
+                if (!completed) return;
+                long elapsed = Math.max(0L, System.nanoTime() - started);
+                String metrics = null;
+                synchronized (mCompatibilityReplayLock) {
+                    mCompatibilityReplayAppliedGeneration = batch.generation;
+                    mCompatibilityReplayQueuedBytes = Math.max(0L,
+                        mCompatibilityReplayQueuedBytes - batch.bytes);
+                    mCompatibilityReplayAppliedBytes += batch.bytes;
+                    mCompatibilityReplayAppliedBatches++;
+                    mCompatibilityReplayLastThreadId = workerThreadId;
+                    mCompatibilityReplayLastThreadName = workerThreadName;
+                    mCompatibilityReplayMaxBatchNanos = Math.max(
+                        mCompatibilityReplayMaxBatchNanos, elapsed);
+                    long now = System.nanoTime();
+                    if (now - mCompatibilityReplayLastLogNanos >=
+                        COMPATIBILITY_METRICS_LOG_INTERVAL_NANOS) {
+                        mCompatibilityReplayLastLogNanos = now;
+                        metrics = compatibilityCheckpointStatusLocked();
+                    }
+                    mCompatibilityReplayLock.notifyAll();
+                }
+                if (metrics != null) {
+                    Logger.logInfo(mClient, LOG_TAG, "compat-checkpoint-v1 " + metrics);
+                }
+            }
+        } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
+            synchronized (mCompatibilityReplayLock) {
+                mCompatibilityReplayFailure = error;
+                mCompatibilityReplayStop = true;
+                mCompatibilityReplayLock.notifyAll();
+            }
+            Logger.logStackTraceWithMessage(mClient, LOG_TAG,
+                "Compatibility checkpoint worker failed; stale Java state will not be shown",
+                error);
+        } finally {
+            synchronized (mCompatibilityReplayLock) {
+                if (mCompatibilityReplayThread == Thread.currentThread()) {
+                    mCompatibilityReplayThread = null;
+                }
+                mCompatibilityReplayLock.notifyAll();
+            }
+        }
+    }
+
+    private String compatibilityCheckpointStatusLocked() {
+        return "mode=disk-foreground-idle" +
+            " thresholdBytes=" + MAX_COMPATIBILITY_REPLAY_BYTES +
+            " pressureBytes=" + COMPATIBILITY_REPLAY_PRESSURE_BYTES +
+            " queued=" + mCompatibilityReplayQueuedBytes +
+            " highWater=" + mCompatibilityReplayHighWaterBytes +
+            " appliedBytes=" + mCompatibilityReplayAppliedBytes +
+            " batches=" + mCompatibilityReplayAppliedBatches +
+            " generation=" + mCompatibilityReplayAppliedGeneration + '/' +
+            mCompatibilityReplayEnqueuedGeneration +
+            " maxBatchUs=" + (mCompatibilityReplayMaxBatchNanos / 1000L) +
+            " deferredWaits=" + mCompatibilityReplayDeferredWaits +
+            " deferredUs=" + (mCompatibilityReplayDeferredNanos / 1000L) +
+            " urgent=" + mCompatibilityReplayUrgent +
+            " thread=" + mCompatibilityReplayLastThreadName + '#' +
+            mCompatibilityReplayLastThreadId;
+    }
+
+    public synchronized String getCompatibilityCheckpointStatusForDiagnostics() {
+        synchronized (mCompatibilityReplayLock) {
+            return compatibilityCheckpointStatusLocked() +
+                " activeBytes=" + mCompatibilityReplayBytes +
+                " activeJournal=" + (mCompatibilityJournalFile != null) +
+                " failed=" + (mCompatibilityReplayFailure != null);
+        }
+    }
+
+    private synchronized TerminalEmulator ensureCompatibilityCurrent() {
+        long targetGeneration = enqueueCompatibilityReplayBatch(
+            mCompatibilityEmulator == null && !mCompatibilityJournalHasEvents);
+        boolean interrupted = false;
+        TerminalEmulator compatibility;
+        synchronized (mCompatibilityReplayLock) {
+            // This API promises an exact, current Java terminal. It is the exceptional recovery
+            // path, so finish queued checkpoints immediately instead of observing the idle gate.
+            mCompatibilityReplayUrgent = true;
+            mCompatibilityReplayLock.notifyAll();
+            try {
+                while ((mCompatibilityEmulator == null ||
+                    mCompatibilityReplayAppliedGeneration < targetGeneration) &&
+                    mCompatibilityReplayFailure == null) {
+                    try {
+                        mCompatibilityReplayLock.wait();
+                    } catch (InterruptedException ignored) {
+                        interrupted = true;
+                    }
+                }
+                if (mCompatibilityReplayFailure != null) {
+                    throw new IllegalStateException(
+                        "Compatibility checkpoint is unavailable", mCompatibilityReplayFailure);
+                }
+                compatibility = mCompatibilityEmulator;
+            } finally {
+                mCompatibilityReplayUrgent = false;
+                mCompatibilityReplayLock.notifyAll();
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+        return compatibility;
+    }
+
+    synchronized void recordCompatibilityBytesForTesting(byte[] bytes) {
+        recordBytesForCompatibility(bytes, bytes.length);
+    }
+
+    synchronized void recordCompatibilityResizeForTesting(int columns, int rows,
+                                                          int cellWidth, int cellHeight) {
+        recordResizeForCompatibility(columns, rows, cellWidth, cellHeight);
+    }
+
+    synchronized void sealCompatibilityCheckpointForTesting() {
+        enqueueCompatibilityReplayBatch(false);
+    }
+
+    synchronized TerminalEmulator awaitCompatibilityCheckpointForTesting() {
+        return ensureCompatibilityCurrent();
+    }
+
+    private void stopCompatibilityReplayWorker(boolean discardPending) {
+        if (discardPending) {
+            closeCompatibilityJournalOutput();
+            deleteCompatibilityJournal(mCompatibilityJournalFile);
+            mCompatibilityJournalFile = null;
+            mCompatibilityJournalHasEvents = false;
+            mCompatibilityReplayBytes = 0L;
+        }
+        Thread worker;
+        synchronized (mCompatibilityReplayLock) {
+            mCompatibilityReplayStop = true;
+            if (discardPending) {
+                for (CompatibilityReplayBatch batch : mCompatibilityReplayQueue) {
+                    deleteCompatibilityJournal(batch.journal);
+                }
+                mCompatibilityReplayQueue.clear();
+                mCompatibilityReplayQueuedBytes = 0L;
+            }
+            worker = mCompatibilityReplayThread;
+            mCompatibilityReplayLock.notifyAll();
+        }
+        if (worker != null && worker != Thread.currentThread()) worker.interrupt();
+    }
+
+    private synchronized void activateCompatibilityFallback(String reason) {
+        TerminalEmulator compatibility = ensureCompatibilityCurrent();
+        compatibility.mScrollSignal.set(mScrollSignal.getAndSet(1L));
+        mCompatibilityReplayInProgress = false;
+        mCompatibilityFallback = true;
+        stopCompatibilityReplayWorker(false);
+        // Keep the closed wrapper reachable until final disposal. A UI thread may have obtained
+        // this Java reference immediately before the authority transition; all backend methods
+        // safely return failure after close(), avoiding a null-dereference race.
+        GhosttyTerminalBackend retiredBackend = mGhosttyBackend;
+        if (retiredBackend != null) retiredBackend.close();
+        mGhosttyState = null;
+        mColumns = compatibility.mColumns;
+        mRows = compatibility.mRows;
+        mCellWidthPixels = compatibility.mCellWidthPixels;
+        mCellHeightPixels = compatibility.mCellHeightPixels;
+        System.arraycopy(compatibility.mColors.mCurrentColors, 0, mColors.mCurrentColors, 0,
+            mColors.mCurrentColors.length);
+        mFullRedrawRequired.set(true);
+        Logger.logWarn(mClient, LOG_TAG,
+            "Ghostty authority disabled; Java state restored from PTY journal: " + reason);
+    }
+
+    public synchronized void updateTerminalSessionClient(TerminalSessionClient client) {
         mClient = client;
         setCursorStyle();
         setCursorBlinkState(true);
     }
 
     public TerminalBuffer getScreen() {
+        if (hasGhosttyAuthority()) return ensureCompatibilityCurrent().getScreen();
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getScreen();
+        }
         return mScreen;
     }
 
     public boolean isAlternateBufferActive() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.alternateScreen;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isAlternateBufferActive();
+        }
         return mScreen == mAltBuffer;
+    }
+
+    public int getActiveTranscriptRows() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            int configuredHistory = Math.max(0, mConfiguredTranscriptRows - mRows);
+            return Math.min(mGhosttyState.scrollbackRows, configuredHistory);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getActiveTranscriptRows();
+        }
+        return mScreen.getActiveTranscriptRows();
+    }
+
+    public int getActiveRows() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mRows + getActiveTranscriptRows();
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getActiveRows();
+        }
+        return mScreen.getActiveRows();
+    }
+
+    /** Viewport row selected atomically by libghostty-vt's tracked resize anchor. */
+    public synchronized int getGhosttyViewportTopRow() {
+        return hasGhosttyAuthority() && mGhosttyBackend != null
+            ? mGhosttyBackend.viewportTopRow() : 0;
+    }
+
+    /** 0=unavailable, 1=exact, 2=clamped at the history/live boundary. */
+    public synchronized int getGhosttyResizeAnchorOutcome() {
+        return hasGhosttyAuthority() && mGhosttyBackend != null
+            ? mGhosttyBackend.lastResizeAnchorOutcome() : 0;
+    }
+
+    public synchronized String getGhosttyResizeAnchorStatusForDiagnostics() {
+        return hasGhosttyAuthority() && mGhosttyBackend != null
+            ? mGhosttyBackend.resizeAnchorStatus() : "authority=java outcome=0";
+    }
+
+    public synchronized boolean isGhosttyResizeAnchorCommitValidForDiagnostics() {
+        return hasGhosttyAuthority() && mGhosttyBackend != null &&
+            mGhosttyBackend.lastResizeAnchorCommitValid();
+    }
+
+    public long getContentRevision() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.generation;
+        return getScreen().getContentRevision();
+    }
+
+    public int getCurrentForegroundColor() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.foregroundColor;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_FOREGROUND];
+        }
+        return mColors.mCurrentColors[TextStyle.COLOR_INDEX_FOREGROUND];
+    }
+
+    public int getCurrentBackgroundColor() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.backgroundColor;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND];
+        }
+        return mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND];
+    }
+
+    public synchronized void onDefaultColorsChanged() {
+        if (hasGhosttyAuthority()) {
+            int[] colors = mColors.mCurrentColors.clone();
+            recordColorsForCompatibility(colors);
+            if (!mGhosttyBackend.setColors(colors)) {
+                activateCompatibilityFallback("native palette update failure");
+                return;
+            }
+            mGhosttyState = mGhosttyBackend.state();
+            mFullRedrawRequired.set(true);
+        } else if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            System.arraycopy(mColors.mCurrentColors, 0,
+                mCompatibilityEmulator.mColors.mCurrentColors, 0,
+                mColors.mCurrentColors.length);
+        }
     }
 
     private int getTerminalTranscriptRows(Integer transcriptRows) {
@@ -392,15 +1245,55 @@ public final class TerminalEmulator {
     /**
      * @param mouseButton one of the MOUSE_* constants of this class.
      */
+    public byte[] encodeKey(int androidKeyCode, int keyModifiers, int action) {
+        return hasGhosttyAuthority()
+            ? mGhosttyBackend.encodeKey(androidKeyCode, keyModifiers, action)
+            : null;
+    }
+
+    public byte[] encodeCodePoint(int codePoint, boolean controlDown, boolean altDown) {
+        int modifiers = 0;
+        if (controlDown) modifiers |= KeyHandler.KEYMOD_CTRL;
+        if (altDown) modifiers |= KeyHandler.KEYMOD_ALT;
+        int unshifted = codePoint >= 'A' && codePoint <= 'Z' ? codePoint - 'A' + 'a' : codePoint;
+        return encodeCodePoint(0, 1, codePoint, unshifted, modifiers);
+    }
+
+    public byte[] encodeCodePoint(int androidKeyCode, int action, int codePoint,
+                                  int unshiftedCodePoint, int keyModifiers) {
+        if (!hasGhosttyAuthority() || action < 0 || action > 2 ||
+            !Character.isValidCodePoint(codePoint) ||
+            (codePoint >= Character.MIN_SURROGATE && codePoint <= Character.MAX_SURROGATE)) {
+            return null;
+        }
+        int unshifted = unshiftedCodePoint;
+        if (!Character.isValidCodePoint(unshifted) ||
+            (unshifted >= Character.MIN_SURROGATE && unshifted <= Character.MAX_SURROGATE)) {
+            unshifted = codePoint >= 'A' && codePoint <= 'Z'
+                ? codePoint - 'A' + 'a' : codePoint;
+        }
+        return mGhosttyBackend.encodeText(
+            new String(Character.toChars(codePoint)), androidKeyCode, action,
+            unshifted, keyModifiers);
+    }
+
     public void sendMouseEvent(int mouseButton, int column, int row, boolean pressed) {
         if (column < 1) column = 1;
         if (column > mColumns) column = mColumns;
         if (row < 1) row = 1;
         if (row > mRows) row = mRows;
 
-        if (mouseButton == MOUSE_LEFT_BUTTON_MOVED && !isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT)) {
+        if (hasGhosttyAuthority()) {
+            byte[] encoded = mGhosttyBackend.encodeMouse(mouseButton, column, row, pressed);
+            if (encoded != null) {
+                if (encoded.length > 0) mSession.write(encoded, 0, encoded.length);
+                return;
+            }
+        }
+
+        if (mouseButton == MOUSE_LEFT_BUTTON_MOVED && !isMouseMotionTrackingActive()) {
             // Do not send tracking.
-        } else if (isDecsetInternalBitSet(DECSET_BIT_MOUSE_PROTOCOL_SGR)) {
+        } else if (isMouseSgrProtocolActive()) {
             mSession.write(String.format("\033[<%d;%d;%d" + (pressed ? 'M' : 'm'), mouseButton, column, row));
         } else {
             mouseButton = pressed ? mouseButton : 3; // 3 for release of all buttons.
@@ -413,9 +1306,45 @@ public final class TerminalEmulator {
         }
     }
 
-    public void resize(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
+    public synchronized void resize(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
+        resize(columns, rows, cellWidthPixels, cellHeightPixels, 0, -1, -1, -1);
+    }
+
+    public synchronized void resize(int columns, int rows, int cellWidthPixels, int cellHeightPixels,
+                                    int viewportTopRow, int anchorColumn,
+                                    int anchorViewportRow, int targetViewportRow) {
+        if (mGhosttyBackend != null && !GhosttyTerminalBackend.isProductionEnabled() &&
+            !mReplayOnly && !mCompatibilityFallback) {
+            activateCompatibilityFallback("process kill switch");
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.resize(columns, rows, cellWidthPixels, cellHeightPixels);
+            mColumns = mCompatibilityEmulator.mColumns;
+            mRows = mCompatibilityEmulator.mRows;
+            mCellWidthPixels = cellWidthPixels;
+            mCellHeightPixels = cellHeightPixels;
+            mFullRedrawRequired.set(true);
+            return;
+        }
+
         this.mCellWidthPixels = cellWidthPixels;
         this.mCellHeightPixels = cellHeightPixels;
+        final boolean ghosttyAuthority = hasGhosttyAuthority();
+        final int visibleScrollbackRows = Math.max(0, mConfiguredTranscriptRows - rows);
+        if (ghosttyAuthority) {
+            recordResizeForCompatibility(columns, rows, cellWidthPixels, cellHeightPixels);
+            if (!mGhosttyBackend.resize(columns, rows, cellWidthPixels, cellHeightPixels,
+                viewportTopRow, anchorColumn, anchorViewportRow, targetViewportRow,
+                visibleScrollbackRows)) {
+                activateCompatibilityFallback("native resize failure");
+                return;
+            }
+            mGhosttyState = mGhosttyBackend.state();
+        } else if (mGhosttyBackend != null) {
+            mGhosttyBackend.resize(columns, rows, cellWidthPixels, cellHeightPixels,
+                0, -1, -1, -1, visibleScrollbackRows);
+            mGhosttyState = mGhosttyBackend.state();
+        }
 
         if (mRows == rows && mColumns == columns) {
             return;
@@ -440,8 +1369,45 @@ public final class TerminalEmulator {
             mRightMargin = mColumns;
         }
 
-        resizeScreen();
-        mFullRedrawRequired = true;
+        if (shouldReflowDormantJavaScreen(ghosttyAuthority)) {
+            resizeScreen();
+        } else {
+            // Ghostty has already performed the authoritative reflow above. The owner Java parser
+            // is dormant in production mode; an independently journaled compatibility emulator is
+            // rebuilt off-thread and becomes the only Java screen if fallback is activated.
+            // Reflowing this stale owner buffer as well doubled grid-resize work during live pinch.
+            mGhosttyDormantJavaResizeSkips++;
+        }
+        mFullRedrawRequired.set(true);
+    }
+
+    static boolean shouldReflowDormantJavaScreen(boolean ghosttyAuthority) {
+        return !ghosttyAuthority;
+    }
+
+    public synchronized String getGhosttyResizeStatusForDiagnostics() {
+        return "authority=" + (hasGhosttyAuthority() ? "ghostty" : "java") +
+            " dormantJavaResizeSkips=" + mGhosttyDormantJavaResizeSkips +
+            " grid=" + mColumns + 'x' + mRows +
+            " cell=" + mCellWidthPixels + 'x' + mCellHeightPixels;
+    }
+
+    public synchronized long getGhosttyDormantJavaResizeSkipsForDiagnostics() {
+        return mGhosttyDormantJavaResizeSkips;
+    }
+
+    public synchronized int getCellWidthPixelsForDiagnostics() {
+        return mCellWidthPixels;
+    }
+
+    public synchronized int getCellHeightPixelsForDiagnostics() {
+        return mCellHeightPixels;
+    }
+
+    synchronized boolean hasExactGeometry(int columns, int rows,
+                                          int cellWidthPixels, int cellHeightPixels) {
+        return mColumns == columns && mRows == rows &&
+            mCellWidthPixels == cellWidthPixels && mCellHeightPixels == cellHeightPixels;
     }
 
     private void resizeScreen() {
@@ -453,38 +1419,78 @@ public final class TerminalEmulator {
     }
 
     public int getCursorRow() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.cursorRow;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getCursorRow();
+        }
         return mCursorRow;
     }
 
     public int getCursorCol() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.cursorColumn;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getCursorCol();
+        }
         return mCursorCol;
     }
 
     /** Get the terminal cursor style. It will be one of {@link #TERMINAL_CURSOR_STYLES_LIST} */
     public int getCursorStyle() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.cursorStyle;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getCursorStyle();
+        }
         return mCursorStyle;
     }
 
     /** Set the terminal cursor style. */
-    public void setCursorStyle() {
+    public synchronized void setCursorStyle() {
         Integer cursorStyle = null;
 
-        if (mClient != null)
+        // A compatibility checkpoint may be built on the dedicated PTY parser after native
+        // failure. Never invoke application preference/UI clients from that worker; the owning
+        // emulator copies its already-resolved cursor style into the replay emulator.
+        if (mReplayOnly) {
+            cursorStyle = mCursorStyle;
+        } else if (mClient != null) {
             cursorStyle = mClient.getTerminalCursorStyle();
+        }
 
         if (cursorStyle == null || !Arrays.asList(TERMINAL_CURSOR_STYLES_LIST).contains(cursorStyle))
             mCursorStyle = DEFAULT_TERMINAL_CURSOR_STYLE;
         else
             mCursorStyle = cursorStyle;
+
+        if (mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.mCursorStyle = mCursorStyle;
+        }
+        if (hasGhosttyAuthority()) {
+            if (!mGhosttyBackend.setDefaultCursorStyle(mCursorStyle)) {
+                activateCompatibilityFallback("native cursor style update failure");
+            } else {
+                mGhosttyState = mGhosttyBackend.state();
+                mFullRedrawRequired.set(true);
+            }
+        }
     }
 
     public boolean isReverseVideo() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_REVERSE_VIDEO);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isReverseVideo();
+        }
         return isDecsetInternalBitSet(DECSET_BIT_REVERSE_VIDEO);
     }
 
 
 
     public boolean isCursorEnabled() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) return mGhosttyState.cursorVisible;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isCursorEnabled();
+        }
         return isDecsetInternalBitSet(DECSET_BIT_CURSOR_ENABLED);
     }
     public boolean shouldCursorBeVisible() {
@@ -505,29 +1511,94 @@ public final class TerminalEmulator {
 
 
     public boolean isKeypadApplicationMode() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_KEYPAD);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isKeypadApplicationMode();
+        }
         return isDecsetInternalBitSet(DECSET_BIT_APPLICATION_KEYPAD);
     }
 
     public boolean isCursorKeysApplicationMode() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_CURSOR_KEYS);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isCursorKeysApplicationMode();
+        }
         return isDecsetInternalBitSet(DECSET_BIT_APPLICATION_CURSOR_KEYS);
     }
 
     /** If mouse events are being sent as escape codes to the terminal. */
     public boolean isMouseTrackingActive() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_MOUSE);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isMouseTrackingActive();
+        }
         return isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_PRESS_RELEASE) || isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT);
     }
 
+    private boolean isMouseMotionTrackingActive() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_MOUSE_MOTION);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isMouseMotionTrackingActive();
+        }
+        return isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT);
+    }
+
+    private boolean isMouseSgrProtocolActive() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_MOUSE_SGR);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isMouseSgrProtocolActive();
+        }
+        return isDecsetInternalBitSet(DECSET_BIT_MOUSE_PROTOCOL_SGR);
+    }
+
     public boolean shouldSendFocusEvents() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_FOCUS);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.shouldSendFocusEvents();
+        }
         return isDecsetInternalBitSet(DECSET_BIT_SEND_FOCUS_EVENTS);
     }
 
     /** Whether the child process has suspended visible updates with DECSET 2026. */
     public boolean isSynchronizedOutputActive() {
+        if (hasGhosttyAuthority() && mGhosttyState != null) {
+            return mGhosttyState.mode(GhosttyTerminalBackend.MODE_SYNC_OUTPUT);
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isSynchronizedOutputActive();
+        }
         return isDecsetInternalBitSet(DECSET_BIT_SYNCHRONIZED_OUTPUT);
     }
 
     /** Release a synchronized update that exceeded the presentation timeout. */
-    void forceFinishSynchronizedOutput() {
+    synchronized void forceFinishSynchronizedOutput() {
+        if (hasGhosttyAuthority()) {
+            byte[] syncOff = {0x1b, '[', '?', '2', '0', '2', '6', 'l'};
+            recordBytesForCompatibility(syncOff, syncOff.length);
+            if (!mGhosttyBackend.setMode(2026, false)) {
+                activateCompatibilityFallback("synchronized-output release failure");
+                return;
+            }
+            mGhosttyState = mGhosttyBackend.state();
+            mFullRedrawRequired.set(true);
+            return;
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.forceFinishSynchronizedOutput();
+            return;
+        }
         finishSynchronizedOutput();
         setDecsetinternalBit(DECSET_BIT_SYNCHRONIZED_OUTPUT, false);
     }
@@ -568,6 +1639,13 @@ public final class TerminalEmulator {
 
     public void onHostWindowFocusChanged(boolean hasFocus) {
         if (!shouldSendFocusEvents()) return;
+        if (hasGhosttyAuthority()) {
+            byte[] encoded = mGhosttyBackend.encodeFocus(hasFocus);
+            if (encoded != null) {
+                if (encoded.length > 0) mSession.write(encoded, 0, encoded.length);
+                return;
+            }
+        }
         mSession.write(hasFocus ? "\033[I" : "\033[O");
     }
 
@@ -577,28 +1655,149 @@ public final class TerminalEmulator {
     }
 
     /**
-     * Accept bytes (typically from the pseudo-teletype) and process them.
+     * Atomically accept one PTY chunk for the off-main Ghostty parser.
      *
      * @param buffer a byte array containing the bytes to be processed
      * @param length the number of bytes in the array to process
+     * @return true when this chunk was consumed by Ghostty (including a fallback triggered during
+     *         the write), false when the caller must enqueue it for the main-thread Java parser.
      */
-    public void append(byte[] buffer, int length) {
+    synchronized boolean appendPtyFromWorker(byte[] buffer, int length) {
+        if (buffer == null || length < 0 || length > buffer.length) {
+            throw new IllegalArgumentException("Invalid terminal input length=" + length);
+        }
+        if (length == 0) return true;
+        if (!hasGhosttyAuthority()) return false;
+        // Keep the trace boundary inside the authority check. This makes the marker evidentiary:
+        // a Java-fallback chunk can never be reported as a Ghostty parse merely because it passed
+        // through the session router.
+        Trace.beginSection("TermuxGhosttyPtyParse");
+        try {
+            append(buffer, length);
+            return true;
+        } finally {
+            Trace.endSection();
+        }
+    }
+
+    public synchronized void append(byte[] buffer, int length) {
+        if (buffer == null || length < 0 || length > buffer.length) {
+            throw new IllegalArgumentException("Invalid terminal input length=" + length);
+        }
+        if (length == 0) return;
+
+        if (mGhosttyBackend != null && !GhosttyTerminalBackend.isProductionEnabled() &&
+            !mReplayOnly && !mCompatibilityFallback) {
+            activateCompatibilityFallback("process kill switch");
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.appendJavaOnly(buffer, length);
+            return;
+        }
+        if (hasGhosttyAuthority()) {
+            int oldScrollback = mGhosttyState == null ? 0 : mGhosttyState.scrollbackRows;
+            recordBytesForCompatibility(buffer, length);
+            if (!mGhosttyBackend.write(buffer, length)) {
+                activateCompatibilityFallback("native write failure");
+                return;
+            }
+            if (!GhosttyTerminalBackend.isProductionEnabled() && !mReplayOnly) {
+                activateCompatibilityFallback("OSC 8900 process kill switch");
+                return;
+            }
+            GhosttyTerminalBackend.State nextState = mGhosttyBackend.state();
+            if (nextState != null) {
+                int scrolled = Math.max(0, nextState.scrollbackRows - oldScrollback);
+                if (scrolled > 0) {
+                    recordScroll(scrolled, true);
+                }
+                mColors.mCurrentColors[TextStyle.COLOR_INDEX_FOREGROUND] =
+                    nextState.foregroundColor;
+                mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND] =
+                    nextState.backgroundColor;
+                mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] =
+                    nextState.cursorColor;
+            }
+            // Volatile publication comes after all related counters and palette writes.
+            mGhosttyState = nextState;
+            return;
+        }
+        if (mGhosttyBackend != null) {
+            mGhosttyBackend.write(buffer, length);
+            mGhosttyState = mGhosttyBackend.state();
+        }
+        appendJavaOnly(buffer, length);
+    }
+
+    private void appendJavaOnly(byte[] buffer, int length) {
+        int rangeCount = TerminalNativeAccelerator.scanAsciiRuns(
+            buffer, length, mAsciiRunStorage, mAsciiRunScratch);
+        boolean nativeClassified = mAsciiRunScratch.get(0) >= 0;
+        int nativeEmittedBytes = appendWithAsciiRuns(buffer, length, rangeCount, nativeClassified);
+        if (nativeClassified) {
+            mNativeAsciiScanCalls++;
+            mNativeAsciiScanBytes += length;
+            mNativeAsciiRangeCount += rangeCount;
+            mNativeAsciiEmittedBytes += nativeEmittedBytes;
+        }
+    }
+
+    /** JVM-testable oracle for the NDK whole-chunk classifier integration. */
+    void appendWithScalarAsciiClassifierForTesting(byte[] buffer, int length) {
+        disableGhosttyForJavaReferenceTesting();
+        int rangeCount = TerminalNativeAccelerator.scanAsciiRunsScalar(buffer, length, mAsciiRunScratch);
+        appendWithAsciiRuns(buffer, length, rangeCount, true);
+    }
+
+    private int appendWithAsciiRuns(byte[] buffer, int length, int rangeCount, boolean classified) {
+        int rangeIndex = 0;
+        int classifiedRunBytes = 0;
+        int classifiedUntil = classified ? mAsciiRunScratch.get(0) : 0;
         for (int i = 0; i < length; ) {
-            int asciiRunLength = findSafeAsciiRun(buffer, i, length);
+            while (rangeIndex < rangeCount && i >= mAsciiRunScratch.get(2 + rangeIndex * 2)) {
+                rangeIndex++;
+            }
+
+            int asciiRunLength = 0;
+            boolean fromClassifiedRange = rangeIndex < rangeCount &&
+                i >= mAsciiRunScratch.get(1 + rangeIndex * 2) &&
+                i < mAsciiRunScratch.get(2 + rangeIndex * 2);
+            if (fromClassifiedRange && canEmitSafeAsciiRun()) {
+                asciiRunLength = Math.min(
+                    mAsciiRunScratch.get(2 + rangeIndex * 2) - i,
+                    mRightMargin - 1 - mCursorCol
+                );
+            } else if (!classified || i >= classifiedUntil) {
+                // Native scratch capacity can be exhausted by deliberately alternating bytes.
+                // Resume the existing semantic fast path for the unclassified suffix.
+                asciiRunLength = findSafeAsciiRun(buffer, i, length);
+            }
             if (asciiRunLength > 0 && emitSafeAsciiRun(buffer, i, asciiRunLength)) {
+                if (fromClassifiedRange) classifiedRunBytes += asciiRunLength;
                 i += asciiRunLength;
                 continue;
             }
             processByte(buffer[i]);
             i++;
         }
+        return classifiedRunBytes;
     }
 
     /** Scalar parser used by differential tests as the semantic reference for batch fast paths. */
     void appendByteWiseForTesting(byte[] buffer, int length) {
+        disableGhosttyForJavaReferenceTesting();
         for (int i = 0; i < length; i++) {
             processByte(buffer[i]);
         }
+    }
+
+    private void disableGhosttyForJavaReferenceTesting() {
+        if (mGhosttyBackend != null) {
+            mGhosttyBackend.close();
+            mGhosttyBackend = null;
+            mGhosttyState = null;
+        }
+        stopCompatibilityReplayWorker(true);
     }
 
     private int findSafeAsciiRun(byte[] buffer, int offset, int length) {
@@ -810,7 +2009,7 @@ public final class TerminalEmulator {
                         break;
                     case ESC_CSI_EXCLAMATION:
                         if (b == 'p') { // Soft terminal reset (DECSTR, http://vt100.net/docs/vt510-rm/DECSTR).
-                            reset();
+                            resetJavaState();
                         } else {
                             unknownSequence(b);
                         }
@@ -1355,7 +2554,7 @@ public final class TerminalEmulator {
             case 4: // DECSCLM-Scrolling Mode. Ignore.
                 break;
             case 5: // Reverse video. Colors of the entire viewport change.
-                mFullRedrawRequired = true;
+                mFullRedrawRequired.set(true);
                 break;
             case 6: // Set: Origin Mode. Reset: Normal Cursor Mode. Ansi name: DECOM.
                 if (setting) setCursorPosition(0, 0);
@@ -1366,7 +2565,9 @@ public final class TerminalEmulator {
             case 12: // Control cursor blinking - ignore.
             case 25: // Hide/show cursor - no action needed, renderer will check with shouldCursorBeVisible().
                 if (mClient != null)
-                    mClient.onTerminalCursorStateChange(setting);
+                    if (!mReplayOnly && mClient != null) {
+                        mClient.onTerminalCursorStateChange(setting);
+                    }
                 break;
             case 40: // Allow 80 => 132 Mode, ignore.
             case 45: // TODO: Reverse wrap-around. Implement???
@@ -1419,7 +2620,7 @@ public final class TerminalEmulator {
                     // Clear new screen if alt buffer:
                     if (newScreen == mAltBuffer)
                         newScreen.blockSet(0, 0, mColumns, mRows, ' ', getStyle());
-                    mFullRedrawRequired = true;
+                    mFullRedrawRequired.set(true);
                 }
                 break;
             }
@@ -1592,7 +2793,7 @@ public final class TerminalEmulator {
                 }
                 break;
             case 'c': // RIS - Reset to Initial State (http://vt100.net/docs/vt510-rm/RIS).
-                reset();
+                resetJavaState();
                 mMainBuffer.clearTranscript();
                 blockClear(0, 0, mColumns, mRows);
                 setCursorPosition(0, 0);
@@ -2400,6 +3601,16 @@ public final class TerminalEmulator {
         }
 
         if (command.isEmpty()) return;
+        if (HOST_CONTROL_TERMINAL_BACKEND.equals(command) &&
+            "java".equalsIgnoreCase(argument)) {
+            // The callback can run while libghostty-vt owns its mutex. Flip only the process-wide
+            // gate here; the next backend access performs the journal replay and closes native
+            // resources after the native write has returned.
+            GhosttyTerminalBackend.setProductionEnabled(false);
+            Logger.logWarn(mClient, LOG_TAG,
+                "One-click terminal rollback requested through OSC 8900; switching to Java");
+            return;
+        }
         mSession.onTerminalHostControlCommand(command, argument.isEmpty() ? null : argument);
     }
 
@@ -2420,8 +3631,7 @@ public final class TerminalEmulator {
 
     private void scrollDownOneLine() {
         boolean fullScreenScroll = mTopMargin == 0 && mBottomMargin == mRows && mLeftMargin == 0 && mRightMargin == mColumns;
-        mScrollCounterFullScreen &= fullScreenScroll;
-        mScrollCounter++;
+        recordScroll(1, fullScreenScroll);
         long currentStyle = getStyle();
         if (mLeftMargin != 0 || mRightMargin != mColumns) {
             // Horizontal margin: Do not put anything into scroll history, just non-margin part of screen up.
@@ -2736,25 +3946,71 @@ public final class TerminalEmulator {
         mAboutToAutoWrap = false;
     }
 
+    private void recordScroll(int count, boolean fullScreen) {
+        if (count <= 0) return;
+        while (true) {
+            long current = mScrollSignal.get();
+            int currentCount = (int) Math.min(Integer.MAX_VALUE, current >>> 1);
+            int nextCount = (int) Math.min(Integer.MAX_VALUE, (long) currentCount + count);
+            boolean currentFullScreen = (current & 1L) != 0L;
+            boolean nextFullScreen = currentCount == 0
+                ? fullScreen : currentFullScreen && fullScreen;
+            long next = ((long) nextCount << 1) | (nextFullScreen ? 1L : 0L);
+            if (mScrollSignal.compareAndSet(current, next)) return;
+        }
+    }
+
     public int getScrollCounter() {
-        return mScrollCounter;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getScrollCounter();
+        }
+        return (int) Math.min(Integer.MAX_VALUE, mScrollSignal.get() >>> 1);
     }
 
     public boolean isScrollCounterFullScreen() {
-        return mScrollCounterFullScreen;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.isScrollCounterFullScreen();
+        }
+        return (mScrollSignal.get() & 1L) != 0L;
+    }
+
+    /** Consume every scroll accepted before this atomic exchange without losing a concurrent one. */
+    public int consumeScrollCounter() {
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.consumeScrollCounter();
+        }
+        return (int) Math.min(Integer.MAX_VALUE, mScrollSignal.getAndSet(1L) >>> 1);
     }
 
     public void clearScrollCounter() {
-        mScrollCounter = 0;
-        mScrollCounterFullScreen = true;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.clearScrollCounter();
+        }
+        mScrollSignal.set(1L);
     }
 
     public boolean isFullRedrawRequired() {
-        return mFullRedrawRequired;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mFullRedrawRequired.get() ||
+                mCompatibilityEmulator.isFullRedrawRequired();
+        }
+        return mFullRedrawRequired.get();
+    }
+
+    /** Consume the redraw edge atomically so a simultaneous PTY publication survives. */
+    public boolean consumeFullRedrawRequired() {
+        boolean required = mFullRedrawRequired.getAndSet(false);
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            required |= mCompatibilityEmulator.consumeFullRedrawRequired();
+        }
+        return required;
     }
 
     public void clearFullRedrawRequired() {
-        mFullRedrawRequired = false;
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.clearFullRedrawRequired();
+        }
+        mFullRedrawRequired.set(false);
     }
 
     public boolean isAutoScrollDisabled() {
@@ -2767,7 +4023,31 @@ public final class TerminalEmulator {
 
 
     /** Reset terminal state so user can interact with it regardless of present state. */
-    public void reset() {
+    public synchronized void reset() {
+        if (mGhosttyBackend != null && !GhosttyTerminalBackend.isProductionEnabled() &&
+            !mReplayOnly && !mCompatibilityFallback) {
+            activateCompatibilityFallback("process kill switch");
+        }
+        if (hasGhosttyAuthority()) {
+            recordResetForCompatibility();
+            if (!mGhosttyBackend.softReset()) {
+                activateCompatibilityFallback("native soft reset failure");
+                return;
+            }
+            mGhosttyState = mGhosttyBackend.state();
+            setCursorStyle();
+            mFullRedrawRequired.set(true);
+            return;
+        }
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.resetJavaState();
+            return;
+        }
+        if (mGhosttyBackend != null) mGhosttyBackend.softReset();
+        resetJavaState();
+    }
+
+    private void resetJavaState() {
         if (isSynchronizedOutputActive()) forceFinishSynchronizedOutput();
         setCursorStyle();
         mArgIndex = 0;
@@ -2802,12 +4082,285 @@ public final class TerminalEmulator {
         mSession.onColorsChanged();
     }
 
+    GhosttyTerminalBackend.Snapshot getGhosttySnapshotForDiagnostics() {
+        return mGhosttyBackend == null ? null : mGhosttyBackend.snapshot();
+    }
+
+    /** Return an owned Ghostty viewport packet for diagnostics or external synchronous consumers. */
+    public GhosttyRenderSnapshot getGhosttyRenderSnapshot(int topRow) {
+        if (!hasGhosttyAuthority()) return null;
+        GhosttyTerminalBackend backend = mGhosttyBackend;
+        return backend == null ? null : backend.renderSnapshotCopy(topRow);
+    }
+
+    /** Decode the reusable native render packet while excluding only competing render requests. */
+    public <T> T decodeGhosttyRenderSnapshot(int topRow, GhosttyRenderDecoder<T> decoder) {
+        if (!hasGhosttyAuthority() || decoder == null) return null;
+        GhosttyTerminalBackend backend = mGhosttyBackend;
+        if (backend == null) return null;
+        return backend.decodeRenderSnapshot(topRow, decoder::decode);
+    }
+
+    /** Decode only rows changed since the prior successful native render packet. */
+    public <T> T decodeGhosttyRenderDelta(int topRow, boolean forceFull,
+                                          GhosttyRenderDeltaDecoder<T> decoder) {
+        if (!hasGhosttyAuthority() || decoder == null) return null;
+        GhosttyTerminalBackend backend = mGhosttyBackend;
+        if (backend == null) return null;
+        return backend.decodeRenderDelta(topRow, forceFull, decoder::decode);
+    }
+
+    public interface GhosttyRenderDecoder<T> {
+        T decode(GhosttyRenderSnapshot snapshot);
+    }
+
+    public interface GhosttyRenderDeltaDecoder<T> {
+        T decode(GhosttyRenderDelta delta);
+    }
+
+    public boolean isGhosttyRenderAuthorityActive() {
+        return hasGhosttyAuthority();
+    }
+
+    /**
+     * Return whether the native authority can still produce bulk render packets.
+     *
+     * <p>Parsing and rendering deliberately share one authority. A terminal whose parser keeps
+     * advancing while rendering is permanently unavailable cannot safely display the dormant Java
+     * screen, so callers must transition through {@link #activateGhosttyRenderFallback(String)}
+     * instead of silently drawing stale compatibility state.</p>
+     */
+    public boolean isGhosttyRenderBackendHealthy() {
+        if (!hasGhosttyAuthority()) return false;
+        GhosttyTerminalBackend backend = mGhosttyBackend;
+        return backend != null && backend.isRenderHealthy();
+    }
+
+    /** Recreate only Ghostty's derived render state; parser, grids, and scrollback remain live. */
+    public boolean recoverGhosttyRenderBackend(String reason) {
+        if (!hasGhosttyAuthority()) return false;
+        GhosttyTerminalBackend backend = mGhosttyBackend;
+        if (backend == null || !backend.recoverRender()) return false;
+        mFullRedrawRequired.set(true);
+        Logger.logWarn(mClient, LOG_TAG, "Ghostty render state recovered in place: " +
+            (reason == null ? "unknown" : reason));
+        return true;
+    }
+
+    /**
+     * Atomically restore the journaled Java terminal after a production render failure.
+     *
+     * @return {@code true} only when this call performed the authority transition.
+     */
+    public synchronized boolean activateGhosttyRenderFallback(String reason) {
+        if (!hasGhosttyAuthority()) return false;
+        activateCompatibilityFallback("render pipeline failure: " +
+            (reason == null || reason.isEmpty() ? "unknown" : reason));
+        return true;
+    }
+
+    public boolean isGhosttyParserAuthorityActive() {
+        return hasGhosttyAuthority();
+    }
+
+    public String getGhosttyRenderStatusForDiagnostics() {
+        return mGhosttyBackend == null ? "backend-unavailable" : mGhosttyBackend.renderStatus();
+    }
+
+    /** Process-wide kill switch. Existing views fall back immediately; new sessions skip Ghostty. */
+    public static void setGhosttyProductionEnabled(boolean enabled) {
+        GhosttyTerminalBackend.setProductionEnabled(enabled);
+    }
+
+    synchronized void releaseNativeResources() {
+        stopCompatibilityReplayWorker(true);
+        if (mGhosttyBackend != null) {
+            mGhosttyBackend.close();
+            mGhosttyBackend = null;
+            mGhosttyState = null;
+        }
+        if (mCompatibilityEmulator != null) {
+            mCompatibilityEmulator.releaseNativeResources();
+        }
+    }
+
     public String getSelectedText(int x1, int y1, int x2, int y2) {
-        return mScreen.getSelectedText(x1, y1, x2, y2);
+        if (hasGhosttyAuthority()) {
+            String value = mGhosttyBackend.formatRange(x1, y1, x2, y2, true);
+            if (value != null) return value;
+        }
+        return getScreen().getSelectedText(x1, y1, x2, y2);
+    }
+
+    /** Derive the initial long-press word range without materializing the Java replay buffer. */
+    public int[] getWordBounds(int column, int row) {
+        int safeColumn = clampSelection(column, 0, Math.max(0, mColumns - 1));
+        int safeRow = clampSelection(row, -getActiveTranscriptRows(), Math.max(0, mRows - 1));
+        if (hasGhosttyAuthority()) {
+            int[] bounds = mGhosttyBackend.selectWord(safeColumn, safeRow);
+            if (bounds != null && bounds.length == 4) {
+                bounds[0] = clampSelection(bounds[0], 0, Math.max(0, mColumns - 1));
+                bounds[2] = clampSelection(bounds[2], 0, Math.max(0, mColumns - 1));
+                bounds[1] = clampSelection(bounds[1], -getActiveTranscriptRows(), mRows - 1);
+                bounds[3] = clampSelection(bounds[3], -getActiveTranscriptRows(), mRows - 1);
+                return bounds;
+            }
+            return new int[] {safeColumn, safeRow, safeColumn, safeRow};
+        }
+
+        TerminalBuffer screen = getScreen();
+        int start = safeColumn;
+        int end = safeColumn;
+        if (!" ".equals(screen.getSelectedText(start, safeRow, end, safeRow))) {
+            while (start > 0 &&
+                !"".equals(screen.getSelectedText(start - 1, safeRow, start - 1, safeRow))) {
+                start--;
+            }
+            while (end < mColumns - 1 &&
+                !"".equals(screen.getSelectedText(end + 1, safeRow, end + 1, safeRow))) {
+                end++;
+            }
+        }
+        return new int[] {start, safeRow, end, safeRow};
+    }
+
+    /** Keep selection endpoints aligned to a complete wide grapheme. */
+    public int snapSelectionColumn(int column, int row, boolean startEndpoint) {
+        int safeColumn = clampSelection(column, 0, Math.max(0, mColumns - 1));
+        int safeRow = clampSelection(row, -getActiveTranscriptRows(), Math.max(0, mRows - 1));
+        if (hasGhosttyAuthority()) {
+            int wide = mGhosttyBackend.cellWide(safeColumn, safeRow);
+            if (startEndpoint && wide == 2) return Math.max(0, safeColumn - 1);
+            if (!startEndpoint && wide == 1) return Math.min(mColumns - 1, safeColumn + 1);
+            return safeColumn;
+        }
+
+        TerminalBuffer screen = getScreen();
+        TerminalRow line = screen.allocateFullLineIfNecessary(screen.externalToInternalRow(safeRow));
+        if (startEndpoint && safeColumn > 0 &&
+            line.findStartOfColumn(safeColumn) == line.findStartOfColumn(safeColumn - 1)) {
+            return safeColumn - 1;
+        }
+        if (!startEndpoint && safeColumn + 1 < mColumns &&
+            line.findStartOfColumn(safeColumn + 1) == line.findStartOfColumn(safeColumn)) {
+            return safeColumn + 1;
+        }
+        return safeColumn;
+    }
+
+    /** Resolve OSC 8 and textual URLs against the authoritative backend selection snapshot. */
+    public synchronized TerminalLinkResolver.SelectionResult resolveSelectionLinks(
+        int x1, int y1, int x2, int y2, boolean allowWithoutScheme) {
+        if (hasGhosttyAuthority()) {
+            List<String> semantic = mGhosttyBackend.selectionHyperlinks(x1, y1, x2, y2);
+            if (semantic != null) {
+                TerminalLinkResolver.SelectionResult semanticResult =
+                    TerminalLinkResolver.resolveSemanticTargets(semantic);
+                if (!semanticResult.getUrls().isEmpty()) return semanticResult;
+                TerminalLinkResolver.SelectionResult textResult =
+                    resolveGhosttyTextSelectionLinks(x1, y1, x2, y2, allowWithoutScheme);
+                if (textResult != null) return textResult;
+            }
+        }
+        return TerminalLinkResolver.resolveTerminalSelection(
+            getScreen(), x1, y1, x2, y2, allowWithoutScheme);
+    }
+
+    private TerminalLinkResolver.SelectionResult resolveGhosttyTextSelectionLinks(
+        int x1, int y1, int x2, int y2, boolean allowWithoutScheme) {
+        int startX = x1;
+        int startY = y1;
+        int endX = x2;
+        int endY = y2;
+        if (startY > endY || (startY == endY && startX > endX)) {
+            int swapX = startX;
+            int swapY = startY;
+            startX = endX;
+            startY = endY;
+            endX = swapX;
+            endY = swapY;
+        }
+        int minRow = -getActiveTranscriptRows();
+        int maxRow = Math.max(0, mRows - 1);
+        startX = clampSelection(startX, 0, Math.max(0, mColumns - 1));
+        endX = clampSelection(endX, 0, Math.max(0, mColumns - 1));
+        startY = clampSelection(startY, minRow, maxRow);
+        endY = clampSelection(endY, minRow, maxRow);
+
+        int paddingRows = 2;
+        while (true) {
+            int contextStartRow = Math.max(minRow, startY - paddingRows);
+            int contextEndRow = Math.min(maxRow, endY + paddingRows);
+            String context = mGhosttyBackend.formatRangeRaw(
+                0, contextStartRow, mColumns - 1, contextEndRow, true);
+            if (context == null) return null;
+
+            String prefix;
+            if (startX == 0 && startY == contextStartRow) {
+                prefix = "";
+            } else if (startX > 0) {
+                prefix = mGhosttyBackend.formatRangeRaw(
+                    0, contextStartRow, startX - 1, startY, true);
+            } else {
+                prefix = mGhosttyBackend.formatRangeRaw(
+                    0, contextStartRow, mColumns - 1, startY - 1, true);
+            }
+            String throughSelection = mGhosttyBackend.formatRangeRaw(
+                0, contextStartRow, endX, endY, true);
+            if (prefix == null || throughSelection == null ||
+                !context.startsWith(prefix) || !context.startsWith(throughSelection) ||
+                throughSelection.length() < prefix.length()) return null;
+
+            TerminalSelectionContext selectionContext;
+            try {
+                selectionContext = new TerminalSelectionContext(
+                    context, prefix.length(), throughSelection.length());
+            } catch (IllegalArgumentException ignored) {
+                return null;
+            }
+            TerminalLinkResolver.SelectionResult result =
+                TerminalLinkResolver.resolveSelectionResult(
+                    selectionContext, allowWithoutScheme);
+            boolean atStart = contextStartRow == minRow;
+            boolean atEnd = contextEndRow == maxRow;
+            if ((!result.touchesContextStart() || atStart) &&
+                (!result.touchesContextEnd() || atEnd)) return result;
+            if (paddingRows >= 256) return result;
+            paddingRows = Math.min(256, paddingRows * 2);
+        }
+    }
+
+    private static int clampSelection(int value, int minimum, int maximum) {
+        return Math.max(minimum, Math.min(value, maximum));
+    }
+
+    public String getTranscriptText() {
+        return getTranscriptTextInternal(true);
+    }
+
+    public String getTranscriptTextWithoutJoinedLines() {
+        return getTranscriptTextInternal(false);
+    }
+
+    public String getTranscriptTextWithFullLinesJoined() {
+        return getTranscriptTextInternal(true);
+    }
+
+    private String getTranscriptTextInternal(boolean unwrap) {
+        if (hasGhosttyAuthority()) {
+            String value = mGhosttyBackend.formatAll(unwrap);
+            if (value != null) return value.trim();
+        }
+        TerminalBuffer screen = getScreen();
+        return unwrap ? screen.getTranscriptTextWithFullLinesJoined()
+                      : screen.getTranscriptTextWithoutJoinedLines();
     }
 
     /** Get the terminal session's title (null if not set). */
     public String getTitle() {
+        if (mCompatibilityFallback && mCompatibilityEmulator != null) {
+            return mCompatibilityEmulator.getTitle();
+        }
         return mTitle;
     }
 
@@ -2822,13 +4375,25 @@ public final class TerminalEmulator {
 
     /** If DECSET 2004 is set, prefix paste with "\033[200~" and suffix with "\033[201~". */
     public void paste(String text) {
+        if (text == null) return;
+        if (hasGhosttyAuthority()) {
+            byte[] encoded = mGhosttyBackend.encodePaste(text);
+            if (encoded != null) {
+                if (encoded.length > 0) mSession.write(encoded, 0, encoded.length);
+                return;
+            }
+        }
         // First: Always remove escape key and C1 control characters [0x80,0x9F]:
         text = text.replaceAll("(\u001B|[\u0080-\u009F])", "");
         // Second: Replace all newlines (\n) or CRLF (\r\n) with carriage returns (\r).
         text = text.replaceAll("\r?\n", "\r");
 
         // Then: Implement bracketed paste mode if enabled:
-        boolean bracketed = isDecsetInternalBitSet(DECSET_BIT_BRACKETED_PASTE_MODE);
+        boolean bracketed = hasGhosttyAuthority() && mGhosttyState != null
+            ? mGhosttyState.mode(GhosttyTerminalBackend.MODE_BRACKETED_PASTE)
+            : mCompatibilityFallback && mCompatibilityEmulator != null
+                ? mCompatibilityEmulator.isDecsetInternalBitSet(DECSET_BIT_BRACKETED_PASTE_MODE)
+                : isDecsetInternalBitSet(DECSET_BIT_BRACKETED_PASTE_MODE);
         if (bracketed) mSession.write("\033[200~");
         mSession.write(text);
         if (bracketed) mSession.write("\033[201~");

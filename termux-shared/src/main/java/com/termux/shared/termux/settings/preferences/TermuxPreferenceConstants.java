@@ -1,7 +1,7 @@
 package com.termux.shared.termux.settings.preferences;
 
 /*
- * Version: v0.16.0
+ * Version: v0.18.0
  *
  * Changelog
  *
@@ -73,6 +73,7 @@ package com.termux.shared.termux.settings.preferences;
  * - 0.17.0 (2026-03-16)
  *      - Added following to `TERMUX_APP`:
  *          `KEY_TERMINAL_FULL_SCREEN_SWIPE` and `DEFAULT_VALUE_TERMINAL_FULL_SCREEN_SWIPE`.
+ *
  */
 
 import com.termux.shared.shell.command.ExecutionCommand;
@@ -112,7 +113,6 @@ public final class TermuxPreferenceConstants {
          */
         public static final String KEY_TERMINAL_FULL_SCREEN_SWIPE = "terminal_full_screen_swipe";
         public static final boolean DEFAULT_VALUE_TERMINAL_FULL_SCREEN_SWIPE = false;
-
 
         /**
          * Defines the key for whether the soft keyboard will be enabled, for cases where users want

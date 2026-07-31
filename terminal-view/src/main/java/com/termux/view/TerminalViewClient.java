@@ -21,6 +21,9 @@ public interface TerminalViewClient {
      */
     float onScale(float scale);
 
+    /** Persist the text size committed by TerminalView's real-time reflow gesture. */
+    void onScaleTextSizeChanged(int textSize, boolean finished);
+
 
 
     /**
@@ -37,6 +40,15 @@ public interface TerminalViewClient {
      */
     void onTextInputTap(MotionEvent e);
 
+    /**
+     * A tap routed with its owning view/session. Implementations that keep Activity-level
+     * selection state may use this to commit focus before asynchronous page reconciliation.
+     */
+    default void onTerminalViewTap(TerminalView terminalView, TerminalSession session, MotionEvent e) {
+        onTextInputTap(e);
+        onSingleTapUp(e);
+    }
+
     /** Open a URL already validated by the terminal link resolver. */
     void onOpenUrl(String url);
 
@@ -50,9 +62,18 @@ public interface TerminalViewClient {
 
     boolean isTerminalViewSelected();
 
-    boolean shouldScrollWithArrowKeysInAlternateBuffer(TerminalSession session);
-
     boolean shouldSendMouseWheelEventsForTouchScroll(TerminalSession session);
+
+    /**
+     * Whether a touch tap should be reported as a terminal mouse click.
+     *
+     * By default this follows the touch-scroll policy for compatibility with
+     * existing clients. Clients may opt out separately when a terminal needs
+     * remote wheel input but a tap must remain available for local focus/IME.
+     */
+    default boolean shouldSendMouseClickEventsForTouchTap(TerminalSession session) {
+        return shouldSendMouseWheelEventsForTouchScroll(session);
+    }
 
 
 

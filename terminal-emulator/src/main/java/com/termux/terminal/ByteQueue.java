@@ -57,11 +57,7 @@ final class ByteQueue {
      * Returns whether the output was totally written, false if it was closed before.
      */
     public boolean write(byte[] buffer, int offset, int lengthToWrite) {
-        if (lengthToWrite + offset > buffer.length) {
-            throw new IllegalArgumentException("length + offset > buffer.length");
-        } else if (lengthToWrite <= 0) {
-            throw new IllegalArgumentException("length <= 0");
-        }
+        validateWrite(buffer, offset, lengthToWrite);
 
         final int bufferLength = mBuffer.length;
 
@@ -104,5 +100,37 @@ final class ByteQueue {
             }
         }
         return true;
+    }
+
+    /**
+     * Atomically enqueue the complete range without waiting for capacity.
+     *
+     * <p>This is used by UI-originated terminal input: a stalled PTY must apply backpressure as a
+     * visible failed write, never by blocking the Android main thread.</p>
+     */
+    public synchronized boolean tryWrite(byte[] buffer, int offset, int lengthToWrite) {
+        validateWrite(buffer, offset, lengthToWrite);
+        if (!mOpen || lengthToWrite > mBuffer.length - mStoredBytes) return false;
+
+        boolean wasEmpty = mStoredBytes == 0;
+        int remaining = lengthToWrite;
+        while (remaining > 0) {
+            int tail = (mHead + mStoredBytes) % mBuffer.length;
+            int oneRun = Math.min(mBuffer.length - tail, remaining);
+            System.arraycopy(buffer, offset, mBuffer, tail, oneRun);
+            offset += oneRun;
+            remaining -= oneRun;
+            mStoredBytes += oneRun;
+        }
+        if (wasEmpty) notify();
+        return true;
+    }
+
+    private static void validateWrite(byte[] buffer, int offset, int lengthToWrite) {
+        if (buffer == null) throw new NullPointerException("buffer == null");
+        if (offset < 0 || lengthToWrite < 0 || offset > buffer.length - lengthToWrite) {
+            throw new IndexOutOfBoundsException("Invalid offset/length");
+        }
+        if (lengthToWrite == 0) throw new IllegalArgumentException("length == 0");
     }
 }

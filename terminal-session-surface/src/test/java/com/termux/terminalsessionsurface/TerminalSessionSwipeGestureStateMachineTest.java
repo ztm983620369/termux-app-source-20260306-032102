@@ -70,4 +70,15 @@ public class TerminalSessionSwipeGestureStateMachineTest {
         );
         Assert.assertTrue(machine.isEligible(21L));
     }
+
+    @Test
+    public void keyboardPreservationStartsOnlyAfterTheOuterPagerCaptures() {
+        Assert.assertFalse(ProgrammaticViewPager.shouldStartPagerOwnedSwipe(
+            TerminalSessionSwipeGestureStateMachine.SIGNAL_TOUCH_DOWN));
+        Assert.assertFalse(ProgrammaticViewPager.shouldStartPagerOwnedSwipe(
+            TerminalSessionSwipeGestureStateMachine.SIGNAL_FINISHED));
+        Assert.assertTrue(ProgrammaticViewPager.shouldStartPagerOwnedSwipe(
+            TerminalSessionSwipeGestureStateMachine.SIGNAL_CAPTURED));
+    }
+
 }

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source_file="$root/terminal-emulator/src/main/jni/ghostty_terminal_backend.c"
+patch_file="$root/third_party/ghostty-vt/render-query-batch.patch"
+
+status() {
+    if rg -q '^#define TERMUX_GHOSTTY_RENDER_BATCH_API 1$' "$source_file"; then
+        echo "batch"
+    elif rg -q '^#define TERMUX_GHOSTTY_RENDER_BATCH_API 0$' "$source_file"; then
+        echo "scalar"
+    else
+        echo "unknown" >&2
+        return 1
+    fi
+}
+
+case "${1:-status}" in
+    status)
+        status
+        ;;
+    scalar|rollback)
+        if [[ "$(status)" != "scalar" ]]; then
+            git -C "$root" apply -R "$patch_file"
+        fi
+        echo "Ghostty render query path: scalar compatibility"
+        ;;
+    batch|enable)
+        if [[ "$(status)" != "batch" ]]; then
+            git -C "$root" apply "$patch_file"
+        fi
+        echo "Ghostty render query path: batch-v1 with direct UTF-8"
+        ;;
+    *)
+        echo "usage: $0 {status|scalar|rollback|batch|enable}" >&2
+        exit 2
+        ;;
+esac

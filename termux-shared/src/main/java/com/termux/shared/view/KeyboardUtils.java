@@ -102,8 +102,8 @@ public class KeyboardUtils {
     }
 
     public static void setSoftKeyboardAlwaysHiddenFlags(final Activity activity) {
-        if (activity != null && activity.getWindow() != null)
-            activity.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        setSoftInputModeBits(activity, WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE,
+            WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
     }
 
     public static void setSoftInputModeAdjustResize(final Activity activity) {
@@ -111,8 +111,32 @@ public class KeyboardUtils {
         // https://developer.android.com/reference/android/view/WindowManager.LayoutParams#SOFT_INPUT_ADJUST_RESIZE
         // https://medium.com/androiddevelopers/animating-your-keyboard-fb776a8fb66d
         // https://stackoverflow.com/a/65194077/14686958
-        if (activity != null && activity.getWindow() != null)
-            activity.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        setSoftInputModeBits(activity, WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST,
+            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+    }
+
+    /**
+     * Keep the activity's measured bounds stable while the IME is shown.
+     *
+     * Terminal applications expose their measured rows and columns to a PTY. Letting Android
+     * resize the activity for every IME animation frame therefore has process-visible semantics:
+     * it produces repeated {@code TIOCSWINSZ} calls and, for SSH/tmux sessions, repeated remote
+     * window changes. The terminal host consumes IME insets as a visual viewport instead.
+     */
+    public static void setSoftInputModeAdjustNothing(final Activity activity) {
+        setSoftInputModeBits(activity, WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST,
+            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
+    }
+
+    static int replaceSoftInputModeBits(int currentMode, int mask, int replacement) {
+        return (currentMode & ~mask) | (replacement & mask);
+    }
+
+    private static void setSoftInputModeBits(final Activity activity, int mask, int replacement) {
+        if (activity == null || activity.getWindow() == null) return;
+        int currentMode = activity.getWindow().getAttributes().softInputMode;
+        activity.getWindow().setSoftInputMode(
+            replaceSoftInputModeBits(currentMode, mask, replacement));
     }
 
     /**

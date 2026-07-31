@@ -14,8 +14,9 @@ public class LegacySshCommandProfileResolverTest {
 
         Assert.assertTrue(result.success);
         Assert.assertNotNull(result.endpoint);
-        Assert.assertEquals("ssh://prod-bastion:2222", result.endpoint.authorityKey);
+        Assert.assertEquals("ssh-hostkeyalias://prod-bastion", result.endpoint.authorityKey);
         Assert.assertEquals("prod-bastion", result.endpoint.hostIdentity);
+        Assert.assertTrue(result.endpoint.usesHostKeyAlias);
         Assert.assertEquals("/data/known_hosts", result.endpoint.userKnownHostsPath);
     }
 
@@ -32,6 +33,7 @@ public class LegacySshCommandProfileResolverTest {
         Assert.assertEquals("~/.ssh/id_ed25519", result.endpoint.identityPath);
         Assert.assertEquals("dev", result.endpoint.user);
         Assert.assertEquals("10.0.0.8", result.endpoint.host);
+        Assert.assertFalse(result.endpoint.usesHostKeyAlias);
     }
 
     @Test
@@ -43,5 +45,35 @@ public class LegacySshCommandProfileResolverTest {
 
         Assert.assertFalse(result.success);
         Assert.assertEquals(SshConnectionFailureCategory.INVALID_PROFILE, result.failureCategory);
+    }
+
+    @Test
+    public void doesNotTreatSshpassPasswordAsTheSshExecutable() {
+        SshProfileResolutionResult result = LegacySshCommandProfileResolver.resolve(
+            "p4", "sshpass -p ssh ssh -p 2200 dev@example.com");
+
+        Assert.assertTrue(result.success);
+        Assert.assertEquals("example.com", result.endpoint.host);
+        Assert.assertEquals(2200, result.endpoint.port);
+        Assert.assertEquals("dev", result.endpoint.user);
+    }
+
+    @Test
+    public void parsesQuotedOpenSshOptionValue() {
+        SshProfileResolutionResult result = LegacySshCommandProfileResolver.resolve(
+            "p5", "ssh -o 'StrictHostKeyChecking no' -o 'HostKeyAlias bastion' root@example.com");
+
+        Assert.assertTrue(result.success);
+        Assert.assertEquals(ResolvedSshEndpoint.HostKeyVerificationMode.NO,
+            result.endpoint.hostKeyVerificationMode);
+        Assert.assertEquals("bastion", result.endpoint.hostIdentity);
+    }
+
+    @Test
+    public void rejectsShellExpansionAndWildcardHostIdentity() {
+        Assert.assertFalse(LegacySshCommandProfileResolver.resolve(
+            "p6", "ssh root@$TARGET").success);
+        Assert.assertFalse(LegacySshCommandProfileResolver.resolve(
+            "p7", "ssh -o HostKeyAlias='*' root@example.com").success);
     }
 }

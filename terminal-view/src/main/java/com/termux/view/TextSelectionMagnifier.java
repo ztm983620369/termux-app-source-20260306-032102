@@ -171,7 +171,8 @@ final class TextSelectionMagnifier {
             canvas.translate(getWidth() / 2f, getHeight() / 2f);
             canvas.scale(zoom, zoom);
             canvas.translate(-sourceX, -sourceY);
-            terminalView.mRenderer.render(terminalView.mEmulator, canvas, terminalView.getTopRow(), selection[0], selection[1], selection[2], selection[3]);
+            terminalView.mRenderer.render(terminalView.mEmulator, canvas, terminalView.getTopRow(),
+                terminalView.getViewportPixelOffset(), selection[0], selection[1], selection[2], selection[3]);
             canvas.restore();
 
             // Inner padding to avoid any artifacts touching the rounded clip edge.

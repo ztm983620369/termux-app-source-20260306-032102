@@ -1798,6 +1798,8 @@ fn allowed_environment(name: &str) -> bool {
             | "TERMUX_SHADOW_CONTROL_ACTION"
             | "TERMUX_SHADOW_CONTROL_COMPONENT"
             | "TERMUX_SHADOW_CONFIGURATION_CACHE"
+            | "TERMUX_SHADOW_DEPENDENCY_POLICY"
+            | "TERMUX_SHADOW_ALLOW_NETWORK"
             | "TERMUX_SHADOW_HOME"
             | "TERMUX_SHADOW_OPERATION_ID"
             | "TERMUX_SHADOW_SIGNING_KEY_ID"
@@ -1993,7 +1995,7 @@ mod tests {
         environment_has_entry, gradle_version_marker, is_json_object, safe_request_id,
         same_file_identity, validate_request, worker_compatibility_issue,
     };
-    use crate::context::AppContext;
+    use crate::context::{AppContext, AppContextOptions};
     use crate::evidence::EvidenceRef;
     use std::collections::BTreeMap;
     use std::fs;
@@ -2085,7 +2087,17 @@ mod tests {
             "schemaVersion=1\n",
         )
         .unwrap();
-        let context = AppContext::new(Some(project.clone()), None, None, true, false).unwrap();
+        let context = AppContext::new(AppContextOptions {
+            project_override: Some(project.clone()),
+            template_override: None,
+            toolchain_override: None,
+            json: true,
+            verbose: false,
+            dependency_policy: crate::cli::DependencyPolicy::CacheFirst,
+            allow_network: false,
+            workspace: None,
+        })
+        .unwrap();
         unsafe { std::env::set_var("TERMUX_SHADOW_WORKER_TEST_ROOT", root.path()) };
         let request = RpcRequest {
             protocol_version: 1,

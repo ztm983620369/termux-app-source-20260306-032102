@@ -42,13 +42,20 @@ shadow-plugin doctor [--project-only] [--full] [--fresh] [--failures-only]
 shadow-plugin build [--version-code N] [--version-name NAME] [--fresh]
 shadow-plugin publish [--version-code N] [--version-name NAME] [--no-wait] [--allow-downgrade]
 shadow-plugin upgrade <version-code> <version-name>
-shadow-plugin dev [--no-run] [--version-name NAME] [--fresh] [--agent|--json]
+shadow-plugin dev [--no-run] [--version-name NAME] [--fresh] [--watch [--diff]] [--agent|--json]
+shadow-plugin dev --workspace
 shadow-plugin retry|resume [dev options]
 shadow-plugin deploy [--bump patch|minor|major] [--run] [--fresh] [--json]
+shadow-plugin deps resolve [--allow-network] [--lock] [--refresh]
+shadow-plugin deps import-gradle-cache [--from PATH]
+shadow-plugin deps vendor|status|clean
+shadow-plugin deps audit [--workspace]
+shadow-plugin import-android <source> --slug <slug> [--dry-run]
 shadow-plugin status [--all] [--compact] [--wait] [--timeout SECONDS] [--json]
-shadow-plugin context [--since-revision N] --json
+shadow-plugin context [--resume|--since-cursor CURSOR|--since-revision N] --json
 shadow-plugin evidence <evidenceId> [--diagnostics|--tail N|--full]
 shadow-plugin run|rollback [pluginId]
+shadow-plugin test-ui [pluginId] [--smoke-file PATH]
 shadow-plugin disable|enable [pluginId]
 shadow-plugin delete [pluginId] --yes
 shadow-plugin refresh
@@ -61,7 +68,11 @@ shadow-plugin sync [--dry-run]
 Command behavior:
 
 - `new` copies only source/tooling inputs, rewrites the business source package and Activity class,
-  rejects identity/resource collisions, and runs `doctor` before committing the new directory.
+  rejects identity/resource collisions, and runs `doctor` before committing the new directory. Its
+  final handoff contains the complete bounded source tree, edit ownership, full identity and key
+  sources, a
+  shell-safe next command, and separate source/registration/runtime states. `--publish` says
+  `REGISTERED` only after exact-SHA confirmation; it never implies runtime health.
 - `doctor` checks config, source/manifest alignment, SDK assets, Java, Android SDK, aapt2, legacy
   artifacts, live registry resource ownership, sibling project collisions, and signing inputs. Full
   output shows plugin diagnostics before package validation and reports build/tool warnings separately.
@@ -112,16 +123,21 @@ Command behavior:
 - `context` returns the compact fingerprint/version/pointer/recommended-action capsule and supports
   registry revision deltas; `evidence` retrieves details only when needed.
 - `info` prints the current directory and whether the project came from an explicit override, nearest
-  ancestor, or the standard home fallback.
-- `sync` updates only canonical tooling/runtime inputs from `$PREFIX/share`; it never overwrites the
-  project's identity config or `plugin-app/` business source.
+  ancestor, or was not resolved. Commands never silently fall back to a standard home project.
+- `sync` updates canonical tooling/runtime inputs and migrates schema-1 config keys without changing
+  identity values. It replaces the managed module script only after saving
+  `plugin-app/build.gradle.pre-shadow-sync`, extracts dependency declarations to
+  `plugin-app/dependencies.gradle`, and never overwrites `plugin-app/src/` business source or the
+  project `.gitignore`;
+- leaves an explicit incomplete-transaction marker if the process is interrupted, so doctor blocks
+  mixed-tooling builds until `shadow-plugin sync` is rerun.
 
 ## Single config
 
 Edit `shadow-plugin.properties` rather than Gradle identity fields:
 
 ```properties
-schemaVersion=1
+schemaVersion=2
 pluginSlug=basic
 projectName=TermuxShadowBasicPlugin
 pluginId=com.termux.shadow.basic
@@ -137,6 +153,12 @@ defaultVersionCode=1
 defaultVersionName=1.0.0
 minHostVersionCode=118
 maxHostVersionCode=999999
+applicationClassName=
+applicationTheme=android.R.style.Theme_Material_Light_NoActionBar
+activityTheme=android.R.style.Theme_Material_Light_NoActionBar
+screenOrientation=unspecified
+softInputMode=adjustNothing
+configChanges=orientation|screenSize|keyboardHidden
 ```
 
 Keep `applicationId 'com.termux'`: logical identity comes from `pluginId` and `partKey`. Every
@@ -144,6 +166,45 @@ simultaneously loadable logical plugin must have a distinct resource ID in `0x02
 `shadow-plugin new` allocates downward from `0x7B`, checks sibling workspaces and the live registry,
 and never reuses the standard plugin's reserved `0x7C`. The shell scaffolder remains only as the
 project-shim fallback.
+
+## Dependency policies
+
+Local deployment and reproducible packaging no longer imply forced offline development. The CLI
+defaults to `cache-first`: portable read-only cache → managed
+`~/.termux-shadow/gradle-cache` → project `vendor/gradle-home`. Repository access is explicit:
+
+```sh
+shadow-plugin deps status
+shadow-plugin deps import-gradle-cache --from ~/.gradle
+shadow-plugin deps resolve --allow-network --lock
+shadow-plugin deps vendor
+shadow-plugin dev --offline
+```
+
+`online` resolves through configured repositories and warms the shared cache; `offline` never uses
+the network. Publish/upgrade require a valid `shadow-dependencies.lock.json` plus Gradle lockfiles,
+re-resolve and SHA-256-compare the complete artifact set, and build the release offline. Dependency
+failure diagnostics include the exact recovery command.
+
+## Migration and UI smoke validation
+
+Use `shadow-plugin import-android SOURCE --slug NAME --dry-run` to get a compatibility report, then
+rerun without `--dry-run` for an atomic staged import. The importer copies sources/resources and
+dependency declarations, rewrites the launcher to `ShadowActivity`, and records AppCompat and
+non-Activity component decisions in `shadow-import-report.json`. The current template is Java-only;
+Kotlin sources are reported as a blocking migration item before any target is written. Project/file
+dependencies, dynamic coordinates, non-`implementation` configurations, annotation processors, and
+variant-specific dependency declarations are likewise reported with their source line and block the
+transaction instead of silently generating an incomplete project. Java keywords in derived
+namespaces and the public lifecycle visibility required by `ShadowActivity` are normalized
+deterministically. Custom Application classes, multiple activities, and Service/Receiver/Provider
+components remain explicit blocking items until their Shadow lifecycle mapping is implemented.
+
+Create a bounded `shadow-smoke.json` and run `shadow-plugin test-ui`. Supported actions are
+`assertDisplayed`, `assertText`, `click`, `focus`, `input`, `scroll`, `assertImeActive`, and `wait`.
+Every interactive step names a view (plain ID, `id/name`, or `@id/name`), cumulative `waitMs` is
+limited to 10 seconds, and unknown fields are rejected. Smoke execution starts only after first
+draw; a failed step is an activation failure and cannot replace the previous healthy generation.
 
 ## Package and registration
 

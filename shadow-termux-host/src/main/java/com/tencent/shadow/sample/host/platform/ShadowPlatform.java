@@ -1212,7 +1212,12 @@ public final class ShadowPlatform {
             context.put("status", status);
             context.put("updatedAt", System.currentTimeMillis());
             context.put("error", error == null ? JSONObject.NULL : error);
-            context.put("healthSemantics", "FIRST_FRAME_AND_PROCESS_STABILITY");
+            context.put(
+                    "healthSemantics",
+                    health != null && health.smokeRequested
+                            ? "FIRST_FRAME_UI_SMOKE_AND_PROCESS_STABILITY"
+                            : "FIRST_FRAME_AND_PROCESS_STABILITY"
+            );
             if (health != null) {
                 context.put("healthProtocolVersion", health.protocolVersion);
                 context.put("firstFrameElapsedMs", health.firstFrameElapsedMs);
@@ -1223,6 +1228,13 @@ public final class ShadowPlatform {
                 context.put("pluginProcessName", health.pluginProcessName == null
                         ? JSONObject.NULL
                         : health.pluginProcessName);
+                context.put("smokeRequested", health.smokeRequested);
+                context.put("smokePassed", health.smokePassed);
+                context.put("smokeStepCount", health.smokeStepCount);
+                context.put("smokeDurationMs", health.smokeDurationMs);
+                context.put("smokeError", health.smokeError == null
+                        ? JSONObject.NULL
+                        : health.smokeError);
             }
             byte[] bytes = context.toString(2).getBytes(StandardCharsets.UTF_8);
             ShadowFileOps.writeAtomically(paths.launchContextFile(), bytes, false);

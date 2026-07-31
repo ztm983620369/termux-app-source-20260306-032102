@@ -8,6 +8,8 @@ publish=1
 wait_for_registration=1
 version_code=
 version_name=
+dependency_policy=${TERMUX_SHADOW_DEPENDENCY_POLICY:-cache-first}
+allow_network=${TERMUX_SHADOW_ALLOW_NETWORK:-0}
 
 usage() {
     cat <<'EOF'
@@ -18,6 +20,9 @@ Options:
   --version-code N      Override defaultVersionCode for this build.
   --version-name NAME   Override defaultVersionName for this build.
   --no-wait             Publish without waiting for host registration.
+  --offline             Use only locked cached dependencies.
+  --online              Permit repository access.
+  --allow-network       Permit cache-first fallback to repositories.
   -h, --help            Show this help.
 EOF
 }
@@ -39,6 +44,16 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-wait)
             wait_for_registration=0
+            ;;
+        --offline)
+            dependency_policy=offline
+            ;;
+        --online)
+            dependency_policy=online
+            allow_network=1
+            ;;
+        --allow-network)
+            allow_network=1
             ;;
         -h|--help)
             usage
@@ -86,7 +101,11 @@ task=copyShadowPluginDebugToDist
 
 printf 'sdk.dir=%s\n' "$ANDROID_HOME" > "$ROOT_DIR/local.properties"
 
-set -- --offline --no-daemon "-Pandroid.aapt2FromMavenOverride=$aapt2"
+set -- --no-daemon "-Pandroid.aapt2FromMavenOverride=$aapt2"
+if [ "$dependency_policy" = offline ] \
+        || { [ "$dependency_policy" = cache-first ] && [ "$allow_network" != 1 ]; }; then
+    set -- --offline "$@"
+fi
 [ -z "$version_code" ] || set -- "$@" "-PshadowPluginVersionCode=$version_code"
 [ -z "$version_name" ] || set -- "$@" "-PshadowPluginVersionName=$version_name"
 set -- "$@" "$task"

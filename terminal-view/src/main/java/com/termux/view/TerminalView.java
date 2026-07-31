@@ -16,6 +16,7 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.util.AttributeSet;
+import android.util.Log;
 import android.view.ActionMode;
 import android.view.HapticFeedbackConstants;
 import android.view.InputDevice;
@@ -34,7 +35,9 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.widget.Scroller;
 
+import androidx.annotation.MainThread;
 import androidx.annotation.Nullable;
+import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 
 import com.termux.terminal.KeyHandler;
@@ -73,10 +76,55 @@ public final class TerminalView extends View {
 
     /** The top row of text to display. Ranges from -activeTranscriptRows to 0. */
     int mTopRow;
+    /** Sub-row viewport position in [0, lineHeight), used by the retained Ghostty renderer. */
+    float mViewportPixelOffset;
     int[] mDefaultSelectors = new int[]{-1,-1,-1,-1};
 
     float mScaleFactor = 1.f;
     final GestureAndScaleRecognizer mGestureRecognizer;
+    private boolean mScaleGestureActive;
+    private boolean mScaleGestureQualified;
+    private boolean mScaleCommitPending;
+    private boolean mScaleFrameScheduled;
+    private int mScaleStartTextSize;
+    private int mScaleTargetTextSize;
+    private float mScaleGestureFactor = 1f;
+    /** Screen-space pivot captured once per pinch; detector focus drift must never pan history. */
+    private float mScaleFocusX;
+    private float mScaleFocusY;
+    private float mScaleReportedFocusMaxDrift;
+    private int mScaleSampleCount;
+    private boolean mMultiTouchSequenceCaptured;
+    private long mScaleGestureStartedNanos;
+    private long mScaleGestureStartedEventTimeMillis;
+    private int mScaleReflowCount;
+    private long mScaleMetricNanos;
+    private long mScaleResizeNanos;
+    private long mScaleAnchorNanos;
+    private long mScaleMetricMaxNanos;
+    private long mScaleResizeMaxNanos;
+    private long mScaleAnchorMaxNanos;
+    private int mScaleAnchorExactCount;
+    private int mScaleAnchorClampedCount;
+    private int mScaleAnchorUnavailableCount;
+    private int mScaleGestureStartTopRow;
+    private int mScaleGestureStartTranscriptRows;
+    private boolean mScaleGestureStartedAlternateScreen;
+    private boolean mScaleGesturePinnedToLiveEdge;
+    private int mScaleLiveEdgePinCount;
+    private static final int SCALE_GLYPH_WARM_RUNS_PER_FRAME = 4;
+    private static final int IDLE_GLYPH_WARM_STABLE_FRAME_COUNT = 2;
+    private boolean mScaleGlyphWarmupPending;
+    private boolean mScaleGlyphWarmFrameScheduled;
+    private int mScaleGlyphWarmCandidates;
+    private int mScaleGlyphWarmFrames;
+    private long mScaleGlyphWarmNanos;
+    private boolean mIdleGlyphWarmCheckScheduled;
+    private boolean mGlyphWarmupFromIdle;
+    private int mIdleGlyphWarmStableFrames;
+    private long mIdleGlyphWarmCandidateGeneration = Long.MIN_VALUE;
+    private long mIdleGlyphWarmActiveGeneration = Long.MIN_VALUE;
+    private long mIdleGlyphWarmCompletedGeneration = Long.MIN_VALUE;
 
     /** Keep track of where mouse touch event started which we report as mouse scroll. */
     private int mMouseScrollStartX = -1, mMouseScrollStartY = -1;
@@ -87,6 +135,13 @@ public final class TerminalView extends View {
 
     /** What was left in from scrolling movement. */
     float mScrollRemainder;
+    private final TerminalFingerScrollTracker mFingerScrollTracker =
+        new TerminalFingerScrollTracker();
+    private final TerminalViewportPosition.Result mResolvedViewportPosition =
+        new TerminalViewportPosition.Result();
+    private final float mFingerScrollCaptureSlop;
+    private long mFingerScrollStartedNanos;
+    private int mFingerScrollMoveCount;
 
     /** If non-zero, this is the last unicode code point received if that was a combining character. */
     int mCombiningAccent;
@@ -99,6 +154,73 @@ public final class TerminalView extends View {
     private int mLastRenderedCursorCol = -1;
     private int mLastRenderedCursorStyle = -1;
     private boolean mLastRenderedCursorVisible;
+    private int mLastSentCellWidth = -1;
+    private int mLastSentCellHeight = -1;
+    /** The only authority allowed to turn observed layout into a PTY grid resize. */
+    private final TerminalGeometryCommitPolicy mGeometryCommitPolicy =
+        new TerminalGeometryCommitPolicy();
+    private boolean mImeViewportGeometryLocked;
+    private boolean mGeometryCommitFrameScheduled;
+    private long mGeometryCommitFrameEpoch;
+    private long mGeometryDeferredCount;
+    private long mGeometryCommittedCount;
+    private static final long FRAME_METRICS_LOG_INTERVAL_MS = 3000L;
+    private long mRenderFrameRequests;
+    private long mRenderFrameCallbacks;
+    private long mRenderFrameCoalesced;
+    private long mImmediateGhosttyInvalidations;
+    private long mImmediateViewportInvalidations;
+    private long mUserInputLiveEdgeRestores;
+    private long mPartialGhosttyInvalidations;
+    private long mPresentedFrames;
+    private long mSkippedFramePresentations;
+    private long mFrameScheduledNanos;
+    private long mMaxScheduleLatencyMicros;
+    private long mMaxDrawMicros;
+    private long mLastPresentedContentRevision = Long.MIN_VALUE;
+    private int mLastPresentedTopRow = Integer.MIN_VALUE;
+    private int mLastPresentedViewportOffsetBits = Integer.MIN_VALUE;
+    private int mLastPresentedViewHeight = -1;
+    private int mLastPresentedFontLineSpacing = -1;
+    private int mLastPresentedFontLineSpacingAndAscent = Integer.MIN_VALUE;
+    private boolean mLastPresentedCursorEnabled;
+    private int mLastPresentedImeProtectedBottomScreenRow = -1;
+    private long mLastFrameMetricsLogMs;
+
+    /** Optional per-tab Vulkan surface. Canvas remains the correctness fallback until its frame is committed. */
+    @Nullable
+    private TerminalVulkanView mVulkanView;
+    @Nullable
+    private Runnable mVisualViewportAnchorChangedListener;
+    @Nullable
+    private Runnable mImeCameraFrameReadyListener;
+    @Nullable
+    private Runnable mImeExplicitFocusListener;
+    private final TerminalImeCameraFrameRequestPolicy mImeCameraFrameRequestPolicy =
+        new TerminalImeCameraFrameRequestPolicy();
+    private long mImeCameraFrameRequests;
+    private long mImeCameraFrameDeltaPrewarms;
+    private long mImeCameraFrameFullFallbacks;
+    private long mImeCameraFrameImmediateNotifications;
+    private long mLastImeCameraNotifiedRevision = Long.MIN_VALUE;
+    private int mLastImeCameraNotifiedCursorRow = Integer.MIN_VALUE;
+    private int mLastImeCameraNotifiedCursorColumn = Integer.MIN_VALUE;
+    private int mLastImeCameraNotifiedTopRow = Integer.MIN_VALUE;
+    private int mLastImeCameraNotifiedViewportOffsetBits = Integer.MIN_VALUE;
+    private int mLastImeCameraNotifiedViewHeight = -1;
+    private int mLastImeCameraNotifiedFontLineSpacing = -1;
+    private int mLastImeCameraNotifiedFontLineSpacingAndAscent = Integer.MIN_VALUE;
+    private int mLastImeCameraNotifiedProtectedBottomScreenRow = Integer.MIN_VALUE;
+    private boolean mLastImeCameraNotifiedCursorEnabled;
+    private boolean mVulkanFailed;
+    private long mGpuFrameId;
+    private long mGpuLastSubmittedCommandGeneration = Long.MIN_VALUE;
+    private long mGpuLastSubmittedModelRevision = Long.MIN_VALUE;
+    private int mGpuLastSubmittedTopRow = Integer.MIN_VALUE;
+    private float mGpuLastSubmittedViewportOffset = Float.NaN;
+    private int mGpuLastSubmittedWidth = -1;
+    private int mGpuLastSubmittedHeight = -1;
+    private long mGpuPresentedFrames;
 
     /**
      * The current AutoFill type returned for {@link View#getAutofillType()} by {@link #getAutofillType()}.
@@ -159,15 +281,17 @@ public final class TerminalView extends View {
                 if (mEmulator != null && shouldUseMouseTrackingForTouchTap() && !event.isFromSource(InputDevice.SOURCE_MOUSE) && !isSelectingText() && !scrolledWithFinger) {
                     // Quick event processing when mouse tracking is active - do not wait for check of double tapping
                     // for zooming.
+                    // Commit the terminal mouse transaction before Android focus/IME work. tmux is
+                    // authoritative for the active pane, while the concrete view that received the
+                    // touch remains authoritative for the keyboard request on this same tap.
+                    sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, true);
+                    sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, false);
                     if (mClient == null || mClient.shouldTerminalViewRequestFocusOnTap()) {
                         requestFocusFromTouch();
                         requestFocus();
                     }
-                    if (mClient != null) mClient.onTextInputTap(event);
-                    sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, true);
-                    sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, false);
+                    if (mClient != null) mClient.onTerminalViewTap(TerminalView.this, mTermSession, event);
                     scrolledWithFinger = false;
-                    if (mClient != null) mClient.onSingleTapUp(event);
                     return true;
                 }
                 scrolledWithFinger = false;
@@ -177,6 +301,7 @@ public final class TerminalView extends View {
             @Override
             public boolean onSingleTapUp(MotionEvent event) {
                 if (mEmulator == null) return true;
+                if (mFingerScrollTracker.isDragging()) return true;
 
                 if (isSelectingText()) {
                     stopTextSelectionMode();
@@ -186,14 +311,18 @@ public final class TerminalView extends View {
                     requestFocusFromTouch();
                     requestFocus();
                 }
-                mClient.onTextInputTap(event);
-                mClient.onSingleTapUp(event);
+                mClient.onTerminalViewTap(TerminalView.this, mTermSession, event);
                 return true;
             }
 
             @Override
             public boolean onScroll(MotionEvent e, float distanceX, float distanceY) {
                 if (mEmulator == null) return true;
+                if (mScaleGestureActive || mMultiTouchSequenceCaptured ||
+                    mGestureRecognizer.isMultiTouchSequence()) {
+                    mScrollRemainder = 0f;
+                    return true;
+                }
                 if (mEmulator.isMouseTrackingActive() && e.isFromSource(InputDevice.SOURCE_MOUSE)) {
                     // If moving with mouse pointer while pressing button, report that instead of scroll.
                     // This means that we never report moving with button press-events for touch input,
@@ -202,34 +331,148 @@ public final class TerminalView extends View {
                     sendMouseEventCode(e, TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED, true);
                 } else {
                     scrolledWithFinger = true;
-                    distanceY += mScrollRemainder;
-                    int deltaRows = (int) (distanceY / mRenderer.mFontLineSpacing);
-                    mScrollRemainder = distanceY - deltaRows * mRenderer.mFontLineSpacing;
-                    doScroll(e, deltaRows);
+                    if (isSmoothGhosttyLocalScroll()) {
+                        if (!mFingerScrollTracker.isActive()) {
+                            scrollViewportByPixels(distanceY);
+                        }
+                    } else {
+                        distanceY += mScrollRemainder;
+                        int deltaRows = (int) (distanceY / mRenderer.mFontLineSpacing);
+                        mScrollRemainder = distanceY - deltaRows * mRenderer.mFontLineSpacing;
+                        doScroll(e, deltaRows);
+                    }
                 }
                 return true;
             }
 
             @Override
-            public boolean onScale(float focusX, float focusY, float scale) {
-                if (mEmulator == null || isSelectingText()) return true;
-                mScaleFactor *= scale;
-                mScaleFactor = mClient.onScale(mScaleFactor);
+            public boolean onScaleBegin(float focusX, float focusY, long eventTimeMillis) {
+                if (mEmulator == null || mRenderer == null || mClient == null ||
+                    isSelectingText()) return false;
+                captureMultiTouchSequence();
+                if (!mScroller.isFinished()) mScroller.abortAnimation();
+                mScaleGestureActive = true;
+                mScaleGestureQualified = false;
+                mScaleCommitPending = false;
+                mScaleStartTextSize = mRenderer.mTextSize;
+                mScaleTargetTextSize = mScaleStartTextSize;
+                mScaleGestureFactor = 1f;
+                mScaleFocusX = focusX;
+                mScaleFocusY = focusY;
+                mScaleReportedFocusMaxDrift = 0f;
+                mScaleSampleCount = 0;
+                mScrollRemainder = 0f;
+                scrolledWithFinger = false;
+                mScaleGestureStartedNanos = System.nanoTime();
+                mScaleGestureStartedEventTimeMillis = eventTimeMillis;
+                mScaleReflowCount = 0;
+                mScaleMetricNanos = 0L;
+                mScaleResizeNanos = 0L;
+                mScaleAnchorNanos = 0L;
+                mScaleMetricMaxNanos = 0L;
+                mScaleResizeMaxNanos = 0L;
+                mScaleAnchorMaxNanos = 0L;
+                mScaleAnchorExactCount = 0;
+                mScaleAnchorClampedCount = 0;
+                mScaleAnchorUnavailableCount = 0;
+                mScaleGestureStartTopRow = mTopRow;
+                mScaleGestureStartTranscriptRows = mEmulator.getActiveTranscriptRows();
+                mScaleGestureStartedAlternateScreen = mEmulator.isAlternateBufferActive();
+                boolean atLiveEdge = mTopRow == 0 && Math.abs(mViewportPixelOffset) < 0.01f;
+                // Stream output retains the focal-cell behavior the user already validated. An
+                // inline TUI at the live edge must remain live, otherwise its post-SIGWINCH redraw
+                // leaves this viewport anchored to an obsolete frame in primary-screen history.
+                mScaleGesturePinnedToLiveEdge =
+                    TerminalTuiResizePolicy.shouldPinLiveEdge(atLiveEdge,
+                        mScaleGestureStartedAlternateScreen, mEmulator.isMouseTrackingActive(),
+                        mEmulator.shouldSendFocusEvents(),
+                        mEmulator.isCursorKeysApplicationMode(),
+                        mEmulator.isKeypadApplicationMode(), mEmulator.isCursorEnabled());
+                mScaleLiveEdgePinCount = 0;
+                mScaleGlyphWarmupPending = false;
+                mScaleGlyphWarmCandidates = 0;
+                mScaleGlyphWarmFrames = 0;
+                mScaleGlyphWarmNanos = 0L;
+                mGlyphWarmupFromIdle = false;
+                mIdleGlyphWarmStableFrames = 0;
+                mIdleGlyphWarmCandidateGeneration = Long.MIN_VALUE;
+                mRenderer.setRealtimeScaleActive(true);
+                Log.i(LOG_TAG, "pinch-reflow-v4 gesture-begin textPx=" +
+                    mScaleStartTextSize + " top=" + mTopRow + " scrollback=" +
+                    mScaleGestureStartTranscriptRows + " alternate=" +
+                    mScaleGestureStartedAlternateScreen +
+                    " viewportPolicy=" + (mScaleGesturePinnedToLiveEdge
+                        ? "inline-tui-live-edge" : "tracked-cell-universal") +
+                    " anchor=ghostty-tracked-cell pivot=fixed multitouchExclusive=true" +
+                    " realReflow=true");
                 return true;
+            }
+
+            @Override
+            public boolean onScale(float focusX, float focusY, float scale,
+                                   long eventTimeMillis) {
+                if (!mScaleGestureActive || mEmulator == null || isSelectingText()) return true;
+                if (!Float.isNaN(scale) && !Float.isInfinite(scale) && scale > 0f) {
+                    mScaleGestureFactor = Math.max(0.125f,
+                        Math.min(8f, mScaleGestureFactor * scale));
+                }
+                mScaleSampleCount++;
+                mScaleReportedFocusMaxDrift = Math.max(mScaleReportedFocusMaxDrift,
+                    TerminalPinchViewportAnchor.reportedFocusDrift(
+                        mScaleFocusX, mScaleFocusY, focusX, focusY));
+                if (!mScaleGestureQualified) {
+                    mScaleGestureQualified = TerminalPinchGesturePolicy.qualifies(
+                        mScaleGestureFactor, mScaleSampleCount,
+                        Math.max(0L, eventTimeMillis - mScaleGestureStartedEventTimeMillis));
+                }
+                if (!mScaleGestureQualified) return true;
+                float density = getResources().getDisplayMetrics().density;
+                int minimum = Math.max(4, (int) (4f * density));
+                mScaleTargetTextSize = Math.max(minimum, Math.min(256,
+                    Math.round(mScaleStartTextSize * mScaleGestureFactor)));
+                scheduleRealtimeScaleFrame();
+                return true;
+            }
+
+            @Override
+            public void onScaleEnd(boolean cancelled) {
+                if (!mScaleGestureActive) return;
+                boolean commit = TerminalPinchGesturePolicy.shouldCommit(
+                    mScaleGestureQualified, cancelled, mScaleStartTextSize,
+                    mScaleTargetTextSize);
+                if (!commit) {
+                    abortRealtimeScaleGesture(cancelled ? "touch-cancel" : "unqualified");
+                    return;
+                }
+                mScaleGestureActive = false;
+                mScaleCommitPending = true;
+                Log.i(LOG_TAG, "pinch-reflow-v4 gesture-end targetPx=" +
+                    mScaleTargetTextSize + " reflowsSoFar=" + mScaleReflowCount +
+                    " samples=" + mScaleSampleCount + " qualified=true" +
+                    " pivot=fixed reportedFocusDriftPx=" +
+                    Math.round(mScaleReportedFocusMaxDrift));
+                scheduleRealtimeScaleFrame();
             }
 
             @Override
             public boolean onFling(final MotionEvent e2, float velocityX, float velocityY) {
                 if (mEmulator == null) return true;
+                if (mScaleGestureActive || mMultiTouchSequenceCaptured ||
+                    mGestureRecognizer.isMultiTouchSequence()) return true;
                 // Do not start scrolling until last fling has been taken care of:
                 if (!mScroller.isFinished()) return true;
+
+                if (isSmoothGhosttyLocalScroll()) {
+                    startSmoothGhosttyFling(velocityY);
+                    return true;
+                }
 
                 final boolean mouseTrackingAtStartOfFling = shouldUseMouseTrackingForTouchScroll();
                 float SCALE = 0.25f;
                 if (mouseTrackingAtStartOfFling) {
                     mScroller.fling(0, 0, 0, -(int) (velocityY * SCALE), 0, 0, -mEmulator.mRows / 2, mEmulator.mRows / 2);
                 } else {
-                    mScroller.fling(0, mTopRow, 0, -(int) (velocityY * SCALE), 0, 0, -mEmulator.getScreen().getActiveTranscriptRows(), 0);
+                    mScroller.fling(0, mTopRow, 0, -(int) (velocityY * SCALE), 0, 0, -mEmulator.getActiveTranscriptRows(), 0);
                 }
 
                 post(new Runnable() {
@@ -256,13 +499,7 @@ public final class TerminalView extends View {
 
             @Override
             public boolean onDown(float x, float y) {
-                // Why is true not returned here?
-                // https://developer.android.com/training/gestures/detector.html#detect-a-subset-of-supported-gestures
-                // Although setting this to true still does not solve the following errors when long pressing in terminal view text area
-                // ViewDragHelper: Ignoring pointerId=0 because ACTION_DOWN was not received for this pointer before ACTION_MOVE
-                // Commenting out the call to mGestureDetector.onTouchEvent(event) in GestureAndScaleRecognizer#onTouchEvent() removes
-                // the error logging, so issue is related to GestureDetector
-                return false;
+                return true;
             }
 
             @Override
@@ -276,12 +513,15 @@ public final class TerminalView extends View {
                 if (mGestureRecognizer.isInProgress()) return;
                 if (mClient.onLongPress(event)) return;
                 if (!isSelectingText()) {
+                    finishDirectFingerScroll("long-press");
                     performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
                     startTextSelectionMode(event);
                 }
             }
         });
         mScroller = new Scroller(context);
+        mFingerScrollCaptureSlop = Math.max(1f,
+            ViewConfiguration.get(context).getScaledTouchSlop() * 0.35f);
         AccessibilityManager am = (AccessibilityManager) context.getSystemService(Context.ACCESSIBILITY_SERVICE);
         mAccessibilityEnabled = am.isEnabled();
     }
@@ -314,23 +554,321 @@ public final class TerminalView extends View {
      */
     public boolean attachSession(TerminalSession session) {
         if (session == mTermSession) return false;
+        finishDirectFingerScroll("session-switch");
+        abortRealtimeScaleGesture("session-switch");
+        if (!mScroller.isFinished()) mScroller.abortAnimation();
+        if (mRenderer != null) mRenderer.resetRenderState();
         mTopRow = 0;
+        mViewportPixelOffset = 0f;
+        mLastSentCellWidth = -1;
+        mLastSentCellHeight = -1;
+        mGeometryCommitPolicy.reset();
+        mGeometryCommitPolicy.setImeViewportActive(mImeViewportGeometryLocked);
+        mGeometryCommitFrameEpoch++;
+        mGeometryCommitFrameScheduled = false;
         mLastRenderedCursorRow = -1;
         mLastRenderedCursorCol = -1;
         mLastRenderedCursorStyle = -1;
         mLastRenderedCursorVisible = false;
+        resetPresentedImeCameraState();
+        resetImeCameraFrameNotificationState();
+        resetVulkanSubmissionState();
 
         mTermSession = session;
-        mEmulator = null;
+        // A retained tab/session already owns an authoritative grid. Adopt it before consulting
+        // this View's transient layout so a tab switch or IME-visible holder attachment cannot
+        // resize a live SSH/tmux PTY merely to present it.
+        mEmulator = session.getEmulator();
         mCombiningAccent = 0;
+
+        if (mEmulator != null) {
+            mLastSentCellWidth = mEmulator.getCellWidthPixelsForDiagnostics();
+            mLastSentCellHeight = mEmulator.getCellHeightPixelsForDiagnostics();
+            mGeometryCommitPolicy.markCommitted(new TerminalGeometryCommitPolicy.Geometry(
+                mEmulator.mColumns, mEmulator.mRows,
+                mLastSentCellWidth, mLastSentCellHeight));
+            mClient.onEmulatorSet();
+            if (mTerminalCursorBlinkerRunnable != null) {
+                mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
+            }
+        }
 
         updateSize();
 
         // Wait with enabling the scrollbar until we have a terminal to get scroll position from.
         setVerticalScrollBarEnabled(true);
-        invalidate();
+        requestFullRenderFrame();
 
         return true;
+    }
+
+    /** Connect the optional GPU surface owned by the containing pager page. */
+    public void setVulkanView(@Nullable TerminalVulkanView view) {
+        if (mVulkanView == view) return;
+        if (mVulkanView != null) mVulkanView.attachTerminalView(null);
+        mVulkanView = view;
+        mVulkanFailed = false;
+        resetVulkanSubmissionState();
+        if (view != null) {
+            view.attachTerminalView(this);
+            publishVulkanFrameNow(true);
+        }
+        invalidate();
+    }
+
+    /** Notifies the owner when local scroll changes which terminal row is visually anchored. */
+    public void setVisualViewportAnchorChangedListener(@Nullable Runnable listener) {
+        mVisualViewportAnchorChangedListener = listener;
+    }
+
+    /** Notifies the owner after a terminal-pixel frame becomes authoritative for IME focus. */
+    public void setImeCameraFrameReadyListener(@Nullable Runnable listener) {
+        mImeCameraFrameReadyListener = listener;
+        resetImeCameraFrameNotificationState();
+    }
+
+    /** Notifies the owner of explicit user intent to leave history and write at the live cursor. */
+    public void setImeExplicitFocusListener(@Nullable Runnable listener) {
+        mImeExplicitFocusListener = listener;
+    }
+
+    private void notifyVisualViewportAnchorChanged() {
+        Runnable listener = mVisualViewportAnchorChangedListener;
+        if (listener != null) listener.run();
+    }
+
+    private void notifyImeExplicitFocus() {
+        Runnable listener = mImeExplicitFocusListener;
+        if (listener != null) listener.run();
+    }
+
+    private void resetImeCameraFrameNotificationState() {
+        mImeCameraFrameRequestPolicy.reset();
+        mLastImeCameraNotifiedRevision = Long.MIN_VALUE;
+        mLastImeCameraNotifiedCursorRow = Integer.MIN_VALUE;
+        mLastImeCameraNotifiedCursorColumn = Integer.MIN_VALUE;
+        mLastImeCameraNotifiedTopRow = Integer.MIN_VALUE;
+        mLastImeCameraNotifiedViewportOffsetBits = Integer.MIN_VALUE;
+        mLastImeCameraNotifiedViewHeight = -1;
+        mLastImeCameraNotifiedFontLineSpacing = -1;
+        mLastImeCameraNotifiedFontLineSpacingAndAscent = Integer.MIN_VALUE;
+        mLastImeCameraNotifiedProtectedBottomScreenRow = Integer.MIN_VALUE;
+        mLastImeCameraNotifiedCursorEnabled = false;
+    }
+
+    private void resetPresentedImeCameraState() {
+        mLastPresentedContentRevision = Long.MIN_VALUE;
+        mLastPresentedTopRow = Integer.MIN_VALUE;
+        mLastPresentedViewportOffsetBits = Integer.MIN_VALUE;
+        mLastPresentedViewHeight = -1;
+        mLastPresentedFontLineSpacing = -1;
+        mLastPresentedFontLineSpacingAndAscent = Integer.MIN_VALUE;
+        mLastPresentedCursorEnabled = false;
+        mLastPresentedImeProtectedBottomScreenRow = -1;
+    }
+
+    private void recordPresentedImeCameraState(int topRow, float viewportPixelOffset,
+                                                int viewHeight, int fontLineSpacing,
+                                                int fontAscent,
+                                                int imeProtectedBottomScreenRow) {
+        mLastPresentedTopRow = topRow;
+        mLastPresentedViewportOffsetBits = Float.floatToIntBits(viewportPixelOffset);
+        mLastPresentedViewHeight = viewHeight;
+        mLastPresentedFontLineSpacing = fontLineSpacing;
+        mLastPresentedFontLineSpacingAndAscent = fontLineSpacing + fontAscent;
+        mLastPresentedImeProtectedBottomScreenRow = imeProtectedBottomScreenRow;
+    }
+
+    private int resolvePresentedImeProtectedBottomScreenRow() {
+        if (mEmulator == null || mRenderer == null) return mLastRenderedCursorRow;
+        int cursorScreenRow = mLastRenderedCursorRow;
+        if (cursorScreenRow < 0 || cursorScreenRow >= mEmulator.mRows) {
+            return cursorScreenRow;
+        }
+        boolean alternateScreen = mEmulator.isAlternateBufferActive();
+        boolean inlinePrimaryScreen = TerminalTuiResizePolicy.isInlinePrimaryScreen(
+            alternateScreen, mEmulator.isMouseTrackingActive(),
+            mEmulator.shouldSendFocusEvents(), mEmulator.isCursorKeysApplicationMode(),
+            mEmulator.isKeypadApplicationMode(), mEmulator.isCursorEnabled());
+        int semanticTail = mEmulator.isGhosttyRenderAuthorityActive()
+            ? mRenderer.findLastGhosttySemanticScreenRow(
+                mTopRow, cursorScreenRow, mEmulator.mRows)
+            : mEmulator.getScreen().findLastNonBlankScreenRow(cursorScreenRow);
+        return TerminalImeSemanticEnvelope.resolveProtectedBottomScreenRow(
+            alternateScreen, inlinePrimaryScreen, cursorScreenRow, semanticTail, mEmulator.mRows);
+    }
+
+    private void notifyImeCameraFrameReady() {
+        Runnable listener = mImeCameraFrameReadyListener;
+        if (listener == null || mEmulator == null) return;
+        long revision = mLastPresentedContentRevision;
+        int cursorRow = mLastRenderedCursorRow;
+        int cursorColumn = mLastRenderedCursorCol;
+        // Every value in this identity must come from the frame that actually reached pixels.
+        // Reading mTopRow/mViewportPixelOffset here mixes an older asynchronous Vulkan frame with
+        // a newer UI-thread viewport. A far history-to-live jump can then record the stale history
+        // frame as topRow=0 and suppress the real live frame because its model revision and cursor
+        // happen to be unchanged. The IME camera would remain permanently WAITING_READY.
+        int presentedTopRow = mLastPresentedTopRow;
+        int viewportOffsetBits = mLastPresentedViewportOffsetBits;
+        boolean cursorEnabled = mLastPresentedCursorEnabled;
+        boolean frameIdentityChanged = !(revision == mLastImeCameraNotifiedRevision &&
+            cursorRow == mLastImeCameraNotifiedCursorRow &&
+            cursorColumn == mLastImeCameraNotifiedCursorColumn &&
+            presentedTopRow == mLastImeCameraNotifiedTopRow &&
+            viewportOffsetBits == mLastImeCameraNotifiedViewportOffsetBits &&
+            mLastPresentedViewHeight == mLastImeCameraNotifiedViewHeight &&
+            mLastPresentedFontLineSpacing == mLastImeCameraNotifiedFontLineSpacing &&
+            mLastPresentedFontLineSpacingAndAscent ==
+                mLastImeCameraNotifiedFontLineSpacingAndAscent &&
+            mLastPresentedImeProtectedBottomScreenRow ==
+                mLastImeCameraNotifiedProtectedBottomScreenRow &&
+            cursorEnabled == mLastImeCameraNotifiedCursorEnabled);
+        if (!mImeCameraFrameRequestPolicy.shouldNotify(frameIdentityChanged)) {
+            return;
+        }
+        mLastImeCameraNotifiedRevision = revision;
+        mLastImeCameraNotifiedCursorRow = cursorRow;
+        mLastImeCameraNotifiedCursorColumn = cursorColumn;
+        mLastImeCameraNotifiedTopRow = presentedTopRow;
+        mLastImeCameraNotifiedViewportOffsetBits = viewportOffsetBits;
+        mLastImeCameraNotifiedViewHeight = mLastPresentedViewHeight;
+        mLastImeCameraNotifiedFontLineSpacing = mLastPresentedFontLineSpacing;
+        mLastImeCameraNotifiedFontLineSpacingAndAscent =
+            mLastPresentedFontLineSpacingAndAscent;
+        mLastImeCameraNotifiedProtectedBottomScreenRow =
+            mLastPresentedImeProtectedBottomScreenRow;
+        mLastImeCameraNotifiedCursorEnabled = cursorEnabled;
+        mImeCameraFrameRequestPolicy.markNotified();
+        listener.run();
+    }
+
+    private void resetVulkanSubmissionState() {
+        mGpuLastSubmittedCommandGeneration = Long.MIN_VALUE;
+        mGpuLastSubmittedModelRevision = Long.MIN_VALUE;
+        mGpuLastSubmittedTopRow = Integer.MIN_VALUE;
+        mGpuLastSubmittedViewportOffset = Float.NaN;
+        mGpuLastSubmittedWidth = -1;
+        mGpuLastSubmittedHeight = -1;
+    }
+
+    /** Called on the UI thread after the Vulkan thread has presented a complete frame. */
+    void onVulkanFramePresented(@NonNull TerminalVulkanView view,
+                                @NonNull TerminalGpuFrame frame) {
+        if (view != mVulkanView) return;
+        mVulkanFailed = false;
+        mGpuPresentedFrames++;
+        mLastPresentedContentRevision = frame.modelRevision;
+        mLastRenderedCursorRow = frame.cursorRow;
+        mLastRenderedCursorCol = frame.cursorColumn;
+        mLastRenderedCursorStyle = frame.cursorStyle;
+        mLastRenderedCursorVisible = frame.cursorVisible;
+        mLastPresentedCursorEnabled = frame.cursorEnabled;
+        recordPresentedImeCameraState(frame.viewportTopRow, frame.viewportPixelOffset,
+            frame.viewHeight, frame.fontLineSpacing, frame.fontAscent,
+            frame.imeProtectedBottomScreenRow >= frame.cursorRow
+                ? frame.imeProtectedBottomScreenRow : frame.cursorRow);
+        notifyImeCameraFrameReady();
+        invalidate();
+    }
+
+    /** A missing retained row is recoverable by exporting one complete GPU frame. */
+    void onVulkanFrameNeedsFull(@NonNull TerminalVulkanView view,
+                                @NonNull TerminalGpuFrame ignoredFrame) {
+        if (view != mVulkanView || mEmulator == null || mRenderer == null) return;
+        resetVulkanSubmissionState();
+        mPendingFullInvalidation = true;
+        publishVulkanFrameNow(true);
+        invalidate();
+    }
+
+    /** Permanently switch this tab to the proven Canvas path after native failure. */
+    void onVulkanRendererFailed(@NonNull TerminalVulkanView view) {
+        if (view != mVulkanView) return;
+        mVulkanFailed = true;
+        view.setVisibility(INVISIBLE);
+        resetVulkanSubmissionState();
+        invalidate();
+        Log.e(LOG_TAG, "vulkan-renderer-fallback view=" + System.identityHashCode(this) +
+            " diagnostics=" + view.getDiagnostics());
+    }
+
+    /** Surface loss must immediately expose Canvas so a tab never remains black. */
+    void onVulkanFrameUnavailable(@NonNull TerminalVulkanView view) {
+        if (view != mVulkanView) return;
+        resetVulkanSubmissionState();
+        invalidate();
+    }
+
+    /** A TextureView resize invalidates the last swapchain image even if its frame metadata was final. */
+    void onVulkanSurfaceSizeChanged(@NonNull TerminalVulkanView view) {
+        if (view != mVulkanView || mVulkanFailed) return;
+        resetVulkanSubmissionState();
+        mPendingFullInvalidation = true;
+        publishVulkanFrameNow(true);
+        invalidate();
+    }
+
+    /** Queue a complete native frame when this page becomes the sole visible Vulkan owner. */
+    void onVulkanSurfaceActivated(@NonNull TerminalVulkanView view) {
+        if (view != mVulkanView || mVulkanFailed) return;
+        resetVulkanSubmissionState();
+        mPendingFullInvalidation = true;
+        publishVulkanFrameNow(true);
+        invalidate();
+    }
+
+    private boolean isVulkanFrameActive() {
+        return mVulkanView != null && !mVulkanFailed && hasCurrentTerminalGeometry() &&
+            mVulkanView.isFrameReadyForGeometry(getWidth(), getHeight(), mRenderer.mTextSize,
+                mRenderer.mFontWidth, mRenderer.mFontLineSpacing,
+                mRenderer.mFontAscent, mEmulator.mRows, mTopRow, mViewportPixelOffset,
+                mRenderer.getGhosttyRetainedCommandGeneration(),
+                mRenderer.getGhosttyCachedModelRevision());
+    }
+
+    /** Submit the latest immutable Ghostty frame to the per-tab GPU thread. */
+    private void publishVulkanFrameNow(boolean forceFull) {
+        TerminalVulkanView view = mVulkanView;
+        if (view == null || mVulkanFailed || !view.isRenderActive() || !view.isSupported() ||
+            mEmulator == null ||
+            mRenderer == null || !mEmulator.isGhosttyRenderAuthorityActive() ||
+            getWidth() <= 0 || getHeight() <= 0 || !hasCurrentTerminalGeometry()) return;
+
+        long commandGeneration = mRenderer.getGhosttyRetainedCommandGeneration();
+        long modelRevision = mRenderer.getGhosttyCachedModelRevision();
+        int topRow = mTopRow;
+        float viewportOffset = mViewportPixelOffset;
+        int width = getWidth();
+        int height = getHeight();
+        boolean sizeChanged = width != mGpuLastSubmittedWidth ||
+            height != mGpuLastSubmittedHeight;
+        boolean requiresSubmission = forceFull || !view.isFrameReady() ||
+            view.getConsumedCommandGeneration() == Long.MIN_VALUE ||
+            commandGeneration != mGpuLastSubmittedCommandGeneration ||
+            modelRevision != mGpuLastSubmittedModelRevision ||
+            topRow != mGpuLastSubmittedTopRow ||
+            Math.abs(viewportOffset - mGpuLastSubmittedViewportOffset) > 0.01f ||
+            sizeChanged;
+        if (!requiresSubmission) return;
+        boolean exportFull = forceFull || !view.isFrameReady() ||
+            view.getConsumedCommandGeneration() == Long.MIN_VALUE || sizeChanged;
+
+        int[] selectors = mDefaultSelectors;
+        if (mTextSelectionCursorController != null) {
+            mTextSelectionCursorController.getSelectors(selectors);
+        }
+        TerminalGpuFrame frame = mRenderer.prepareGpuFrame(mEmulator, width, height, topRow,
+            viewportOffset, exportFull, selectors[0], selectors[1], selectors[2], selectors[3],
+            ++mGpuFrameId, view.getConsumedCommandGeneration(), view.getConsumedTopRow());
+        if (frame == null || !frame.contentReady) return;
+        view.submitFrame(frame);
+        mGpuLastSubmittedCommandGeneration = frame.commandGeneration;
+        mGpuLastSubmittedModelRevision = frame.modelRevision;
+        mGpuLastSubmittedTopRow = topRow;
+        mGpuLastSubmittedViewportOffset = viewportOffset;
+        mGpuLastSubmittedWidth = width;
+        mGpuLastSubmittedHeight = height;
     }
 
     @Override
@@ -467,7 +1005,7 @@ public final class TerminalView extends View {
 
     @Override
     protected int computeVerticalScrollRange() {
-        return mEmulator == null ? 1 : mEmulator.getScreen().getActiveRows();
+        return mEmulator == null ? 1 : mEmulator.getActiveRows();
     }
 
     @Override
@@ -477,7 +1015,7 @@ public final class TerminalView extends View {
 
     @Override
     protected int computeVerticalScrollOffset() {
-        return mEmulator == null ? 1 : mEmulator.getScreen().getActiveRows() + mTopRow - mEmulator.mRows;
+        return mEmulator == null ? 1 : mEmulator.getActiveRows() + mTopRow - mEmulator.mRows;
     }
 
     public void onScreenUpdated() {
@@ -487,11 +1025,15 @@ public final class TerminalView extends View {
     public void onScreenUpdated(boolean skipScrolling) {
         if (mEmulator == null) return;
 
-        TerminalBuffer screen = mEmulator.getScreen();
-        int rowsInHistory = screen.getActiveTranscriptRows();
-        if (mTopRow < -rowsInHistory) mTopRow = -rowsInHistory;
-        boolean requireFullInvalidate = mEmulator.isFullRedrawRequired();
-        final int scrolledRows = mEmulator.getScrollCounter();
+        boolean ghosttyAuthority = mEmulator.isGhosttyRenderAuthorityActive();
+        TerminalBuffer screen = ghosttyAuthority ? null : mEmulator.getScreen();
+        int rowsInHistory = mEmulator.getActiveTranscriptRows();
+        if (mTopRow < -rowsInHistory) {
+            mTopRow = -rowsInHistory;
+            mViewportPixelOffset = 0f;
+        }
+        boolean requireFullInvalidate = mEmulator.consumeFullRedrawRequired();
+        final int scrolledRows = mEmulator.consumeScrollCounter();
 
         // Only follow output when we are already at the bottom. If the user has scrolled up (mTopRow != 0),
         // keep their scroll position stable while new output is appended.
@@ -500,14 +1042,17 @@ public final class TerminalView extends View {
         if (!followOutput) {
             int rowShift = scrolledRows;
             if (rowShift != 0) {
+                float viewportPositionBeforeOutputShift = getViewportPositionPixels();
                 if (-mTopRow + rowShift > rowsInHistory) {
                     // We're hitting the end of the history transcript, clamp to the oldest available row.
                     if (selectingText) stopTextSelectionMode();
                     mTopRow = -rowsInHistory;
+                    mViewportPixelOffset = 0f;
                 } else {
                     mTopRow -= rowShift;
                     if (selectingText) decrementYTextSelectionCursors(rowShift);
                 }
+                rebaseActiveLocalScrollAfterOutput(viewportPositionBeforeOutputShift);
                 requireFullInvalidate = true;
             }
             skipScrolling = true;
@@ -522,12 +1067,13 @@ public final class TerminalView extends View {
                 awakenScrollBars();
             }
             mTopRow = 0;
+            mViewportPixelOffset = 0f;
             requireFullInvalidate = true;
         }
 
         int dirtyStart = Integer.MAX_VALUE;
         int dirtyEnd = Integer.MIN_VALUE;
-        if (screen.hasDirtyRows()) {
+        if (screen != null && screen.hasDirtyRows()) {
             dirtyStart = screen.getDirtyStartRow();
             dirtyEnd = screen.getDirtyEndRow();
         }
@@ -549,9 +1095,35 @@ public final class TerminalView extends View {
             }
         }
 
-        mEmulator.clearScrollCounter();
-        mEmulator.clearFullRedrawRequired();
-        screen.clearDirtyRows();
+        if (screen != null) screen.clearDirtyRows();
+
+        if (ghosttyAuthority) {
+            int[] selectors = mDefaultSelectors;
+            if (mTextSelectionCursorController != null) {
+                mTextSelectionCursorController.getSelectors(selectors);
+            }
+            boolean prepared = mRenderer != null && mRenderer.prewarmGhosttyFrame(
+                mEmulator, mTopRow, mViewportPixelOffset, requireFullInvalidate,
+                selectors[0], selectors[1], selectors[2], selectors[3]);
+            if (!prepared) {
+                scheduleRenderFrame(true);
+                return;
+            }
+
+            if (requireFullInvalidate || mRenderer.isPreparedGhosttyDamageFull()) {
+                publishGhosttyRenderFrameNow(true, -1, -1);
+                return;
+            }
+
+            int damageStart = mRenderer.getPreparedGhosttyDamageStart();
+            int damageEnd = mRenderer.getPreparedGhosttyDamageEnd();
+            if (damageStart < damageEnd) {
+                publishGhosttyRenderFrameNow(true, damageStart, damageEnd);
+            } else {
+                publishVulkanFrameNow(false);
+            }
+            return;
+        }
 
         if (requireFullInvalidate) {
             scheduleRenderFrame(true);
@@ -584,16 +1156,384 @@ public final class TerminalView extends View {
      */
     public void setTextSize(int textSize) {
         if (mRenderer != null && mRenderer.mTextSize == textSize) return;
-        mRenderer = new TerminalRenderer(textSize, mRenderer == null ? Typeface.MONOSPACE : mRenderer.mTypeface);
+        if (mRenderer == null) {
+            mRenderer = new TerminalRenderer(textSize, Typeface.MONOSPACE);
+        } else {
+            mRenderer.reconfigure(textSize, mRenderer.mTypeface);
+        }
+        resetVulkanSubmissionState();
         invalidate();
-        updateSize();
+        requestTerminalGeometry(TerminalGeometryCommitPolicy.Source.USER_TEXT_SCALE,
+            false, 0, -1, -1, -1);
+        publishVulkanFrameNow(true);
+    }
+
+    /** Test-only diagnostic accessor; production rendering state remains renderer-owned. */
+    public int getTextSizeForDiagnostics() {
+        return mRenderer == null ? 0 : mRenderer.mTextSize;
+    }
+
+    public int getResizeAnchorOutcomeForDiagnostics() {
+        return mEmulator == null ? 0 : mEmulator.getGhosttyResizeAnchorOutcome();
+    }
+
+    public String getResizeAnchorStatusForDiagnostics() {
+        return mEmulator == null ? "emulator=none outcome=0" :
+            mEmulator.getGhosttyResizeAnchorStatusForDiagnostics();
+    }
+
+    public boolean isResizeAnchorCommitValidForDiagnostics() {
+        return mEmulator != null &&
+            mEmulator.isGhosttyResizeAnchorCommitValidForDiagnostics();
+    }
+
+    public float getViewportPixelOffsetForDiagnostics() {
+        return mViewportPixelOffset;
+    }
+
+    /** Device-lab hook for exercising pinch anchoring at a deterministic transcript position. */
+    public void setViewportPositionForDiagnostics(int topRow, float pixelOffset) {
+        if (mEmulator == null || mRenderer == null) return;
+        float lineHeight = Math.max(1f, mRenderer.mFontLineSpacing);
+        setViewportPositionPixels(topRow * lineHeight + pixelOffset, false);
+        requestFullRenderFrame();
+    }
+
+    public int getTranscriptRowsForDiagnostics() {
+        return mEmulator == null ? 0 : mEmulator.getActiveTranscriptRows();
+    }
+
+    public float getScaleReportedFocusDriftForDiagnostics() {
+        return mScaleReportedFocusMaxDrift;
+    }
+
+    public boolean isScalePivotLockedForDiagnostics() {
+        return true;
+    }
+
+    public boolean isScaleLiveEdgePinnedForDiagnostics() {
+        return mScaleGesturePinnedToLiveEdge;
+    }
+
+    public int getScaleLiveEdgePinCountForDiagnostics() {
+        return mScaleLiveEdgePinCount;
+    }
+
+    private void scheduleRealtimeScaleFrame() {
+        if (mScaleFrameScheduled) return;
+        mScaleFrameScheduled = true;
+        postOnAnimation(() -> {
+            mScaleFrameScheduled = false;
+            applyRealtimeScaleFrame();
+        });
+    }
+
+    private void applyRealtimeScaleFrame() {
+        if (mRenderer == null || mEmulator == null) {
+            mScaleCommitPending = false;
+            return;
+        }
+        int target = mScaleTargetTextSize;
+        if (target > 0 && target != mRenderer.mTextSize) {
+            applyRealtimeTextSize(target, mScaleFocusX, mScaleFocusY);
+        }
+        if (!mScaleGestureActive && mScaleCommitPending) {
+            mScaleCommitPending = false;
+            mScaleFactor = 1f;
+            mRenderer.setRealtimeScaleActive(false);
+            mScaleGlyphWarmupPending = true;
+            if (mClient != null) {
+                mClient.onScaleTextSizeChanged(mRenderer.mTextSize, true);
+            }
+            long elapsedMicros = Math.max(0L,
+                (System.nanoTime() - mScaleGestureStartedNanos) / 1000L);
+            Log.i(LOG_TAG, "pinch-reflow-v4 startPx=" + mScaleStartTextSize +
+                " endPx=" + mRenderer.mTextSize + " nativeReflows=" + mScaleReflowCount +
+                " elapsedUs=" + elapsedMicros +
+                " metricUs=" + averageScaleMicros(mScaleMetricNanos) + '/' +
+                    nanosToMicros(mScaleMetricMaxNanos) +
+                " resizeUs=" + averageScaleMicros(mScaleResizeNanos) + '/' +
+                    nanosToMicros(mScaleResizeMaxNanos) +
+                " anchorUs=" + averageScaleMicros(mScaleAnchorNanos) + '/' +
+                    nanosToMicros(mScaleAnchorMaxNanos) +
+                " anchorOutcome=" + mScaleAnchorExactCount + '/' +
+                    mScaleAnchorClampedCount + '/' + mScaleAnchorUnavailableCount +
+                " viewport=" + mScaleGestureStartTopRow + "->" + mTopRow +
+                " scrollback=" + mScaleGestureStartTranscriptRows + "->" +
+                    mEmulator.getActiveTranscriptRows() +
+                " alternate=" + mScaleGestureStartedAlternateScreen +
+                " viewportPolicy=" + (mScaleGesturePinnedToLiveEdge
+                    ? "inline-tui-live-edge" : "tracked-cell-universal") +
+                " liveEdgePins=" + mScaleLiveEdgePinCount +
+                " pivot=fixed reportedFocusDriftPx=" +
+                    Math.round(mScaleReportedFocusMaxDrift) +
+                " multitouchExclusive=true" +
+                " ptyResize=continuous-vsync" +
+                " realReflow=true resizePath={" +
+                    mEmulator.getGhosttyResizeStatusForDiagnostics() +
+                "} anchorPath={" +
+                    mEmulator.getGhosttyResizeAnchorStatusForDiagnostics() + '}');
+        }
+    }
+
+    private void abortRealtimeScaleGesture(String reason) {
+        if (!mScaleGestureActive && !mScaleCommitPending) return;
+        int currentTextSize = mRenderer == null ? -1 : mRenderer.mTextSize;
+        mScaleGestureActive = false;
+        mScaleCommitPending = false;
+        mScaleTargetTextSize = mScaleStartTextSize;
+        if (mRenderer != null && mEmulator != null && mScaleStartTextSize > 0 &&
+            currentTextSize != mScaleStartTextSize) {
+            applyRealtimeTextSize(mScaleStartTextSize, mScaleFocusX, mScaleFocusY);
+        }
+        if (mRenderer != null) mRenderer.setRealtimeScaleActive(false);
+        Log.i(LOG_TAG, "pinch-reflow-v4 aborted reason=" + reason +
+            " startPx=" + mScaleStartTextSize + " currentPx=" + currentTextSize +
+            " samples=" + mScaleSampleCount + " qualified=" + mScaleGestureQualified +
+            " persisted=false");
+    }
+
+    private void applyRealtimeTextSize(int textSize, float focusX, float focusY) {
+        int oldTopRow = mTopRow;
+        int oldScreenRows = mEmulator.mRows;
+        int oldTranscriptRows = mEmulator.getActiveTranscriptRows();
+        int oldLineSpacingAndAscent = mRenderer.mFontLineSpacingAndAscent;
+        float oldLineHeight = Math.max(1f, mRenderer.mFontLineSpacing);
+        float oldViewportRow = TerminalPinchViewportAnchor.continuousViewportRow(
+            focusY, oldLineSpacingAndAscent, oldLineHeight, mViewportPixelOffset);
+        int anchorViewportRow = TerminalPinchViewportAnchor.trackedCellRow(
+            oldViewportRow, oldScreenRows);
+        float anchorCellFraction = TerminalPinchViewportAnchor.cellFraction(
+            oldViewportRow, anchorViewportRow);
+        int anchorColumn = TerminalPinchViewportAnchor.cellColumn(
+            focusX, mRenderer.mFontWidth, mEmulator.mColumns);
+        float logicalAnchorRow = oldTopRow + oldViewportRow;
+
+        long stageStarted = System.nanoTime();
+        mRenderer.reconfigure(textSize, mRenderer.mTypeface);
+        long metricNanos = System.nanoTime() - stageStarted;
+        mScaleMetricNanos += metricNanos;
+        mScaleMetricMaxNanos = Math.max(mScaleMetricMaxNanos, metricNanos);
+
+        int targetViewportRow = TerminalPinchViewportAnchor.targetCellRow(
+            focusY, mRenderer.mFontLineSpacingAndAscent,
+            mRenderer.mFontLineSpacing, Math.max(4,
+                (getHeight() - mRenderer.mFontLineSpacingAndAscent) /
+                    Math.max(1, mRenderer.mFontLineSpacing)));
+        float targetPixelOffset = TerminalPinchViewportAnchor.targetPixelOffset(
+            focusY, mRenderer.mFontLineSpacingAndAscent, mRenderer.mFontLineSpacing,
+            targetViewportRow, anchorCellFraction);
+
+        stageStarted = System.nanoTime();
+        boolean resized = updateSizeImmediately(true,
+            mScaleGesturePinnedToLiveEdge ? 0 : oldTopRow,
+            mScaleGesturePinnedToLiveEdge ? -1 : anchorColumn,
+            mScaleGesturePinnedToLiveEdge ? -1 : anchorViewportRow,
+            mScaleGesturePinnedToLiveEdge ? -1 : targetViewportRow);
+        long resizeNanos = System.nanoTime() - stageStarted;
+        mScaleResizeNanos += resizeNanos;
+        mScaleResizeMaxNanos = Math.max(mScaleResizeMaxNanos, resizeNanos);
+
+        stageStarted = System.nanoTime();
+        if (mEmulator != null) {
+            float newLineHeight = Math.max(1f, mRenderer.mFontLineSpacing);
+            int anchorOutcome = resized ? mEmulator.getGhosttyResizeAnchorOutcome() : 0;
+            if (mScaleGesturePinnedToLiveEdge) {
+                mTopRow = 0;
+                mViewportPixelOffset = 0f;
+                mScrollRemainder = 0f;
+                mScaleLiveEdgePinCount++;
+            } else if (mEmulator.isGhosttyRenderAuthorityActive()) {
+                commitNativeAnchoredViewport(resized
+                        ? mEmulator.getGhosttyViewportTopRow() : oldTopRow,
+                    targetPixelOffset, newLineHeight);
+                if (!resized || anchorOutcome == 1) {
+                    mScaleAnchorExactCount++;
+                } else if (anchorOutcome == 2) {
+                    mScaleAnchorClampedCount++;
+                } else {
+                    // Native already committed a bounded same-relative-position fallback when the
+                    // tracked cell was legitimately discarded by resize. Keep that integer row;
+                    // never run the old proportional formula on top of it.
+                    mScaleAnchorUnavailableCount++;
+                }
+            } else {
+                float reflowedAnchorRow = logicalAnchorRow +
+                    (mEmulator.mRows - oldScreenRows);
+                float anchoredTop = reflowedAnchorRow -
+                    (focusY - mRenderer.mFontLineSpacingAndAscent) / newLineHeight;
+                setViewportPositionPixels(anchoredTop * newLineHeight, false);
+                mScaleAnchorUnavailableCount++;
+            }
+            Log.d(LOG_TAG, "pinch-anchor-v4 outcome=" + anchorOutcome +
+                " top=" + oldTopRow + "->" + mTopRow +
+                " scrollback=" + oldTranscriptRows + "->" +
+                    mEmulator.getActiveTranscriptRows() +
+                " cell=" + anchorColumn + ',' + anchorViewportRow + "->" +
+                    targetViewportRow + " offset=" + Math.round(mViewportPixelOffset) +
+                " viewportPolicy=" + (mScaleGesturePinnedToLiveEdge
+                    ? "inline-tui-live-edge" : "tracked-cell-universal") +
+                " alternate=" + mEmulator.isAlternateBufferActive() + " native={" +
+                    mEmulator.getGhosttyResizeAnchorStatusForDiagnostics() + '}');
+        }
+        scrollTo(0, 0);
+        requestFullRenderFrame();
+        long anchorNanos = System.nanoTime() - stageStarted;
+        mScaleAnchorNanos += anchorNanos;
+        mScaleAnchorMaxNanos = Math.max(mScaleAnchorMaxNanos, anchorNanos);
+        mScaleReflowCount++;
+    }
+
+    /**
+     * Commit the native tracked-cell row and its sub-row visual fraction as one viewport. This
+     * intentionally bypasses TerminalViewportPosition.resolve(): that helper is correct for finger
+     * scrolling, but its directional floor/ceil representation may change the integer top row and
+     * would therefore invalidate the native resize anchor on the next render packet.
+     */
+    private void commitNativeAnchoredViewport(int nativeTopRow, float requestedPixelOffset,
+                                              float lineHeight) {
+        int transcriptRows = mEmulator == null ? 0 : mEmulator.getActiveTranscriptRows();
+        mTopRow = Math.max(-transcriptRows, Math.min(0, nativeTopRow));
+        mViewportPixelOffset = TerminalPinchViewportAnchor.committedPixelOffset(
+            mTopRow, transcriptRows, lineHeight, requestedPixelOffset);
+        mScrollRemainder = 0f;
+        awakenScrollBars();
+    }
+
+    private long averageScaleMicros(long nanos) {
+        return mScaleReflowCount <= 0 ? 0L : nanos / mScaleReflowCount / 1000L;
+    }
+
+    private static long nanosToMicros(long nanos) {
+        return nanos / 1000L;
+    }
+
+    private void beginScaleGlyphWarmupAfterPresentedFrame() {
+        if (!mScaleGlyphWarmupPending || mScaleGestureActive || mRenderer == null) return;
+        mScaleGlyphWarmupPending = false;
+        mGlyphWarmupFromIdle = false;
+        mIdleGlyphWarmActiveGeneration = Long.MIN_VALUE;
+        mScaleGlyphWarmCandidates = mRenderer.beginScaleGlyphWarmup();
+        if (mScaleGlyphWarmCandidates > 0) scheduleScaleGlyphWarmFrame();
+    }
+
+    private void armIdleGlyphWarmupAfterPresentedFrame() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || mRenderer == null ||
+            mEmulator == null || !mEmulator.isGhosttyRenderAuthorityActive() ||
+            mScaleGestureActive || mScaleCommitPending || mScaleGlyphWarmupPending ||
+            mScaleGlyphWarmFrameScheduled || mFingerScrollTracker.isActive() ||
+            !mScroller.isFinished()) {
+            return;
+        }
+        long generation = mRenderer.getGhosttyRetainedCommandGeneration();
+        if (generation == mIdleGlyphWarmCompletedGeneration) return;
+        if (generation != mIdleGlyphWarmCandidateGeneration) {
+            mIdleGlyphWarmCandidateGeneration = generation;
+            mIdleGlyphWarmStableFrames = 0;
+        }
+        scheduleIdleGlyphWarmCheck();
+    }
+
+    private void scheduleIdleGlyphWarmCheck() {
+        if (mIdleGlyphWarmCheckScheduled) return;
+        mIdleGlyphWarmCheckScheduled = true;
+        postOnAnimation(() -> {
+            mIdleGlyphWarmCheckScheduled = false;
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                mRenderer == null || mEmulator == null || !isAttachedToWindow() ||
+                !isShown() || !mEmulator.isGhosttyRenderAuthorityActive() ||
+                mScaleGestureActive || mScaleCommitPending || mScaleGlyphWarmupPending ||
+                mScaleGlyphWarmFrameScheduled || mFingerScrollTracker.isActive() ||
+                !mScroller.isFinished()) {
+                mIdleGlyphWarmStableFrames = 0;
+                return;
+            }
+            long generation = mRenderer.getGhosttyRetainedCommandGeneration();
+            if (generation != mIdleGlyphWarmCandidateGeneration ||
+                !mRenderer.hasCompleteGhosttyFrame(mTopRow, mEmulator.mRows)) {
+                mIdleGlyphWarmCandidateGeneration = generation;
+                mIdleGlyphWarmStableFrames = 0;
+                return;
+            }
+            if (mFrameInvalidationScheduled) {
+                mIdleGlyphWarmStableFrames = 0;
+                return;
+            }
+            if (++mIdleGlyphWarmStableFrames < IDLE_GLYPH_WARM_STABLE_FRAME_COUNT) {
+                scheduleIdleGlyphWarmCheck();
+                return;
+            }
+
+            mGlyphWarmupFromIdle = true;
+            mIdleGlyphWarmActiveGeneration = generation;
+            mScaleGlyphWarmCandidates = mRenderer.beginScaleGlyphWarmup();
+            mScaleGlyphWarmFrames = 0;
+            mScaleGlyphWarmNanos = 0L;
+            if (mScaleGlyphWarmCandidates > 0) {
+                scheduleScaleGlyphWarmFrame();
+            } else {
+                mIdleGlyphWarmCompletedGeneration = generation;
+                mGlyphWarmupFromIdle = false;
+                mIdleGlyphWarmActiveGeneration = Long.MIN_VALUE;
+            }
+        });
+    }
+
+    private void scheduleScaleGlyphWarmFrame() {
+        if (mScaleGlyphWarmFrameScheduled) return;
+        mScaleGlyphWarmFrameScheduled = true;
+        postOnAnimation(() -> {
+            mScaleGlyphWarmFrameScheduled = false;
+            if (mScaleGestureActive || mRenderer == null || !isAttachedToWindow()) {
+                mGlyphWarmupFromIdle = false;
+                mIdleGlyphWarmActiveGeneration = Long.MIN_VALUE;
+                return;
+            }
+            long started = System.nanoTime();
+            int remaining = mRenderer.warmScaleGlyphCache(SCALE_GLYPH_WARM_RUNS_PER_FRAME);
+            mScaleGlyphWarmNanos += System.nanoTime() - started;
+            mScaleGlyphWarmFrames++;
+            if (remaining > 0) {
+                scheduleScaleGlyphWarmFrame();
+            } else {
+                boolean wasIdleWarmup = mGlyphWarmupFromIdle;
+                long warmupGeneration = wasIdleWarmup
+                    ? mIdleGlyphWarmActiveGeneration
+                    : mRenderer.getGhosttyRetainedCommandGeneration();
+                boolean idleWarmupCommitted = wasIdleWarmup &&
+                    mIdleGlyphWarmActiveGeneration ==
+                        mRenderer.getGhosttyRetainedCommandGeneration();
+                if (idleWarmupCommitted) {
+                    mIdleGlyphWarmCompletedGeneration = mIdleGlyphWarmActiveGeneration;
+                }
+                Log.i(LOG_TAG, (wasIdleWarmup ? "idle" : "pinch") +
+                    "-glyph-warm-v2 candidates=" +
+                    mScaleGlyphWarmCandidates + " prepared=" +
+                    mRenderer.getScaleGlyphWarmPrepared() + " frames=" +
+                    mScaleGlyphWarmFrames + " elapsedUs=" +
+                    nanosToMicros(mScaleGlyphWarmNanos) +
+                    " budgetRuns=" + SCALE_GLYPH_WARM_RUNS_PER_FRAME +
+                    " generation=" + warmupGeneration +
+                    (wasIdleWarmup ? " committed=" + idleWarmupCommitted : "") +
+                    " pixelsUnchanged=true");
+                mGlyphWarmupFromIdle = false;
+                mIdleGlyphWarmActiveGeneration = Long.MIN_VALUE;
+            }
+        });
     }
 
     public void setTypeface(Typeface newTypeface) {
         if (mRenderer != null && mRenderer.mTypeface == newTypeface) return;
-        mRenderer = new TerminalRenderer(mRenderer.mTextSize, newTypeface);
-        updateSize();
+        if (mRenderer == null) {
+            mRenderer = new TerminalRenderer(14, newTypeface);
+        } else {
+            mRenderer.reconfigure(mRenderer.mTextSize, newTypeface);
+        }
+        resetVulkanSubmissionState();
+        requestTerminalGeometry(TerminalGeometryCommitPolicy.Source.USER_TEXT_SCALE,
+            false, 0, -1, -1, -1);
         invalidate();
+        publishVulkanFrameNow(true);
     }
 
     @Override
@@ -603,7 +1543,7 @@ public final class TerminalView extends View {
 
     @Override
     public boolean isOpaque() {
-        return true;
+        return !isVulkanFrameActive();
     }
 
     @Override
@@ -627,7 +1567,8 @@ public final class TerminalView extends View {
      */
     public int[] getColumnAndRow(MotionEvent event, boolean relativeToScroll) {
         int column = (int) (event.getX() / mRenderer.mFontWidth);
-        int row = (int) ((event.getY() - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
+        int row = (int) ((event.getY() + mViewportPixelOffset -
+            mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
         if (relativeToScroll) {
             row += mTopRow;
         }
@@ -652,52 +1593,380 @@ public final class TerminalView extends View {
         mEmulator.sendMouseEvent(button, x, y, pressed);
     }
 
-    /**
-     * For touch gestures, client may opt out from terminal mouse-tracking behavior
-     * (e.g. pinned ssh/tmux sessions prefer smooth local transcript scrolling).
-     */
+    /** Touch taps use an independent policy from touch scrolling. */
     private boolean shouldUseMouseTrackingForTouchTap() {
         return mEmulator != null &&
-            mEmulator.isMouseTrackingActive() &&
-            (mClient == null || mClient.shouldSendMouseWheelEventsForTouchScroll(mTermSession));
+            TerminalTouchInputPolicy.shouldSendMouseClick(
+                mEmulator.isMouseTrackingActive(),
+                mClient == null || mClient.shouldSendMouseClickEventsForTouchTap(mTermSession));
+    }
+
+    private TerminalTouchInputPolicy.ScrollRoute resolveTouchScrollRoute() {
+        if (mEmulator == null) return TerminalTouchInputPolicy.ScrollRoute.LOCAL_VIEWPORT;
+        boolean shouldSendMouseWheel = mClient == null ||
+            mClient.shouldSendMouseWheelEventsForTouchScroll(mTermSession);
+        return TerminalTouchInputPolicy.resolveScrollRoute(
+            mEmulator.isMouseTrackingActive(), shouldSendMouseWheel,
+            mEmulator.getActiveTranscriptRows());
+    }
+
+    private boolean shouldUseMouseTrackingForTouchScroll() {
+        return resolveTouchScrollRoute() ==
+            TerminalTouchInputPolicy.ScrollRoute.REMOTE_MOUSE_WHEEL;
+    }
+
+    private boolean isSmoothGhosttyLocalScroll() {
+        if (mEmulator == null || mRenderer == null ||
+            !mEmulator.isGhosttyRenderAuthorityActive()) return false;
+        return resolveTouchScrollRoute() ==
+            TerminalTouchInputPolicy.ScrollRoute.LOCAL_VIEWPORT;
+    }
+
+    private float getViewportPositionPixels() {
+        if (mRenderer == null) return 0f;
+        return mTopRow * (float) mRenderer.mFontLineSpacing + mViewportPixelOffset;
+    }
+
+    private void setViewportPositionPixels(float position) {
+        setViewportPositionPixels(position, true);
+    }
+
+    private void setViewportPositionPixels(float position, boolean publishImmediately) {
+        if (mEmulator == null || mRenderer == null) return;
+        float lineHeight = Math.max(1f, mRenderer.mFontLineSpacing);
+        float previousPosition = getViewportPositionPixels();
+        TerminalViewportPosition.resolve(position, mEmulator.getActiveTranscriptRows(), lineHeight,
+            previousPosition, mTopRow, mViewportPixelOffset, mResolvedViewportPosition);
+        int topRow = mResolvedViewportPosition.topRow;
+        float offset = mResolvedViewportPosition.pixelOffset;
+        if (topRow == mTopRow && Math.abs(offset - mViewportPixelOffset) < 0.01f) return;
+        mTopRow = topRow;
+        mViewportPixelOffset = offset;
+        mScrollRemainder = 0f;
+        awakenScrollBars();
+        if (publishImmediately) publishViewportRenderFrameNow();
+    }
+
+    /** Output can move history while an absolute touch anchor or fling is still active. */
+    private void rebaseActiveLocalScrollAfterOutput(float viewportPositionBeforeOutputShift) {
+        if (mRenderer == null) return;
+        float viewportDelta = getViewportPositionPixels() - viewportPositionBeforeOutputShift;
+        if (Math.abs(viewportDelta) < 0.01f) return;
+        if (mFingerScrollTracker.isActive()) mFingerScrollTracker.rebase(viewportDelta);
+        // Scroller has no supported way to rebase its internal coordinate system mid-flight.
+        if (isSmoothGhosttyLocalScroll() && !mScroller.isFinished()) mScroller.abortAnimation();
+    }
+
+    /** Force a complete retained-frame transaction before this terminal can become visible. */
+    public void requestFullRenderFrame() {
+        if (mRenderer != null) mRenderer.requestFullFrame();
+        mPendingFullInvalidation = true;
+        if (mEmulator == null) updateSize();
+        if (mEmulator != null && getWidth() > 0) {
+            scheduleRenderFrame(false);
+        } else {
+            invalidate();
+        }
     }
 
     /**
-     * For touch scroll we honor client preference directly. Pinned ssh/tmux sessions disable
-     * remote wheel and rely on local transcript for smooth scrolling.
+     * Ensures that one authoritative terminal frame is handed to the IME camera.
+     *
+     * <p>Opening the keyboard or returning from history creates a new focus transaction even when
+     * terminal pixels did not change. The request generation therefore forces one callback for an
+     * already-ready frame. When a frame is pending, use the retained-delta path first and request a
+     * full frame only when that cache cannot establish a current presentation.</p>
      */
-    private boolean shouldUseMouseTrackingForTouchScroll() {
-        if (mEmulator == null || !mEmulator.isMouseTrackingActive()) return false;
-        if (mClient == null || mClient.shouldSendMouseWheelEventsForTouchScroll(mTermSession)) return true;
-        // Keep pinned ssh/tmux smooth-first, but never dead: if no local transcript yet, fallback to remote wheel.
-        return mEmulator.getScreen().getActiveTranscriptRows() <= 0;
+    @MainThread
+    public void requestImeCameraFrame() {
+        mImeCameraFrameRequests++;
+        mImeCameraFrameRequestPolicy.request();
+
+        ImeCameraSnapshot snapshot = getImeCameraSnapshot();
+        if (snapshot.availability == ImeCameraSnapshot.Availability.READY) {
+            mImeCameraFrameImmediateNotifications++;
+            notifyImeCameraFrameReady();
+            return;
+        }
+        if (snapshot.availability == ImeCameraSnapshot.Availability.HISTORY_OWNED) return;
+
+        boolean prewarmed = mEmulator != null && mRenderer != null &&
+            mEmulator.isGhosttyRenderAuthorityActive() && prewarmRenderFrame(false);
+        if (prewarmed) {
+            mImeCameraFrameDeltaPrewarms++;
+            // The retained cache now contains the frame, but Canvas still needs a traversal and
+            // Vulkan still needs one UI-thread presentation callback before it is camera-safe.
+            scheduleRenderFrame(false);
+            return;
+        }
+
+        mImeCameraFrameFullFallbacks++;
+        requestFullRenderFrame();
+    }
+
+    /** True when a retained frame can be brought current without rebuilding every row. */
+    public boolean hasCompleteRenderFrame() {
+        if (!hasCurrentTerminalGeometry()) return false;
+        return !mEmulator.isGhosttyRenderAuthorityActive() ||
+            mRenderer.hasCompleteGhosttyFrame(mTopRow, mEmulator.mRows);
+    }
+
+    /** True only when PTY rows/columns and cell metrics match the View's current pixel bounds. */
+    public boolean hasCurrentTerminalGeometryForDiagnostics() {
+        return hasCurrentTerminalGeometry();
+    }
+
+    /** Immutable result consumed by the host's per-tab IME focus camera. */
+    public static final class ImeCameraSnapshot {
+        public enum Availability {
+            READY,
+            FRAME_PENDING,
+            HISTORY_OWNED
+        }
+
+        @NonNull public final Availability availability;
+        public final int cursorTopPx;
+        public final int cursorBottomPx;
+        /** Bottom of the frame-committed semantic footer/status envelope, never above cursor. */
+        public final int protectedBottomPx;
+        public final long contentRevision;
+        public final long presentedRevision;
+
+        private ImeCameraSnapshot(@NonNull Availability availability, int cursorTopPx,
+                                  int cursorBottomPx, int protectedBottomPx, long contentRevision,
+                                  long presentedRevision) {
+            this.availability = availability;
+            this.cursorTopPx = cursorTopPx;
+            this.cursorBottomPx = cursorBottomPx;
+            this.protectedBottomPx = protectedBottomPx;
+            this.contentRevision = contentRevision;
+            this.presentedRevision = presentedRevision;
+        }
+    }
+
+    /**
+     * Returns the cursor rectangle only when it belongs to the frame currently on screen.
+     *
+     * <p>History is an explicit ownership state, not a missing-anchor error. A frame that is being
+     * rebuilt is likewise distinguished from history so the surface can hold its last committed
+     * transform instead of jumping to zero. The cursor remains the only focus authority; semantic
+     * footer/status rows from that same committed frame extend only its occlusion envelope.</p>
+     */
+    @NonNull
+    public ImeCameraSnapshot getImeCameraSnapshot() {
+        long contentRevision = mEmulator == null
+            ? Long.MIN_VALUE : mEmulator.getContentRevision();
+        if (mEmulator != null && (mTopRow != 0 ||
+            Math.abs(mViewportPixelOffset) >= 0.01f ||
+            mEmulator.isAutoScrollDisabled())) {
+            return new ImeCameraSnapshot(ImeCameraSnapshot.Availability.HISTORY_OWNED,
+                -1, -1, -1, contentRevision, mLastPresentedContentRevision);
+        }
+        if (mEmulator == null || mRenderer == null || getHeight() <= 0 ||
+            !hasCurrentTerminalGeometry()) {
+            return new ImeCameraSnapshot(ImeCameraSnapshot.Availability.FRAME_PENDING,
+                -1, -1, -1, contentRevision, mLastPresentedContentRevision);
+        }
+
+        boolean frameGeometryCurrent = mLastPresentedTopRow == mTopRow &&
+            mLastPresentedViewportOffsetBits == Float.floatToIntBits(mViewportPixelOffset) &&
+            mLastPresentedViewHeight == getHeight() &&
+            mLastPresentedFontLineSpacing == mRenderer.mFontLineSpacing &&
+            mLastPresentedFontLineSpacingAndAscent == mRenderer.mFontLineSpacingAndAscent &&
+            mLastPresentedContentRevision != Long.MIN_VALUE;
+        int screenRow = mLastRenderedCursorRow - mLastPresentedTopRow;
+        if (!frameGeometryCurrent || !mLastPresentedCursorEnabled ||
+            screenRow < 0 || screenRow >= mEmulator.mRows) {
+            return new ImeCameraSnapshot(ImeCameraSnapshot.Availability.FRAME_PENDING,
+                -1, -1, -1, contentRevision, mLastPresentedContentRevision);
+        }
+        int protectedScreenRow = mLastPresentedImeProtectedBottomScreenRow;
+        if (protectedScreenRow < screenRow || protectedScreenRow >= mEmulator.mRows) {
+            protectedScreenRow = screenRow;
+        }
+        return new ImeCameraSnapshot(ImeCameraSnapshot.Availability.READY,
+            getImeScreenRowTopPx(screenRow), getImeScreenRowBottomPx(screenRow),
+            getImeScreenRowBottomPx(protectedScreenRow), contentRevision,
+            mLastPresentedContentRevision);
+    }
+
+    /** Compatibility diagnostic accessor for the bottom of the current cursor row. */
+    public int getImeCursorAnchorBottomPx() {
+        ImeCameraSnapshot snapshot = getImeCameraSnapshot();
+        return snapshot.availability == ImeCameraSnapshot.Availability.READY
+            ? snapshot.cursorBottomPx : -1;
+    }
+
+    /**
+     * Returns the bottom of the semantic input envelope from the currently presented frame.
+     *
+     * <p>The envelope may include a TUI footer or tmux status line below the cursor. It is not
+     * recomputed from a newer emulator/cache state, so an IME caller can never combine old pixels
+     * with a future tail position.</p>
+     */
+    public int getImeContentAnchorBottomPx() {
+        ImeCameraSnapshot snapshot = getImeCameraSnapshot();
+        return snapshot.availability == ImeCameraSnapshot.Availability.READY
+            ? snapshot.protectedBottomPx : -1;
+    }
+
+    private int getImeScreenRowBottomPx(int screenRow) {
+        float rowBottom = mRenderer.mFontLineSpacingAndAscent +
+            (screenRow + 1f) * mRenderer.mFontLineSpacing - mViewportPixelOffset;
+        return Math.max(1, Math.min(getHeight(), (int) Math.ceil(rowBottom)));
+    }
+
+    private int getImeScreenRowTopPx(int screenRow) {
+        float rowTop = mRenderer.mFontLineSpacingAndAscent +
+            screenRow * mRenderer.mFontLineSpacing - mViewportPixelOffset;
+        return Math.max(0, Math.min(getHeight() - 1, (int) Math.floor(rowTop)));
+    }
+
+    private boolean hasCurrentTerminalGeometry() {
+        if (mEmulator == null || mRenderer == null || getWidth() <= 0 || getHeight() <= 0) {
+            return false;
+        }
+        return mGeometryCommitPolicy.matchesCommitted(mEmulator.mColumns, mEmulator.mRows,
+            mLastSentCellWidth, mLastSentCellHeight);
+    }
+
+    /** Compact state used to verify that a committed page and its retained cache share a viewport. */
+    public String getRenderDiagnostics() {
+        int columns = mEmulator == null ? -1 : mEmulator.mColumns;
+        int rows = mEmulator == null ? -1 : mEmulator.mRows;
+        int expectedColumns = mRenderer == null || getWidth() <= 0
+            ? -1 : expectedTerminalColumns();
+        int expectedRows = mRenderer == null || getHeight() <= 0
+            ? -1 : expectedTerminalRows();
+        TerminalGeometryCommitPolicy.Geometry committed = mGeometryCommitPolicy.getCommitted();
+        String renderer = mRenderer == null ? "renderer=none" :
+            mRenderer.getGhosttyRenderDiagnostics();
+        String vulkan = mVulkanView == null ? "vulkan=absent" :
+            "vulkan={" + mVulkanView.getDiagnostics() + '}';
+        String ptyResize = mTermSession == null ? "ptyResize=none" :
+            "ptyResize={transactions=" +
+                mTermSession.getResizeTransactionsForDiagnostics() + " ioctls=" +
+                mTermSession.getPtyWindowSizeRequestsForDiagnostics() + " deduped=" +
+                mTermSession.getRedundantResizeRequestsSuppressedForDiagnostics() + '}';
+        return "view=" + System.identityHashCode(this) + " size=" + getWidth() + 'x' +
+            getHeight() + " grid=" + columns + 'x' + rows + " observedGrid=" +
+            expectedColumns + 'x' + expectedRows + " committedGrid=" +
+            (committed == null ? "none" : committed.columns + "x" + committed.rows) +
+            " geometry=" +
+            hasCurrentTerminalGeometry() + " top=" + mTopRow +
+            " offset=" + Math.round(mViewportPixelOffset) + " complete=" +
+            hasCompleteRenderFrame() + " publish=" + mRenderFrameCallbacks + '/' +
+            mRenderFrameRequests + " coalesced=" + mRenderFrameCoalesced +
+            " presented=" + mPresentedFrames + " skipped=" + mSkippedFramePresentations +
+            " revision=" +
+            mLastPresentedContentRevision + " gpuPresented=" + mGpuPresentedFrames +
+            " imeFrameRequests=" + mImeCameraFrameRequests + '/' +
+            mImeCameraFrameDeltaPrewarms + '/' + mImeCameraFrameFullFallbacks + '/' +
+            mImeCameraFrameImmediateNotifications + " imeFrameGeneration=" +
+            mImeCameraFrameRequestPolicy.getRequestedGeneration() + '/' +
+            mImeCameraFrameRequestPolicy.getNotifiedGeneration() +
+            " geometryDeferred=" + mGeometryDeferredCount +
+            " geometryCommitted=" + mGeometryCommittedCount +
+            " inputLiveEdgeRestores=" + mUserInputLiveEdgeRestores + ' ' +
+            " geometryPolicy={" + mGeometryCommitPolicy.getDiagnostics() + "} " +
+            ptyResize + ' ' + vulkan + ' ' + renderer;
+    }
+
+    public boolean isVulkanRendererExpectedForDiagnostics() {
+        return mVulkanView != null && mVulkanView.isHardwareSupportedForDiagnostics();
+    }
+
+    public boolean isVulkanFrameReadyForDiagnostics() {
+        return isVulkanFrameActive();
+    }
+
+    public boolean hasVulkanRendererFailedForDiagnostics() {
+        return mVulkanView != null &&
+            (mVulkanFailed || mVulkanView.hasPermanentlyFailedForDiagnostics());
+    }
+
+    public long getVulkanPresentedFrameCountForDiagnostics() {
+        return mVulkanView == null ? 0L : mVulkanView.getPresentedFrameCountForDiagnostics();
+    }
+
+    /**
+     * Materialize a Ghostty retained frame without depending on this view's next draw traversal.
+     * This is used by pager prewarming while a terminal page is clipped outside the viewport.
+     */
+    public boolean prewarmRenderFrame() {
+        return prewarmRenderFrame(true);
+    }
+
+    /** Incrementally update a retained Ghostty frame while this view remains offscreen. */
+    public boolean prewarmRenderDelta() {
+        return prewarmRenderFrame(false);
+    }
+
+    private boolean prewarmRenderFrame(boolean forceFull) {
+        if (mEmulator == null) updateSize();
+        if (mEmulator == null || mRenderer == null || getWidth() <= 0 || getHeight() <= 0) {
+            return false;
+        }
+        int[] sel = mDefaultSelectors;
+        if (mTextSelectionCursorController != null) {
+            mTextSelectionCursorController.getSelectors(sel);
+        }
+        boolean prepared = mRenderer.prewarmGhosttyFrame(mEmulator, mTopRow,
+            mViewportPixelOffset, forceFull,
+            sel[0], sel[1], sel[2], sel[3]);
+        if (prepared) publishVulkanFrameNow(forceFull);
+        return prepared;
+    }
+
+    private void scrollViewportByPixels(float pixels) {
+        if (pixels == 0f) return;
+        setViewportPositionPixels(getViewportPositionPixels() + pixels);
+    }
+
+    private void startSmoothGhosttyFling(float velocityY) {
+        if (mEmulator == null || mRenderer == null) return;
+        int start = Math.round(getViewportPositionPixels());
+        long minimumLong = -(long) mEmulator.getActiveTranscriptRows() *
+            Math.max(1, mRenderer.mFontLineSpacing);
+        int minimum = (int) Math.max(Integer.MIN_VALUE + 1L, minimumLong);
+        mScroller.fling(0, start, 0, -(int) velocityY,
+            0, 0, minimum, 0);
+        postOnAnimation(new Runnable() {
+            @Override
+            public void run() {
+                if (!isSmoothGhosttyLocalScroll() || mScroller.isFinished()) return;
+                boolean more = mScroller.computeScrollOffset();
+                setViewportPositionPixels(mScroller.getCurrY());
+                if (more) postOnAnimation(this);
+            }
+        });
     }
 
     /** Perform a scroll, either from dragging the screen or by scrolling a mouse wheel. */
     void doScroll(MotionEvent event, int rowsDown) {
         boolean up = rowsDown < 0;
         int amount = Math.abs(rowsDown);
-        int activeTranscriptRows = mEmulator.getScreen().getActiveTranscriptRows();
-        boolean useArrowKeysInAltBuffer = mClient != null && mClient.shouldScrollWithArrowKeysInAlternateBuffer(mTermSession);
-        boolean shouldSendMouseWheel = shouldUseMouseTrackingForTouchScroll();
+        TerminalTouchInputPolicy.ScrollRoute scrollRoute = resolveTouchScrollRoute();
 
-        if (!shouldSendMouseWheel && !(mEmulator.isAlternateBufferActive() && useArrowKeysInAltBuffer)) {
+        if (scrollRoute == TerminalTouchInputPolicy.ScrollRoute.LOCAL_VIEWPORT) {
+            if (isSmoothGhosttyLocalScroll()) {
+                scrollViewportByPixels(rowsDown * (float) mRenderer.mFontLineSpacing);
+                return;
+            }
+            int activeTranscriptRows = mEmulator.getActiveTranscriptRows();
             int delta = up ? -amount : amount;
             int nextTopRow = Math.min(0, Math.max(-activeTranscriptRows, mTopRow + delta));
             if (nextTopRow != mTopRow) {
                 mTopRow = nextTopRow;
+                mViewportPixelOffset = 0f;
                 if (!awakenScrollBars()) scheduleRenderFrame(false);
             }
             return;
         }
 
         for (int i = 0; i < amount; i++) {
-            if (shouldSendMouseWheel) {
+            if (scrollRoute == TerminalTouchInputPolicy.ScrollRoute.REMOTE_MOUSE_WHEEL) {
                 sendMouseEventCode(event, up ? TerminalEmulator.MOUSE_WHEELUP_BUTTON : TerminalEmulator.MOUSE_WHEELDOWN_BUTTON, true);
-            } else if (mEmulator.isAlternateBufferActive() && useArrowKeysInAltBuffer) {
-                    // Send up and down key events for scrolling, which is what some terminals do to make scroll work in
-                    // e.g. less, which shifts to the alt screen without mouse handling.
-                    handleKeyCode(up ? KeyEvent.KEYCODE_DPAD_UP : KeyEvent.KEYCODE_DPAD_DOWN, 0);
             }
         }
     }
@@ -707,6 +1976,8 @@ public final class TerminalView extends View {
     }
 
     private void scheduleRenderFrame(boolean updateAccessibilityDescription, int screenRowStart, int screenRowEndExclusive) {
+        mRenderFrameRequests++;
+        publishVulkanFrameNow(screenRowStart < 0 || screenRowEndExclusive <= screenRowStart);
         if (updateAccessibilityDescription && mAccessibilityEnabled) {
             mAccessibilityContentDescriptionDirty = true;
         }
@@ -728,11 +1999,21 @@ public final class TerminalView extends View {
             }
         }
 
-        if (mFrameInvalidationScheduled) return;
+        if (mFrameInvalidationScheduled) {
+            mRenderFrameCoalesced++;
+            return;
+        }
 
         mFrameInvalidationScheduled = true;
+        mFrameScheduledNanos = System.nanoTime();
         postOnAnimation(() -> {
             mFrameInvalidationScheduled = false;
+            mRenderFrameCallbacks++;
+            long scheduleMicros = Math.max(0L,
+                (System.nanoTime() - mFrameScheduledNanos) / 1000L);
+            if (scheduleMicros > mMaxScheduleLatencyMicros) {
+                mMaxScheduleLatencyMicros = scheduleMicros;
+            }
             if (mPendingFullInvalidation || mPendingInvalidateTop >= mPendingInvalidateBottom) {
                 invalidate();
             } else {
@@ -746,6 +2027,43 @@ public final class TerminalView extends View {
                 setContentDescription(getText());
             }
         });
+    }
+
+    /** Native screen publication already runs in Choreographer's animation phase. */
+    private void publishGhosttyRenderFrameNow(boolean updateAccessibilityDescription,
+                                              int screenRowStart,
+                                              int screenRowEndExclusive) {
+        mRenderFrameRequests++;
+        mRenderFrameCallbacks++;
+        mImmediateGhosttyInvalidations++;
+        boolean full = screenRowStart < 0 || screenRowEndExclusive <= screenRowStart ||
+            mRenderer == null || mEmulator == null || getWidth() <= 0;
+        publishVulkanFrameNow(full);
+        if (full) {
+            invalidate();
+        } else {
+            int start = Math.max(0, screenRowStart);
+            int end = Math.min(mEmulator.mRows, screenRowEndExclusive);
+            if (start >= end) return;
+            if (start == 0 && end == mEmulator.mRows) {
+                invalidate();
+            } else {
+                mPartialGhosttyInvalidations++;
+                invalidate(0, getScreenRowTopPx(start), getWidth(), getScreenRowBottomPx(end));
+            }
+        }
+        if (updateAccessibilityDescription && mAccessibilityEnabled) {
+            setContentDescription(getText());
+        }
+    }
+
+    /** Viewport motion is already on the UI/animation timeline; do not add another VSync hop. */
+    private void publishViewportRenderFrameNow() {
+        mRenderFrameRequests++;
+        mImmediateViewportInvalidations++;
+        notifyVisualViewportAnchorChanged();
+        publishVulkanFrameNow(false);
+        invalidate();
     }
 
     private void scheduleCursorRenderFrame() {
@@ -798,11 +2116,23 @@ public final class TerminalView extends View {
     @TargetApi(23)
     public boolean onTouchEvent(MotionEvent event) {
         if (mEmulator == null) return true;
-        final int action = event.getAction();
+        final int action = event.getActionMasked();
+        final boolean touchInput = !event.isFromSource(InputDevice.SOURCE_MOUSE);
+        if (touchInput) {
+            if (action == MotionEvent.ACTION_DOWN && mMultiTouchSequenceCaptured) {
+                finishMultiTouchSequence();
+            } else if (action == MotionEvent.ACTION_POINTER_DOWN) {
+                captureMultiTouchSequence();
+            }
+        }
 
         if (isSelectingText()) {
             updateFloatingToolbarVisibility(event);
             mGestureRecognizer.onTouchEvent(event);
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                finishDirectFingerScroll("selection");
+                finishMultiTouchSequence();
+            }
             return true;
         } else if (event.isFromSource(InputDevice.SOURCE_MOUSE)) {
             if (event.isButtonPressed(MotionEvent.BUTTON_SECONDARY)) {
@@ -815,7 +2145,10 @@ public final class TerminalView extends View {
                     ClipData.Item clipItem = clipData.getItemAt(0);
                     if (clipItem != null) {
                         CharSequence text = clipItem.coerceToText(getContext());
-                        if (!TextUtils.isEmpty(text)) mEmulator.paste(text.toString());
+                        if (!TextUtils.isEmpty(text)) {
+                            prepareForUserInput();
+                            mEmulator.paste(text.toString());
+                        }
                     }
                 }
             } else if (mEmulator.isMouseTrackingActive()) { // BUTTON_PRIMARY.
@@ -831,8 +2164,92 @@ public final class TerminalView extends View {
             }
         }
 
+        if (touchInput && !isSelectingText()) {
+            handleDirectFingerScrollBeforeGesture(event);
+        }
         mGestureRecognizer.onTouchEvent(event);
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            finishDirectFingerScroll(action == MotionEvent.ACTION_UP ? "up" : "cancel");
+            finishMultiTouchSequence();
+        }
         return true;
+    }
+
+    private void handleDirectFingerScrollBeforeGesture(MotionEvent event) {
+        if (mMultiTouchSequenceCaptured || event.getPointerCount() > 1) {
+            finishDirectFingerScroll("multitouch-exclusive");
+            return;
+        }
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                finishDirectFingerScroll("restart");
+                if (!isSmoothGhosttyLocalScroll()) return;
+                if (!mScroller.isFinished()) mScroller.abortAnimation();
+                mFingerScrollTracker.start(event.getPointerId(0), event.getY(0),
+                    getViewportPositionPixels());
+                mFingerScrollStartedNanos = System.nanoTime();
+                mFingerScrollMoveCount = 0;
+                break;
+            case MotionEvent.ACTION_POINTER_DOWN:
+                finishDirectFingerScroll("multitouch");
+                break;
+            case MotionEvent.ACTION_MOVE:
+            case MotionEvent.ACTION_UP:
+                if (!mFingerScrollTracker.isActive() || event.getPointerCount() != 1) return;
+                int pointerIndex = event.findPointerIndex(mFingerScrollTracker.getPointerId());
+                if (pointerIndex < 0) {
+                    finishDirectFingerScroll("pointer-lost");
+                    return;
+                }
+                boolean wasDragging = mFingerScrollTracker.isDragging();
+                float target = mFingerScrollTracker.update(
+                    event.getY(pointerIndex), mFingerScrollCaptureSlop);
+                if (Float.isNaN(target)) return;
+                if (!wasDragging) {
+                    if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+                    Log.i(LOG_TAG, "finger-scroll-v2 begin startPx=" +
+                        Math.round(mFingerScrollTracker.getStartViewport()) + " slopPx=" +
+                        Math.round(mFingerScrollCaptureSlop) + " absoluteAnchor=true");
+                }
+                mFingerScrollMoveCount++;
+                setViewportPositionPixels(target);
+                break;
+        }
+    }
+
+    private void captureMultiTouchSequence() {
+        if (mMultiTouchSequenceCaptured) return;
+        finishDirectFingerScroll("multitouch-exclusive");
+        if (!mScroller.isFinished()) mScroller.abortAnimation();
+        mMultiTouchSequenceCaptured = true;
+        mScrollRemainder = 0f;
+        if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+    }
+
+    private void finishMultiTouchSequence() {
+        if (!mMultiTouchSequenceCaptured) return;
+        mMultiTouchSequenceCaptured = false;
+        if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
+    }
+
+    private void finishDirectFingerScroll(String reason) {
+        if (!mFingerScrollTracker.isActive()) return;
+        boolean dragged = mFingerScrollTracker.isDragging();
+        float requested = mFingerScrollTracker.getLastTarget();
+        float start = mFingerScrollTracker.getStartViewport();
+        mFingerScrollTracker.cancel();
+        if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
+        if (dragged) {
+            long elapsedMicros = Math.max(0L,
+                (System.nanoTime() - mFingerScrollStartedNanos) / 1000L);
+            float applied = getViewportPositionPixels() - start;
+            Log.i(LOG_TAG, "finger-scroll-v2 end reason=" + reason + " moves=" +
+                mFingerScrollMoveCount + " touchDeltaPx=" + Math.round(requested - start) +
+                " viewportDeltaPx=" + Math.round(applied) +
+                " trackingErrorPx=" + Math.round(applied - (requested - start)) +
+                " viewportPx=" + Math.round(getViewportPositionPixels()) +
+                " elapsedUs=" + elapsedMicros + " absoluteAnchor=true");
+        }
     }
 
     @Override
@@ -973,6 +2390,7 @@ public final class TerminalView extends View {
         } else if (event.isSystem() && (!mClient.shouldBackButtonBeMappedToEscape() || keyCode != KeyEvent.KEYCODE_BACK)) {
             return super.onKeyDown(keyCode, event);
         } else if (event.getAction() == KeyEvent.ACTION_MULTIPLE && keyCode == KeyEvent.KEYCODE_UNKNOWN) {
+            prepareForUserInput();
             mTermSession.write(event.getCharacters());
             return true;
         }
@@ -1095,6 +2513,7 @@ public final class TerminalView extends View {
             }
 
             // If left alt, send escape before the code point to make e.g. Alt+B and Alt+F work in readline:
+            prepareForUserInput();
             mTermSession.writeCodePoint(altDown, codePoint);
         }
     }
@@ -1111,6 +2530,7 @@ public final class TerminalView extends View {
         TerminalEmulator term = mTermSession.getEmulator();
         String code = KeyHandler.getCode(keyCode, keyMod, term.isCursorKeysApplicationMode(), term.isKeypadApplicationMode());
         if (code == null) return false;
+        prepareForUserInput();
         mTermSession.write(code);
         return true;
     }
@@ -1168,42 +2588,249 @@ public final class TerminalView extends View {
      */
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
-        updateSize();
+        TerminalGeometryCommitPolicy.Decision decision = requestTerminalGeometry(
+            TerminalGeometryCommitPolicy.Source.LAYOUT, false, 0, -1, -1, -1);
+        if (decision == TerminalGeometryCommitPolicy.Decision.SUPPRESSED_BY_IME ||
+            decision == TerminalGeometryCommitPolicy.Decision.WAIT_FOR_STABLE_FRAME) {
+            // Keep rendering the last committed grid. Canvas naturally clips it to the physical
+            // viewport while an IME or transient pager layout is moving.
+            invalidate();
+            return;
+        }
+        resetVulkanSubmissionState();
+        publishVulkanFrameNow(true);
     }
 
-    /** Check if the terminal size in rows and columns should be updated. */
+    /**
+     * Check if the terminal size in rows and columns should be updated. Explicit callers use this
+     * as a synchronous geometry barrier before presenting a page.
+     */
     public void updateSize() {
+        requestTerminalGeometry(mEmulator == null
+            ? TerminalGeometryCommitPolicy.Source.INITIAL_ATTACH
+            : TerminalGeometryCommitPolicy.Source.RENDER_BARRIER,
+            false, 0, -1, -1, -1);
+    }
+
+    /**
+     * IME occlusion owns no terminal grid changes, including at its stable endpoint. Unlocking
+     * only re-evaluates the fully restored physical viewport so a real structural change that was
+     * deferred while the keyboard was visible cannot be lost.
+     */
+    public void setImeViewportGeometryLocked(boolean locked) {
+        mImeViewportGeometryLocked = locked;
+        boolean wasLocked = mGeometryCommitPolicy.isImeViewportActive();
+        mGeometryCommitPolicy.setImeViewportActive(locked);
+        if (wasLocked && !locked) {
+            requestTerminalGeometry(TerminalGeometryCommitPolicy.Source.LAYOUT,
+                false, 0, -1, -1, -1);
+        }
+    }
+
+    /** Request one stable, anchored structural geometry transaction after configuration changes. */
+    public void requestStructuralGeometryCommit() {
+        requestTerminalGeometry(TerminalGeometryCommitPolicy.Source.STRUCTURAL,
+            false, 0, -1, -1, -1);
+    }
+
+    public long getPtyGeometryCommitCountForDiagnostics() {
+        return mGeometryCommittedCount;
+    }
+
+    public long getImeGeometrySuppressedCountForDiagnostics() {
+        return mGeometryCommitPolicy.getSuppressedByImeCount();
+    }
+
+    private void updateSizeImmediately() {
+        requestTerminalGeometry(mEmulator == null
+            ? TerminalGeometryCommitPolicy.Source.INITIAL_ATTACH
+            : TerminalGeometryCommitPolicy.Source.RENDER_BARRIER,
+            false, 0, -1, -1, -1);
+    }
+
+    /**
+     * Resize transaction. An anchored transaction suppresses publication until the native tracked
+     * cell has been resolved and {@link #applyRealtimeTextSize(int, float, float)} commits it.
+     */
+    private boolean updateSizeImmediately(boolean preserveViewport, int viewportTopRow,
+                                          int anchorColumn, int anchorViewportRow,
+                                          int targetViewportRow) {
+        TerminalGeometryCommitPolicy.Decision decision = requestTerminalGeometry(
+            preserveViewport ? TerminalGeometryCommitPolicy.Source.USER_TEXT_SCALE
+                : (mEmulator == null ? TerminalGeometryCommitPolicy.Source.INITIAL_ATTACH
+                    : TerminalGeometryCommitPolicy.Source.RENDER_BARRIER),
+            preserveViewport, viewportTopRow, anchorColumn, anchorViewportRow,
+            targetViewportRow);
+        return decision == TerminalGeometryCommitPolicy.Decision.COMMIT;
+    }
+
+    private TerminalGeometryCommitPolicy.Decision requestTerminalGeometry(
+        @NonNull TerminalGeometryCommitPolicy.Source source, boolean preserveViewport,
+        int viewportTopRow, int anchorColumn, int anchorViewportRow,
+        int targetViewportRow) {
         int viewWidth = getWidth();
         int viewHeight = getHeight();
-        if (viewWidth == 0 || viewHeight == 0 || mTermSession == null) return;
+        if (viewWidth == 0 || viewHeight == 0 || mTermSession == null || mRenderer == null) {
+            return TerminalGeometryCommitPolicy.Decision.UNCHANGED;
+        }
 
-        // Set to 80 and 24 if you want to enable vttest.
-        int newColumns = Math.max(4, (int) (viewWidth / mRenderer.mFontWidth));
-        int newRows = Math.max(4, (viewHeight - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
+        TerminalGeometryCommitPolicy.Geometry geometry = observedTerminalGeometry();
+        TerminalGeometryCommitPolicy.Decision decision = mGeometryCommitPolicy.request(geometry, source);
+        if (decision == TerminalGeometryCommitPolicy.Decision.WAIT_FOR_STABLE_FRAME) {
+            mGeometryDeferredCount++;
+            scheduleTerminalGeometryCommitFrame();
+            return decision;
+        }
+        if (decision != TerminalGeometryCommitPolicy.Decision.COMMIT) return decision;
 
-        if (mEmulator == null || (newColumns != mEmulator.mColumns || newRows != mEmulator.mRows)) {
-            mTermSession.updateSize(newColumns, newRows, (int) mRenderer.getFontWidth(), mRenderer.getFontLineSpacing());
-            mEmulator = mTermSession.getEmulator();
-            mClient.onEmulatorSet();
+        return commitTerminalGeometry(geometry, preserveViewport, viewportTopRow, anchorColumn,
+            anchorViewportRow, targetViewportRow)
+            ? TerminalGeometryCommitPolicy.Decision.COMMIT
+            : TerminalGeometryCommitPolicy.Decision.UNCHANGED;
+    }
 
-            // Update mTerminalCursorBlinkerRunnable inner class mEmulator on session change
-            if (mTerminalCursorBlinkerRunnable != null)
-                mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
+    private boolean commitTerminalGeometry(@NonNull TerminalGeometryCommitPolicy.Geometry geometry,
+                                           boolean preserveViewport, int viewportTopRow,
+                                           int anchorColumn, int anchorViewportRow,
+                                           int targetViewportRow) {
+        int newColumns = geometry.columns;
+        int newRows = geometry.rows;
+        int cellWidth = geometry.cellWidth;
+        int cellHeight = geometry.cellHeight;
+        if (mEmulator != null && newColumns == mEmulator.mColumns && newRows == mEmulator.mRows &&
+            cellWidth == mLastSentCellWidth && cellHeight == mLastSentCellHeight) {
+            mGeometryCommitPolicy.markCommitted(geometry);
+            return false;
+        }
 
+        boolean anchoredResize = preserveViewport && mEmulator != null;
+        if (anchoredResize) {
+            mTermSession.updateSize(newColumns, newRows, cellWidth, cellHeight,
+                viewportTopRow, anchorColumn, anchorViewportRow, targetViewportRow);
+        } else {
+            mTermSession.updateSize(newColumns, newRows, cellWidth, cellHeight);
+        }
+        mLastSentCellWidth = cellWidth;
+        mLastSentCellHeight = cellHeight;
+        mEmulator = mTermSession.getEmulator();
+        if (mEmulator == null) return false;
+        mGeometryCommitPolicy.markCommitted(geometry);
+        mGeometryCommittedCount++;
+        mClient.onEmulatorSet();
+
+        // Update mTerminalCursorBlinkerRunnable inner class mEmulator on session change.
+        if (mTerminalCursorBlinkerRunnable != null)
+            mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
+
+        if (anchoredResize && mEmulator.isGhosttyRenderAuthorityActive()) {
+            mTopRow = mEmulator.getGhosttyViewportTopRow();
+        } else if (!anchoredResize) {
             mTopRow = 0;
-            scrollTo(0, 0);
-            invalidate();
+            mViewportPixelOffset = 0f;
+        }
+        scrollTo(0, 0);
+        if (anchoredResize) {
+            // Mark the cache stale, but do not publish the pre-anchor viewport.
+            if (mRenderer != null) mRenderer.requestFullFrame();
+            mPendingFullInvalidation = true;
+        } else {
+            requestFullRenderFrame();
+        }
+        if (!mEmulator.isGhosttyRenderAuthorityActive()) {
             mEmulator.getScreen().clearDirtyRows();
         }
+        return true;
+    }
+
+    private void scheduleTerminalGeometryCommitFrame() {
+        if (mGeometryCommitFrameScheduled) return;
+        mGeometryCommitFrameScheduled = true;
+        final long frameEpoch = mGeometryCommitFrameEpoch;
+        postOnAnimation(new Runnable() {
+            @Override
+            public void run() {
+                if (frameEpoch != mGeometryCommitFrameEpoch) return;
+                mGeometryCommitFrameScheduled = false;
+                if (!isAttachedToWindow() || mTermSession == null || mRenderer == null ||
+                    getWidth() == 0 || getHeight() == 0) {
+                    return;
+                }
+                TerminalGeometryCommitPolicy.Decision decision =
+                    mGeometryCommitPolicy.onVsync(observedTerminalGeometry());
+                if (decision == TerminalGeometryCommitPolicy.Decision.WAIT_FOR_STABLE_FRAME) {
+                    scheduleTerminalGeometryCommitFrame();
+                    return;
+                }
+                if (decision == TerminalGeometryCommitPolicy.Decision.COMMIT) {
+                    TerminalGeometryCommitPolicy.Geometry geometry =
+                        observedTerminalGeometry();
+                    if (commitStableTerminalGeometry(geometry)) {
+                        resetVulkanSubmissionState();
+                        publishVulkanFrameNow(true);
+                    }
+                }
+            }
+        });
+    }
+
+    /** Preserve a user's real history viewport across structural reflow. Live TUIs stay live. */
+    private boolean commitStableTerminalGeometry(
+        @NonNull TerminalGeometryCommitPolicy.Geometry geometry) {
+        boolean preserveHistoryViewport = mEmulator != null && mTopRow < 0 &&
+            mEmulator.isGhosttyRenderAuthorityActive() &&
+            !mEmulator.isAlternateBufferActive();
+        if (!preserveHistoryViewport) {
+            return commitTerminalGeometry(geometry, false, 0, -1, -1, -1);
+        }
+
+        int anchorViewportRow = Math.max(0, mEmulator.mRows / 2);
+        int targetViewportRow = Math.max(0, geometry.rows / 2);
+        int anchorColumn = Math.max(0, mEmulator.mColumns / 2);
+        boolean committed = commitTerminalGeometry(geometry, true, mTopRow,
+            anchorColumn, anchorViewportRow, targetViewportRow);
+        if (committed) requestFullRenderFrame();
+        return committed;
+    }
+
+    @NonNull
+    private TerminalGeometryCommitPolicy.Geometry observedTerminalGeometry() {
+        return new TerminalGeometryCommitPolicy.Geometry(expectedTerminalColumns(),
+            expectedTerminalRows(), expectedTerminalCellWidth(), expectedTerminalCellHeight());
+    }
+
+    private int expectedTerminalColumns() {
+        return Math.max(4, (int) (getWidth() / mRenderer.mFontWidth));
+    }
+
+    private int expectedTerminalRows() {
+        return Math.max(4, (getHeight() - mRenderer.mFontLineSpacingAndAscent) /
+            mRenderer.mFontLineSpacing);
+    }
+
+    private int expectedTerminalCellWidth() {
+        return Math.max(1, (int) mRenderer.getFontWidth());
+    }
+
+    private int expectedTerminalCellHeight() {
+        return Math.max(1, mRenderer.getFontLineSpacing());
     }
 
     @Override
     protected void onDraw(Canvas canvas) {
+        if (isVulkanFrameActive()) {
+            // The TextureView below owns terminal pixels once a complete frame is committed.
+            // Keep this overlay transparent, but continue drawing selection handles/cursors.
+            renderTextSelection();
+            maybeLogFramePublication(0L);
+            return;
+        }
         super.onDraw(canvas);
         drawTerminalFrame(canvas);
     }
 
     private void drawTerminalFrame(Canvas canvas) {
+        long drawStartedNanos = System.nanoTime();
+        boolean presented = true;
         if (mEmulator == null) {
             canvas.drawColor(0XFF000000);
             mLastRenderedCursorRow = -1;
@@ -1217,23 +2844,154 @@ public final class TerminalView extends View {
                 mTextSelectionCursorController.getSelectors(sel);
             }
 
-            mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3]);
-            mLastRenderedCursorRow = mEmulator.getCursorRow();
-            mLastRenderedCursorCol = mEmulator.getCursorCol();
-            mLastRenderedCursorStyle = mEmulator.getCursorStyle();
-            mLastRenderedCursorVisible = mEmulator.shouldCursorBeVisible();
+            presented = mRenderer.renderFrame(mEmulator, canvas, mTopRow, mViewportPixelOffset,
+                sel[0], sel[1], sel[2], sel[3]);
+            if (presented) {
+                mLastRenderedCursorRow = mEmulator.getCursorRow();
+                mLastRenderedCursorCol = mEmulator.getCursorCol();
+                mLastRenderedCursorStyle = mEmulator.getCursorStyle();
+                mLastRenderedCursorVisible = mEmulator.shouldCursorBeVisible();
+                mLastPresentedCursorEnabled = mEmulator.isCursorEnabled();
 
-            // render the text selection handles
-            renderTextSelection();
+                // Render handles only after their underlying terminal frame was committed.
+                renderTextSelection();
+                mLastPresentedContentRevision = mEmulator.isGhosttyRenderAuthorityActive()
+                    ? mRenderer.getGhosttyCachedModelRevision()
+                    : mEmulator.getContentRevision();
+                recordPresentedImeCameraState(mTopRow, mViewportPixelOffset, getHeight(),
+                    mRenderer.mFontLineSpacing, mRenderer.mFontAscent,
+                    resolvePresentedImeProtectedBottomScreenRow());
+                beginScaleGlyphWarmupAfterPresentedFrame();
+                armIdleGlyphWarmupAfterPresentedFrame();
+                notifyImeCameraFrameReady();
+            }
         }
+        if (presented) {
+            mPresentedFrames++;
+        } else {
+            mSkippedFramePresentations++;
+            scheduleRenderFrame(false);
+        }
+        long drawMicros = Math.max(0L, (System.nanoTime() - drawStartedNanos) / 1000L);
+        if (drawMicros > mMaxDrawMicros) mMaxDrawMicros = drawMicros;
+        maybeLogFramePublication(drawMicros);
+    }
+
+    private void maybeLogFramePublication(long drawMicros) {
+        long now = SystemClock.uptimeMillis();
+        if (now - mLastFrameMetricsLogMs < FRAME_METRICS_LOG_INTERVAL_MS) return;
+        mLastFrameMetricsLogMs = now;
+        long currentRevision = mEmulator == null ? Long.MIN_VALUE : mEmulator.getContentRevision();
+        Log.i(LOG_TAG, "frame-publication-v4 view=" + System.identityHashCode(this) +
+            " requests=" + mRenderFrameRequests + " callbacks=" + mRenderFrameCallbacks +
+            " coalesced=" + mRenderFrameCoalesced + " presented=" + mPresentedFrames +
+            " immediate=" + mImmediateGhosttyInvalidations + " partial=" +
+            mPartialGhosttyInvalidations + " viewportImmediate=" +
+            mImmediateViewportInvalidations +
+            " skipped=" + mSkippedFramePresentations +
+            " currentRevision=" + currentRevision + " presentedRevision=" +
+            mLastPresentedContentRevision + " drawUs=" + drawMicros + " maxDrawUs=" +
+            mMaxDrawMicros + " maxScheduleUs=" + mMaxScheduleLatencyMicros +
+            " complete=" + hasCompleteRenderFrame());
     }
 
     public TerminalSession getCurrentSession() {
         return mTermSession;
     }
 
+    /** Release retained row commands when the owning tab is permanently removed. */
+    public void releaseRenderResources() {
+        if (mVulkanView != null) mVulkanView.releaseRenderResources();
+        if (mRenderer != null) mRenderer.dispose();
+        resetVulkanSubmissionState();
+        resetImeCameraFrameNotificationState();
+        mVulkanFailed = false;
+        resetPresentedImeCameraState();
+        mPendingFullInvalidation = true;
+    }
+
+    /** Stop an offscreen tab from continuing to submit viewport frames after a page commit. */
+    public void cancelViewportMotionForTabTransition() {
+        finishDirectFingerScroll("tab-transition");
+        if (!mScroller.isFinished()) mScroller.abortAnimation();
+    }
+
+    /**
+     * Commits an explicit user text-input action to the live PTY viewport.
+     *
+     * <p>A terminal has one writable focus: the live cursor. A tap that opens the IME, a key that
+     * is actually sent to the PTY, or a user paste must therefore leave scrollback before the IME
+     * surface computes its cursor/content-tail pan. Passive focus restoration, tab attachment and
+     * inset replay must not call this method, since those events do not express input intent.</p>
+     *
+     * <p>The explicit SCROLL lock and text selection remain authoritative. Returning to the live
+     * edge only changes this view's retained presentation; it never changes terminal rows/columns
+     * or sends a window-size ioctl.</p>
+     *
+     * @return {@code true} if a history or fractional viewport was restored to the live edge.
+     */
+    @MainThread
+    public boolean prepareForUserInput() {
+        if (mEmulator == null || isSelectingText() || mEmulator.isAutoScrollDisabled()) {
+            return false;
+        }
+
+        finishDirectFingerScroll("user-input");
+        if (!mScroller.isFinished()) mScroller.abortAnimation();
+        mScrollRemainder = 0f;
+
+        boolean restoreLiveViewport = mTopRow != 0 ||
+            Math.abs(mViewportPixelOffset) >= 0.01f;
+
+        // A nearby history viewport often still retains every live row; a far history viewport
+        // legitimately does not. Decide before changing the viewport so the explicit focus
+        // transaction can request one authoritative full frame immediately instead of depending
+        // on a best-effort delta followed by an asynchronous retry.
+        boolean liveGhosttyFrameRetained = !restoreLiveViewport || (mRenderer != null &&
+            mEmulator.isGhosttyRenderAuthorityActive() &&
+            mRenderer.hasCompleteGhosttyFrame(0, mEmulator.mRows,
+                mEmulator.getContentRevision()));
+
+        if (restoreLiveViewport) {
+            mTopRow = 0;
+            mViewportPixelOffset = 0f;
+            mUserInputLiveEdgeRestores++;
+
+            // Invalidate only callback de-duplication, not the last presented pixels. A history
+            // frame may already be queued on the Vulkan thread; the next authoritative live frame
+            // must always be allowed to close this input transaction.
+            resetImeCameraFrameNotificationState();
+        }
+
+        // Publish intent only after the UI viewport has atomically become live. The surface then
+        // waits for a frame whose own immutable top-row identity is also live.
+        notifyImeExplicitFocus();
+
+        if (!restoreLiveViewport) {
+            if (getImeCameraSnapshot().availability == ImeCameraSnapshot.Availability.FRAME_PENDING) {
+                requestImeCameraFrame();
+            }
+            return false;
+        }
+
+        // The IME anchor reads Ghostty's retained rows. Prepare the live viewport before notifying
+        // the surface, otherwise the old history cache can transiently report no semantic tail and
+        // leave the terminal pixel layer unpanned behind the keyboard.
+        if (mRenderer != null && mEmulator.isGhosttyRenderAuthorityActive()) {
+            boolean prepared = prewarmRenderFrame(!liveGhosttyFrameRetained);
+            if (!prepared && liveGhosttyFrameRetained) {
+                prepared = prewarmRenderFrame(true);
+            }
+            if (!prepared) requestFullRenderFrame();
+        }
+        requestImeCameraFrame();
+        publishViewportRenderFrameNow();
+        return true;
+    }
+
     private CharSequence getText() {
-        return mEmulator.getScreen().getSelectedText(0, mTopRow, mEmulator.mColumns, mTopRow + mEmulator.mRows);
+        return mEmulator.getSelectedText(
+            0, mTopRow, mEmulator.mColumns, mTopRow + mEmulator.mRows);
     }
 
     public int getCursorX(float x) {
@@ -1245,7 +3003,8 @@ public final class TerminalView extends View {
 
     public int getCursorY(float y) {
         // Keep consistent with {@link #getColumnAndRow(MotionEvent, boolean)} to avoid row drift.
-        return (int) ((y - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing) + mTopRow;
+        return (int) ((y + mViewportPixelOffset -
+            mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing) + mTopRow;
     }
 
     public int getPointX(int cx) {
@@ -1256,15 +3015,22 @@ public final class TerminalView extends View {
     }
 
     public int getPointY(int cy) {
-        return Math.round((cy - mTopRow) * mRenderer.mFontLineSpacing);
+        return Math.round((cy - mTopRow) * mRenderer.mFontLineSpacing -
+            mViewportPixelOffset);
     }
 
     public int getTopRow() {
         return mTopRow;
     }
 
+    public float getViewportPixelOffset() {
+        return mViewportPixelOffset;
+    }
+
     public void setTopRow(int mTopRow) {
         this.mTopRow = mTopRow;
+        mViewportPixelOffset = 0f;
+        notifyVisualViewportAnchorChanged();
     }
 
 
@@ -1276,6 +3042,7 @@ public final class TerminalView extends View {
     @Override
     public void autofill(AutofillValue value) {
         if (value.isText()) {
+            prepareForUserInput();
             mTermSession.write(value.getTextValue().toString());
         }
 
@@ -1675,6 +3442,8 @@ public final class TerminalView extends View {
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
 
+        ensureRenderFrameForPresentation();
+
         if (mTextSelectionCursorController != null) {
             getViewTreeObserver().addOnTouchModeChangeListener(mTextSelectionCursorController);
         }
@@ -1682,6 +3451,12 @@ public final class TerminalView extends View {
 
     @Override
     protected void onDetachedFromWindow() {
+        finishDirectFingerScroll("detach");
+        abortRealtimeScaleGesture("detach");
+        mGeometryCommitFrameEpoch++;
+        mGeometryCommitFrameScheduled = false;
+        if (mRenderer != null) mRenderer.setRealtimeScaleActive(false);
+        if (!mScroller.isFinished()) mScroller.abortAnimation();
         super.onDetachedFromWindow();
 
         if (mTextSelectionCursorController != null) {
@@ -1694,6 +3469,35 @@ public final class TerminalView extends View {
         }
 
         hideTextSelectionPreview();
+    }
+
+    @Override
+    protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        if (visibility == VISIBLE) {
+            ensureRenderFrameForPresentation();
+        } else {
+            abortRealtimeScaleGesture("window-hidden");
+        }
+    }
+
+    @Override
+    protected void onVisibilityChanged(View changedView, int visibility) {
+        super.onVisibilityChanged(changedView, visibility);
+        if (changedView == this && visibility == VISIBLE) ensureRenderFrameForPresentation();
+    }
+
+    private void ensureRenderFrameForPresentation() {
+        if (mRenderer == null) return;
+        // Visibility is a render barrier, not permission to bypass the geometry coordinator.
+        // An IME visual viewport keeps presenting the last real committed grid; structural layout
+        // changes are committed only after the coordinator observes a stable frame transaction.
+        updateSizeImmediately();
+        if (mEmulator == null || !hasCompleteRenderFrame()) {
+            requestFullRenderFrame();
+        } else {
+            scheduleRenderFrame(false);
+        }
     }
 
 

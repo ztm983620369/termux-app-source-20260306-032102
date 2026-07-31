@@ -36,8 +36,29 @@ ok() { printf '[OK]   %s\n' "$*"; }
 warn() { warnings=$((warnings + 1)); printf '[WARN] %s\n' "$*"; }
 fail() { failures=$((failures + 1)); printf '[FAIL] %s\n' "$*"; }
 
+java_name_is_valid() {
+    value=$1
+    printf '%s\n' "$value" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$' \
+        || return 1
+    reserved='_ abstract assert boolean break byte case catch char class const continue default do double else enum exports extends false final finally float for goto if implements import instanceof int interface long module native new null open opens package permits private protected provides public record requires return sealed short static strictfp super switch synchronized this throw throws to transient transitive true try uses var void volatile when while with yield'
+    remaining=$value
+    while :; do
+        segment=${remaining%%.*}
+        case " $reserved " in
+            *" $segment "*) return 1 ;;
+        esac
+        [ "$remaining" = "$segment" ] && break
+        remaining=${remaining#*.}
+    done
+    return 0
+}
+
 CONFIG=$ROOT_DIR/shadow-plugin.properties
 printf 'Shadow plugin doctor\n  project: %s\n\n' "$ROOT_DIR"
+
+if [ -f "$ROOT_DIR/.shadow-tooling-sync-incomplete.json" ]; then
+    fail "interrupted tooling sync detected; rerun shadow-plugin sync"
+fi
 
 if [ ! -f "$CONFIG" ]; then
     fail "missing shadow-plugin.properties"
@@ -84,12 +105,16 @@ version_code=$(shadow_property "$CONFIG" defaultVersionCode)
 version_name=$(shadow_property "$CONFIG" defaultVersionName)
 min_host=$(shadow_property "$CONFIG" minHostVersionCode)
 max_host=$(shadow_property "$CONFIG" maxHostVersionCode)
+application=$(shadow_property "$CONFIG" applicationClassName)
 
 printf '  pluginId: %s\n  partKey: %s\n  resource: %s\n\n' \
     "$plugin_id" "$part_key" "$resource_id"
 
-[ "$schema" = 1 ] && ok "config schema is 1" || fail "schemaVersion must be 1"
-printf '%s\n' "$slug" | grep -Eq '^[a-z][a-z0-9-]*$' \
+case "$schema" in
+    1|2) ok "config schema is supported ($schema)" ;;
+    *) fail "schemaVersion must be 1 or 2" ;;
+esac
+printf '%s\n' "$slug" | grep -Eq '^[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*$' \
     && ok "pluginSlug is valid" || fail "invalid pluginSlug: $slug"
 printf '%s\n' "$project_name" | grep -Eq '^[A-Za-z][A-Za-z0-9_-]*$' \
     && ok "projectName is valid" || fail "invalid projectName: $project_name"
@@ -97,12 +122,23 @@ printf '%s\n' "$plugin_id" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-
     && ok "pluginId is valid" || fail "invalid pluginId: $plugin_id"
 printf '%s\n' "$part_key" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
     && ok "partKey is valid" || fail "invalid partKey: $part_key"
-printf '%s\n' "$namespace" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$' \
+java_name_is_valid "$namespace" \
     && ok "namespace is valid" || fail "invalid namespace: $namespace"
-case "$activity" in
-    "$namespace".*) ok "activity belongs to namespace" ;;
-    *) fail "activityClassName must be inside namespace" ;;
-esac
+if java_name_is_valid "$activity"; then
+    case "$activity" in
+        "$namespace".*) ok "activity belongs to namespace" ;;
+        *) fail "activityClassName must be inside namespace" ;;
+    esac
+else
+    fail "invalid activityClassName: $activity"
+fi
+if [ -z "$application" ]; then
+    ok "default Application is selected"
+elif java_name_is_valid "$application"; then
+    ok "applicationClassName is valid"
+else
+    fail "invalid applicationClassName: $application"
+fi
 
 case "$resource_id" in
     0[xX][0-9A-Fa-f][0-9A-Fa-f])
@@ -237,8 +273,14 @@ if [ "$failures" -eq 0 ] && [ "$full" -eq 1 ]; then
     else
         printf '\nRunning full Gradle package validation...\n'
         printf 'sdk.dir=%s\n' "$ANDROID_HOME" > "$ROOT_DIR/local.properties"
-        if (cd "$ROOT_DIR" && ./gradlew --offline --no-daemon \
-                "-Pandroid.aapt2FromMavenOverride=$aapt2" validateShadowPluginDebug); then
+        dependency_policy=${TERMUX_SHADOW_DEPENDENCY_POLICY:-cache-first}
+        allow_network=${TERMUX_SHADOW_ALLOW_NETWORK:-0}
+        set -- --no-daemon "-Pandroid.aapt2FromMavenOverride=$aapt2" validateShadowPluginDebug
+        if [ "$dependency_policy" = offline ] \
+                || { [ "$dependency_policy" = cache-first ] && [ "$allow_network" != 1 ]; }; then
+            set -- --offline "$@"
+        fi
+        if (cd "$ROOT_DIR" && ./gradlew "$@"); then
             ok "full package validation passed"
         else
             fail "full package validation failed"

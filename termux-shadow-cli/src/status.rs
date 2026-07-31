@@ -80,6 +80,15 @@ pub struct VersionRecord {
     #[serde(default)]
     pub last_healthy_process_pid: u32,
     pub last_healthy_process_name: Option<String>,
+    #[serde(default)]
+    pub smoke_requested: bool,
+    #[serde(default)]
+    pub smoke_passed: bool,
+    #[serde(default)]
+    pub smoke_step_count: u32,
+    #[serde(default)]
+    pub smoke_duration_ms: u64,
+    pub smoke_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +115,10 @@ pub struct PublishReceipt {
 #[serde(rename_all = "camelCase")]
 struct StatusOutput {
     shadow_home: String,
+    current_project: Option<String>,
     current_plugin_id: Option<String>,
+    #[serde(flatten)]
+    scope: StatusScope,
     health: Option<HealthReport>,
     last_published: Option<PublishReceipt>,
     currently_active: Option<ActiveVersionSummary>,
@@ -140,6 +152,8 @@ struct RawStatusOutput {
 struct CompactStatusOutput {
     ok: bool,
     status: String,
+    #[serde(flatten)]
+    scope: StatusScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,6 +183,21 @@ struct CachedArtifact {
     sha256: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusScope {
+    scope: &'static str,
+    project_context: bool,
+    filter_active: bool,
+    filtered: bool,
+    fallback_to_all: bool,
+    total_plugins: usize,
+    matched_plugins: usize,
+    excluded_plugins: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchReport {
@@ -181,9 +210,11 @@ pub struct LaunchReport {
 }
 
 pub fn run(context: &AppContext, args: StatusArgs) -> Result<()> {
-    let project_config = context
-        .project_if_present()
-        .and_then(|project| PluginConfig::load(&project.join("shadow-plugin.properties")).ok());
+    let current_project = context.project_if_present();
+    let project_config = current_project
+        .as_ref()
+        .map(|project| PluginConfig::load(&project.join("shadow-plugin.properties")))
+        .transpose()?;
     let current_plugin_id = project_config
         .as_ref()
         .map(|config| config.plugin_id.as_str());
@@ -196,8 +227,10 @@ pub fn run(context: &AppContext, args: StatusArgs) -> Result<()> {
         let config = project_config
             .as_ref()
             .context("status --wait requires a current plugin project")?;
-        let project = context.project()?;
-        let receipt = find_receipt(&project, &shadow_home, &config.plugin_id)?
+        let project = current_project
+            .as_deref()
+            .context("status --wait requires a current plugin project")?;
+        let receipt = find_receipt(project, &shadow_home, &config.plugin_id)?
             .with_context(|| format!("no publish receipt found for {}", config.plugin_id))?;
         wait_for_receipt(&shadow_home, &receipt, Duration::from_secs(args.timeout))?;
         if !context.json {
@@ -244,8 +277,9 @@ pub fn run(context: &AppContext, args: StatusArgs) -> Result<()> {
     let registry =
         read_optional_json::<RegistryReport>(&shadow_home.join("reports/registry.json"))?
             .unwrap_or_default();
-    let last_published = match (context.project_if_present(), current_plugin_id) {
-        (Some(project), Some(plugin_id)) => find_receipt(&project, &shadow_home, plugin_id)?,
+    let scope = status_scope(&registry.plugins, current_plugin_id, args.all);
+    let last_published = match (current_project.as_deref(), current_plugin_id) {
+        (Some(project), Some(plugin_id)) => find_receipt(project, &shadow_home, plugin_id)?,
         _ => None,
     };
     let currently_active = current_plugin_id.and_then(|plugin_id| {
@@ -255,7 +289,12 @@ pub fn run(context: &AppContext, args: StatusArgs) -> Result<()> {
             .find(|plugin| plugin.plugin_id == plugin_id)
             .and_then(active_version_summary)
     });
-    let compact_output = should_emit_compact(args.compact, context.json, args.all, args.history);
+    let compact_output = should_emit_compact(
+        args.compact,
+        context.json,
+        scope.scope == "all",
+        args.history,
+    );
     if compact_output {
         let current_plugin = current_plugin_id.and_then(|plugin_id| {
             registry
@@ -297,6 +336,7 @@ pub fn run(context: &AppContext, args: StatusArgs) -> Result<()> {
                 .as_ref()
                 .and_then(|health| health.status.clone())
                 .unwrap_or_else(|| "UNAVAILABLE".to_owned()),
+            scope: scope.clone(),
             plugin_id: current_plugin_id.map(str::to_owned),
             active: currently_active,
             candidate,
@@ -322,12 +362,18 @@ pub fn run(context: &AppContext, args: StatusArgs) -> Result<()> {
     let plugins = registry
         .plugins
         .into_iter()
-        .filter(|plugin| args.all || Some(plugin.plugin_id.as_str()) == current_plugin_id)
+        .filter(|plugin| {
+            !scope.filter_active || Some(plugin.plugin_id.as_str()) == current_plugin_id
+        })
         .collect::<Vec<_>>();
 
     let output = StatusOutput {
         shadow_home: shadow_home.display().to_string(),
+        current_project: current_project
+            .as_ref()
+            .map(|project| project.display().to_string()),
         current_plugin_id: current_plugin_id.map(str::to_owned),
+        scope,
         health,
         last_published,
         currently_active,
@@ -342,6 +388,38 @@ pub fn run(context: &AppContext, args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+fn status_scope(
+    plugins: &[PluginRecord],
+    current_plugin_id: Option<&str>,
+    requested_all: bool,
+) -> StatusScope {
+    let project_context = current_plugin_id.is_some();
+    let fallback_to_all = !requested_all && !project_context;
+    let filter_active = !requested_all && project_context;
+    let total_plugins = plugins.len();
+    let matched_plugins = if filter_active {
+        plugins
+            .iter()
+            .filter(|plugin| Some(plugin.plugin_id.as_str()) == current_plugin_id)
+            .count()
+    } else {
+        total_plugins
+    };
+    let excluded_plugins = total_plugins.saturating_sub(matched_plugins);
+    StatusScope {
+        scope: if filter_active { "project" } else { "all" },
+        project_context,
+        filter_active,
+        filtered: filter_active && excluded_plugins > 0,
+        fallback_to_all,
+        total_plugins,
+        matched_plugins,
+        excluded_plugins,
+        hint: (filter_active && excluded_plugins > 0)
+            .then_some("use --all to see all registered plugins"),
+    }
+}
+
 fn should_emit_compact(explicit: bool, json: bool, all: bool, history: bool) -> bool {
     explicit || (json && !all && !history)
 }
@@ -351,11 +429,10 @@ fn compact_fingerprint_state(
     config: Option<&PluginConfig>,
     plugin: Option<&PluginRecord>,
 ) -> Result<(Option<String>, Option<bool>, Option<CachedArtifact>)> {
-    let (Some(config), Some(project), Some(environment)) = (
-        config,
-        context.project_if_present(),
-        context.build_environment().ok(),
-    ) else {
+    let (Some(config), Some(project)) = (config, context.project_if_present()) else {
+        return Ok((None, None, None));
+    };
+    let Some(environment) = context.build_environment_for_project(&project).ok() else {
         return Ok((None, None, None));
     };
     let source_fingerprint = cache::source_fingerprint(&project, &environment)?;
@@ -637,9 +714,28 @@ fn print_human(output: &StatusOutput) {
     }
 
     println!("\nRegistered plugins");
+    if output.scope.fallback_to_all {
+        println!("  No project context detected — showing all registered plugins");
+    } else if output.scope.filter_active {
+        println!(
+            "  Scope: current project {} at {} ({} of {} registered plugin(s))",
+            output.current_plugin_id.as_deref().unwrap_or("unknown"),
+            output.current_project.as_deref().unwrap_or("unknown"),
+            output.scope.matched_plugins,
+            output.scope.total_plugins
+        );
+    }
     if output.plugins.is_empty() {
-        println!("  (none matched)");
+        if output.scope.filter_active && output.scope.total_plugins > 0 {
+            println!("  (none matched — filtered by current project context)");
+            println!("  Hint: run `shadow-plugin status --all` to list all registered plugins");
+        } else {
+            println!("  (none registered)");
+        }
         return;
+    }
+    if let Some(hint) = output.scope.hint {
+        println!("  Hint: {hint}");
     }
     for plugin in &output.plugins {
         println!("  {}", plugin.plugin_id);
@@ -737,7 +833,7 @@ mod tests {
     use super::should_emit_compact;
     use super::{
         Manifest, PluginRecord, PublishReceipt, VersionRecord, active_version_summary,
-        read_launch_report, wait_for_receipt,
+        read_launch_report, status_scope, wait_for_receipt,
     };
     use std::fs;
     use std::time::Duration;
@@ -838,6 +934,11 @@ mod tests {
                     runtime_stable_at: 0,
                     last_healthy_process_pid: 0,
                     last_healthy_process_name: None,
+                    smoke_requested: false,
+                    smoke_passed: false,
+                    smoke_step_count: 0,
+                    smoke_duration_ms: 0,
+                    smoke_error: None,
                 },
                 VersionRecord {
                     generation: "1-active".into(),
@@ -860,6 +961,11 @@ mod tests {
                     runtime_stable_at: 2,
                     last_healthy_process_pid: 42,
                     last_healthy_process_name: Some("com.termux:plugin".into()),
+                    smoke_requested: false,
+                    smoke_passed: false,
+                    smoke_step_count: 0,
+                    smoke_duration_ms: 0,
+                    smoke_error: None,
                 },
             ],
         };
@@ -917,5 +1023,51 @@ mod tests {
         assert!(!should_emit_compact(false, true, false, true));
         assert!(should_emit_compact(true, true, false, false));
         assert!(!should_emit_compact(false, false, false, false));
+    }
+
+    #[test]
+    fn status_scope_falls_back_to_all_without_project_context() {
+        let plugins = vec![PluginRecord {
+            plugin_id: "com.termux.shadow.notes".into(),
+            enabled: true,
+            active_generation: None,
+            previous_generation: None,
+            candidate_generation: None,
+            activating_generation: None,
+            removal_requested: false,
+            versions: Vec::new(),
+        }];
+        let scope = status_scope(&plugins, None, false);
+        assert_eq!(scope.scope, "all");
+        assert!(scope.fallback_to_all);
+        assert!(!scope.filter_active);
+        assert!(!scope.filtered);
+        assert_eq!(scope.matched_plugins, 1);
+    }
+
+    #[test]
+    fn status_scope_distinguishes_filtered_empty_from_empty_registry() {
+        let plugins = vec![PluginRecord {
+            plugin_id: "com.termux.shadow.other".into(),
+            enabled: true,
+            active_generation: None,
+            previous_generation: None,
+            candidate_generation: None,
+            activating_generation: None,
+            removal_requested: false,
+            versions: Vec::new(),
+        }];
+        let filtered = status_scope(&plugins, Some("com.termux.shadow.notes"), false);
+        assert!(filtered.filter_active);
+        assert!(filtered.filtered);
+        assert_eq!(filtered.matched_plugins, 0);
+        assert_eq!(filtered.excluded_plugins, 1);
+        assert!(filtered.hint.is_some());
+
+        let empty = status_scope(&[], Some("com.termux.shadow.notes"), false);
+        assert!(empty.filter_active);
+        assert!(!empty.filtered);
+        assert_eq!(empty.total_plugins, 0);
+        assert!(empty.hint.is_none());
     }
 }

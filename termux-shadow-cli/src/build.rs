@@ -9,10 +9,11 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::cache;
-use crate::cli::{BuildArgs, PublishArgs, UpgradeArgs};
+use crate::cli::{BuildArgs, DependencyPolicy, PublishArgs, UpgradeArgs};
 use crate::config::{PluginConfig, valid_version_name};
 use crate::context::{AppContext, BuildEnvironment};
 use crate::control;
+use crate::dependency;
 use crate::doctor;
 use crate::errors::GradleFailure;
 use crate::fsutil::{remove_dir_if_exists, sha256_file, sha256_paths, write_atomic};
@@ -107,6 +108,15 @@ pub fn run_build(context: &AppContext, args: BuildArgs) -> Result<()> {
 }
 
 pub fn run_publish(context: &AppContext, args: PublishArgs) -> Result<()> {
+    execute_publish(context, args, true).map(|_| ())
+}
+
+pub(crate) fn execute_publish(
+    context: &AppContext,
+    args: PublishArgs,
+    emit: bool,
+) -> Result<BuildOutput> {
+    let started = Instant::now();
     if !context.is_real_termux_home() {
         bail!(
             "publishing is allowed only inside the com.termux home, got {}",
@@ -115,6 +125,7 @@ pub fn run_publish(context: &AppContext, args: PublishArgs) -> Result<()> {
     }
     let project = context.project()?;
     let config = PluginConfig::load(&project.join("shadow-plugin.properties"))?;
+    dependency::require_valid_lock(&project)?;
     let requested_version_code = args
         .build
         .version_code
@@ -130,7 +141,8 @@ pub fn run_publish(context: &AppContext, args: PublishArgs) -> Result<()> {
             "VERSION_REQUIRED: this plugin has published history; pass an explicit version, use upgrade, or use deploy --bump"
         );
     }
-    let environment = context.build_environment()?;
+    let publish_context = context.with_dependency_policy(DependencyPolicy::Offline, false);
+    let environment = publish_context.build_environment_for_project(&project)?;
     let fingerprint = cache::input_fingerprint(
         &project,
         &environment,
@@ -148,7 +160,35 @@ pub fn run_publish(context: &AppContext, args: PublishArgs) -> Result<()> {
         && registered_sha(context, &config.plugin_id, &hit.sha256)?
     {
         crate::runtime_artifacts::reconcile_project(context, &config.plugin_id)?;
-        if context.json {
+        let source_fingerprint = cache::source_fingerprint(&project, &environment)?;
+        let toolchain_fingerprint = cache::toolchain_fingerprint(&environment)?;
+        let receipt = find_receipt(&project, &context.shadow_home, &config.plugin_id)?
+            .filter(|receipt| receipt.sha256 == hit.sha256);
+        let output = BuildOutput {
+            ok: true,
+            action: "publish",
+            status: "ALREADY_PUBLISHED",
+            project: project.display().to_string(),
+            plugin_id: config.plugin_id.clone(),
+            version_code: requested_version_code,
+            version_name: requested_version_name.to_owned(),
+            source_fingerprint,
+            toolchain_fingerprint,
+            input_fingerprint: fingerprint,
+            artifacts: vec![ArtifactOutput {
+                path: hit.artifact.display().to_string(),
+                sha256: hit.sha256.clone(),
+            }],
+            cache: "HIT",
+            gradle: None,
+            timings: BuildTimings {
+                build_ms: elapsed_ms(started),
+                publish_ms: Some(0),
+            },
+            receipt,
+            registration_confirmed: true,
+        };
+        if emit && context.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -169,15 +209,15 @@ pub fn run_publish(context: &AppContext, args: PublishArgs) -> Result<()> {
                     "stateChanged": false,
                 }))?
             );
-        } else {
+        } else if emit {
             println!("publish: ALREADY_PUBLISHED  {}", config.plugin_id);
             println!("  sha256={}", hit.sha256);
             println!("  Gradle: not started; Host already owns this exact artifact");
         }
-        return Ok(());
+        return Ok(output);
     }
     enforce_publish_version(requested_version_code, highest, args.allow_downgrade)?;
-    execute_build(context, args.build, true, !args.no_wait, args.timeout, true).map(|_| ())
+    execute_build(context, args.build, true, !args.no_wait, args.timeout, emit)
 }
 
 fn enforce_publish_version(
@@ -233,6 +273,7 @@ pub fn run_upgrade(context: &AppContext, args: UpgradeArgs) -> Result<()> {
             args.version_code
         );
     }
+    dependency::require_valid_lock(&project)?;
     execute_build(
         context,
         BuildArgs {
@@ -313,7 +354,7 @@ pub fn run_clean(context: &AppContext) -> Result<()> {
 
 pub fn run_stop(context: &AppContext) -> Result<()> {
     let project = context.project()?;
-    let environment = context.build_environment()?;
+    let environment = context.build_environment_for_project(&project)?;
     run_gradle(context, &project, &environment, &["--stop".to_owned()])?;
     if context.json {
         println!(
@@ -337,7 +378,9 @@ pub fn validate_package(
     config: &PluginConfig,
     fresh: bool,
 ) -> Result<ValidationOutcome> {
-    let environment = context.build_environment()?;
+    dependency::ensure_lock(context, project)?;
+    let environment = context.build_environment_for_project(project)?;
+    dependency::prepare_cache_layers(&environment)?;
     write_local_properties(project, &environment)?;
     let fingerprint = cache::input_fingerprint(
         project,
@@ -412,12 +455,24 @@ pub(crate) fn execute_build(
     let project = context.project()?;
     doctor::validate_for_project(context, &project, false, publish)?;
     let config = PluginConfig::load(&project.join("shadow-plugin.properties"))?;
+    if publish {
+        dependency::require_valid_lock(&project)?;
+    } else {
+        dependency::ensure_lock(context, &project)?;
+    }
+    // A published artifact is always rebuilt/validated against the committed lock and an
+    // offline cache, even when the caller selected cache-first or online for development.
+    let gradle_context = if publish {
+        context.with_dependency_policy(DependencyPolicy::Offline, false)
+    } else {
+        context.clone()
+    };
     let version_code = args.version_code.unwrap_or(config.default_version_code);
     let version_name = args
         .version_name
         .clone()
         .unwrap_or_else(|| config.default_version_name.clone());
-    if !context.json {
+    if emit && !context.json {
         println!(
             "Shadow plugin {}",
             if publish { "publish" } else { "build" }
@@ -427,8 +482,12 @@ pub(crate) fn execute_build(
         println!("  version: {version_name} ({version_code})");
         println!("  plugin preflight: PASS");
     }
-    let environment = context.build_environment()?;
-    invalidate_if_tooling_changed(&project, context.json)?;
+    let environment = gradle_context.build_environment_for_project(&project)?;
+    dependency::prepare_cache_layers(&environment)?;
+    if publish {
+        dependency::verify_locked_artifacts(&gradle_context, &project)?;
+    }
+    invalidate_if_tooling_changed(&project, context.json || !emit)?;
     write_local_properties(&project, &environment)?;
     let fingerprint =
         cache::input_fingerprint(&project, &environment, version_code, &version_name)?;
@@ -455,10 +514,18 @@ pub(crate) fn execute_build(
         )
     } else {
         let cache_status = cache_status(publish, args.fresh, false);
-        if !context.json {
+        if emit && !context.json {
             println!("\nPackage build");
             println!("  native cache: {cache_status}");
-            println!("  Gradle: running offline...");
+            println!(
+                "  Gradle: running with {} dependency policy{}...",
+                gradle_context.dependency_policy.as_str(),
+                if gradle_context.allow_network {
+                    " (network allowed)"
+                } else {
+                    ""
+                }
+            );
             io::stdout().flush().ok();
         }
 
@@ -470,7 +537,7 @@ pub(crate) fn execute_build(
             gradle_args.push(format!("-PshadowPluginVersionName={version_name}"));
         }
         gradle_args.push("copyShadowPluginDebugToDist".to_owned());
-        let gradle = run_gradle(context, &project, &environment, &gradle_args)?;
+        let gradle = run_gradle(&gradle_context, &project, &environment, &gradle_args)?;
         persist_tooling_fingerprint(&project)?;
 
         let artifact_paths = dist_artifacts(&project)?;
@@ -496,7 +563,7 @@ pub(crate) fn execute_build(
         (artifacts, cache_status, Some(gradle))
     };
 
-    if !context.json {
+    if emit && !context.json {
         if cache_status == "HIT" || cache_status == "VALIDATED_REUSE" {
             println!("\nPackage build");
             println!("  native cache: {cache_status}");
@@ -524,19 +591,21 @@ pub(crate) fn execute_build(
             &PathBuf::from(&artifact.path),
             &artifact.sha256,
         )?;
-        if let Err(error) = control::try_refresh(context) {
+        if let Err(error) = control::try_refresh(context)
+            && emit
+        {
             eprintln!(
                 "[WARN] Host control refresh was unavailable ({error}); waiting for the inbox observer"
             );
         }
-        if !context.json {
+        if emit && !context.json {
             println!(
                 "Publish receipt: {}/dist/last-published.json",
                 project.display()
             );
         }
         if wait {
-            if !context.json {
+            if emit && !context.json {
                 println!("Waiting for Host registration: {}", published.sha256);
             }
             wait_for_receipt(
@@ -545,13 +614,13 @@ pub(crate) fn execute_build(
                 Duration::from_secs(timeout_seconds),
             )?;
             registration_confirmed = true;
-            if !context.json {
+            if emit && !context.json {
                 println!("Registration confirmed: {}", published.sha256);
             }
         }
         receipt = Some(published);
         publish_duration_ms = Some(elapsed_ms(publish_started));
-    } else if !context.json {
+    } else if emit && !context.json {
         println!("Validated artifacts:");
         for artifact in &artifacts {
             println!("  {}", artifact.path);
@@ -770,7 +839,7 @@ fn validate_version_args(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_gradle(
+pub(crate) fn run_gradle(
     context: &AppContext,
     project: &Path,
     environment: &BuildEnvironment,
@@ -805,7 +874,13 @@ fn run_gradle(
         command.arg(&wrapper);
         command
     };
-    command.arg("--offline");
+    dependency::prepare_cache_layers(environment)?;
+    if matches!(context.dependency_policy, DependencyPolicy::Offline)
+        || (matches!(context.dependency_policy, DependencyPolicy::CacheFirst)
+            && !context.allow_network)
+    {
+        command.arg("--offline");
+    }
     if env::var("TERMUX_SHADOW_CONFIGURATION_CACHE").as_deref() == Ok("1")
         && !arguments.iter().any(|argument| argument == "--stop")
     {
@@ -843,7 +918,14 @@ fn run_gradle(
         }
     }
     if !output.status.success() {
-        return Err(GradleFailure::classify(&combined, project, &log_path).into());
+        return Err(GradleFailure::classify_with_policy(
+            &combined,
+            project,
+            &log_path,
+            context.dependency_policy,
+            context.allow_network,
+        )
+        .into());
     }
     Ok(GradleOutcome {
         duration_ms,
@@ -966,7 +1048,7 @@ fn tooling_fingerprint(project: &Path) -> Result<String> {
     sha256_paths(&paths)
 }
 
-fn write_local_properties(project: &Path, environment: &BuildEnvironment) -> Result<()> {
+pub(crate) fn write_local_properties(project: &Path, environment: &BuildEnvironment) -> Result<()> {
     write_atomic(
         &project.join("local.properties"),
         format!("sdk.dir={}\n", environment.android_home.display()).as_bytes(),
@@ -1054,6 +1136,12 @@ mod tests {
             default_version_name: "1.0.0".into(),
             min_host_version_code: 1,
             max_host_version_code: 999,
+            application_class_name: None,
+            application_theme: "android.R.style.Theme_Material_Light_NoActionBar".into(),
+            activity_theme: "android.R.style.Theme_Material_Light_NoActionBar".into(),
+            screen_orientation: "unspecified".into(),
+            soft_input_mode: "adjustNothing".into(),
+            config_changes: "orientation|screenSize|keyboardHidden".into(),
         };
         let first =
             publish_validated_to(&project, &shadow_home, &config, 7, "1.2.3", &artifact, &sha)

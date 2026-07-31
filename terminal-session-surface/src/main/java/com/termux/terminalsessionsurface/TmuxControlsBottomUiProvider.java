@@ -24,7 +24,17 @@ final class TmuxControlsBottomUiProvider implements TerminalSessionBottomUiProvi
 
     @Override
     public void bind(@NonNull View view, @NonNull Binding binding) {
-        bindAction(view, R.id.tmux_action_prefix, binding, TerminalSessionBottomTmuxAction.PREFIX);
+        bindAction(view, R.id.tmux_action_display_panes, binding, TerminalSessionBottomTmuxAction.DISPLAY_PANES);
+        bindAction(view, R.id.tmux_action_split_vertical, binding, TerminalSessionBottomTmuxAction.SPLIT_VERTICAL);
+        bindAction(view, R.id.tmux_action_split_horizontal, binding, TerminalSessionBottomTmuxAction.SPLIT_HORIZONTAL);
+        bindAction(view, R.id.tmux_action_next_pane, binding, TerminalSessionBottomTmuxAction.NEXT_PANE);
+        bindAction(view, R.id.tmux_action_last_pane, binding, TerminalSessionBottomTmuxAction.LAST_PANE);
+        bindAction(view, R.id.tmux_action_zoom_pane, binding, TerminalSessionBottomTmuxAction.ZOOM_PANE);
+        bindAction(view, R.id.tmux_action_resize_left, binding, TerminalSessionBottomTmuxAction.RESIZE_LEFT);
+        bindAction(view, R.id.tmux_action_resize_right, binding, TerminalSessionBottomTmuxAction.RESIZE_RIGHT);
+        bindAction(view, R.id.tmux_action_resize_up, binding, TerminalSessionBottomTmuxAction.RESIZE_UP);
+        bindAction(view, R.id.tmux_action_resize_down, binding, TerminalSessionBottomTmuxAction.RESIZE_DOWN);
+        bindAction(view, R.id.tmux_action_kill_pane, binding, TerminalSessionBottomTmuxAction.KILL_PANE);
         bindAction(view, R.id.tmux_action_prev, binding, TerminalSessionBottomTmuxAction.PREVIOUS_WINDOW);
         bindAction(view, R.id.tmux_action_next, binding, TerminalSessionBottomTmuxAction.NEXT_WINDOW);
         bindAction(view, R.id.tmux_action_new, binding, TerminalSessionBottomTmuxAction.NEW_WINDOW);

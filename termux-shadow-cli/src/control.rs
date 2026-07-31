@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::cli::{DeleteArgs, LaunchArgs};
 use crate::config::PluginConfig;
@@ -35,6 +36,7 @@ pub(crate) struct LaunchOutcome {
     #[serde(rename = "hostOperationId")]
     pub operation_id: Option<String>,
     pub health_semantics: Option<&'static str>,
+    pub smoke_requested: bool,
     pub message: Option<String>,
 }
 
@@ -58,8 +60,11 @@ pub(crate) fn execute_launch(
     rollback: bool,
     emit: bool,
 ) -> Result<LaunchOutcome> {
+    let smoke_spec = load_smoke_spec(context, &args)?;
     let plugin_id = resolve_plugin_id(context, args.plugin_id)?;
-    if !rollback && !args.force {
+    // A smoke request is an explicit request to exercise the live UI.  Reusing the
+    // registry proof would report success without executing a single smoke step.
+    if !rollback && !args.force && smoke_spec.is_none() {
         let registry = read_registry(&context.shadow_home)?;
         if let Some(plugin) = registry
             .plugins
@@ -86,6 +91,7 @@ pub(crate) fn execute_launch(
                 generation: Some(active_generation.to_owned()),
                 operation_id: None,
                 health_semantics: Some("FIRST_FRAME_AND_PROCESS_STABILITY"),
+                smoke_requested: smoke_spec.is_some(),
                 message: None,
             };
             if emit {
@@ -97,7 +103,7 @@ pub(crate) fn execute_launch(
     let previous_operation =
         read_launch_report(&context.shadow_home, &plugin_id)?.map(|report| report.operation_id);
     let method = if rollback { "rollback" } else { "run" };
-    let message = call(context, method, Some(&plugin_id))?;
+    let message = call(context, method, Some(&plugin_id), smoke_spec.as_deref())?;
     if args.no_wait {
         let outcome = LaunchOutcome {
             ok: true,
@@ -107,6 +113,7 @@ pub(crate) fn execute_launch(
             generation: None,
             operation_id: None,
             health_semantics: None,
+            smoke_requested: smoke_spec.is_some(),
             message: Some(message),
         };
         if emit {
@@ -142,7 +149,12 @@ pub(crate) fn execute_launch(
                         status: "HEALTHY",
                         generation: Some(report.generation),
                         operation_id: Some(report.operation_id),
-                        health_semantics: Some("FIRST_FRAME_AND_PROCESS_STABILITY"),
+                        health_semantics: Some(if smoke_spec.is_some() {
+                            "FIRST_FRAME_UI_SMOKE_AND_PROCESS_STABILITY"
+                        } else {
+                            "FIRST_FRAME_AND_PROCESS_STABILITY"
+                        }),
+                        smoke_requested: smoke_spec.is_some(),
                         message: None,
                     };
                     if emit {
@@ -305,7 +317,7 @@ pub fn run_mutation(
     requested_plugin_id: Option<String>,
 ) -> Result<()> {
     let plugin_id = resolve_plugin_id(context, requested_plugin_id)?;
-    let message = call(context, method, Some(&plugin_id))?;
+    let message = call(context, method, Some(&plugin_id), None)?;
     let registry = read_registry(&context.shadow_home)?;
     let plugin = registry
         .plugins
@@ -329,7 +341,7 @@ pub fn run_delete(context: &AppContext, args: DeleteArgs) -> Result<()> {
         );
     }
     let plugin_id = resolve_plugin_id(context, args.plugin_id)?;
-    let message = call(context, "delete", Some(&plugin_id))?;
+    let message = call(context, "delete", Some(&plugin_id), None)?;
     let registry = read_registry(&context.shadow_home)?;
     if registry
         .plugins
@@ -342,24 +354,24 @@ pub fn run_delete(context: &AppContext, args: DeleteArgs) -> Result<()> {
 }
 
 pub fn run_refresh(context: &AppContext) -> Result<()> {
-    let message = call(context, "refresh", None)?;
+    let message = call(context, "refresh", None, None)?;
     emit_control(context, "refresh", None, "OK", message)
 }
 
 pub fn try_refresh(context: &AppContext) -> Result<()> {
-    call(context, "refresh", None).map(|_| ())
+    call(context, "refresh", None, None).map(|_| ())
 }
 
 pub fn ping(context: &AppContext) -> Result<String> {
-    call(context, "ping", None)
+    call(context, "ping", None, None)
 }
 
 pub fn ensure_build_worker(context: &AppContext) -> Result<String> {
-    call(context, "ensure-worker", None)
+    call(context, "ensure-worker", None, None)
 }
 
 pub fn stop_build_worker(context: &AppContext) -> Result<String> {
-    call(context, "stop-worker", None)
+    call(context, "stop-worker", None, None)
 }
 
 fn resolve_plugin_id(context: &AppContext, requested: Option<String>) -> Result<String> {
@@ -375,7 +387,166 @@ fn resolve_plugin_id(context: &AppContext, requested: Option<String>) -> Result<
     Ok(PluginConfig::load(&project.join("shadow-plugin.properties"))?.plugin_id)
 }
 
-fn call(context: &AppContext, method: &str, plugin_id: Option<&str>) -> Result<String> {
+fn load_smoke_spec(context: &AppContext, args: &LaunchArgs) -> Result<Option<String>> {
+    if !args.smoke {
+        return Ok(None);
+    }
+    let path = args.smoke_file.clone().unwrap_or_else(|| {
+        context
+            .project_if_present()
+            .map(|project| project.join("shadow-smoke.json"))
+            .unwrap_or_else(|| PathBuf::from("shadow-smoke.json"))
+    });
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "UI smoke testing requires a JSON specification: {}",
+            path.display()
+        )
+    })?;
+    if bytes.len() > 32 * 1024 {
+        bail!("UI smoke specification exceeds the 32 KiB transport safety limit");
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse UI smoke specification {}", path.display()))?;
+    validate_smoke_spec(&value)?;
+    Ok(Some(serde_json::to_string(&value)?))
+}
+
+fn validate_smoke_spec(value: &Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("UI smoke specification must be a JSON object")?;
+    if object.get("schemaVersion").and_then(Value::as_u64) != Some(1) {
+        bail!("UI smoke specification schemaVersion must be 1");
+    }
+    let steps = object
+        .get("steps")
+        .and_then(Value::as_array)
+        .context("UI smoke specification requires a steps array")?;
+    if steps.is_empty() || steps.len() > 32 {
+        bail!("UI smoke specification must contain between 1 and 32 steps");
+    }
+    for key in object.keys() {
+        if !matches!(key.as_str(), "schemaVersion" | "steps") {
+            bail!("UI smoke specification has unsupported root field {key}");
+        }
+    }
+    let mut total_wait_ms = 0i64;
+    for (index, step) in steps.iter().enumerate() {
+        let step = step
+            .as_object()
+            .with_context(|| format!("smoke step {index} must be an object"))?;
+        let action = step
+            .get("action")
+            .and_then(Value::as_str)
+            .with_context(|| format!("smoke step {index} requires action"))?;
+        if !matches!(
+            action,
+            "wait"
+                | "assertDisplayed"
+                | "assertText"
+                | "click"
+                | "focus"
+                | "input"
+                | "scroll"
+                | "assertImeActive"
+        ) {
+            bail!("smoke step {index} has unsupported action {action}");
+        }
+        let allowed_fields: &[&str] = match action {
+            "wait" => &["action", "waitMs"],
+            "assertDisplayed" | "click" | "focus" | "assertImeActive" => {
+                &["action", "view", "waitMs"]
+            }
+            "assertText" => &["action", "view", "text", "contains", "waitMs"],
+            "input" => &["action", "view", "text", "waitMs"],
+            "scroll" => &["action", "view", "dx", "dy", "waitMs"],
+            _ => unreachable!(),
+        };
+        for key in step.keys() {
+            if !allowed_fields.contains(&key.as_str()) {
+                bail!("smoke step {index} field {key} is not valid for {action}");
+            }
+        }
+        let view = step.get("view");
+        if action != "wait" && view.is_none() {
+            bail!("smoke step {index} action {action} requires view");
+        }
+        if let Some(view) = view {
+            let view = view
+                .as_str()
+                .with_context(|| format!("smoke step {index} view must be a string"))?;
+            let normalized = view
+                .strip_prefix("@id/")
+                .or_else(|| view.strip_prefix("id/"))
+                .unwrap_or(view);
+            if normalized.is_empty()
+                || view.len() > 160
+                || !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
+            {
+                bail!("smoke step {index} has an unsafe view name");
+            }
+        }
+        if matches!(action, "assertText" | "input") && !step.contains_key("text") {
+            bail!("smoke step {index} action {action} requires text");
+        }
+        if let Some(text) = step.get("text") {
+            let text = text
+                .as_str()
+                .with_context(|| format!("smoke step {index} text must be a string"))?;
+            if text.len() > 2048 {
+                bail!("smoke step {index} text exceeds 2048 bytes");
+            }
+        }
+        if let Some(contains) = step.get("contains")
+            && !contains.is_boolean()
+        {
+            bail!("smoke step {index} contains must be a boolean");
+        }
+        let wait = match step.get("waitMs") {
+            Some(wait) => wait
+                .as_i64()
+                .with_context(|| format!("smoke step {index} waitMs must be an integer"))?,
+            None => 0,
+        };
+        if !(0..=5_000).contains(&wait) {
+            bail!("smoke step {index} waitMs must be between 0 and 5000");
+        }
+        if action == "wait" && wait == 0 {
+            bail!("smoke step {index} wait action requires a positive waitMs");
+        }
+        total_wait_ms += wait;
+        for key in ["dx", "dy"] {
+            if let Some(value) = step.get(key) {
+                let value = value
+                    .as_i64()
+                    .with_context(|| format!("smoke step {index} {key} must be an integer"))?;
+                if !(-10_000..=10_000).contains(&value) {
+                    bail!("smoke step {index} {key} is out of bounds");
+                }
+            }
+        }
+        if action == "scroll"
+            && step.get("dx").and_then(Value::as_i64).unwrap_or(0) == 0
+            && step.get("dy").and_then(Value::as_i64).unwrap_or(0) == 0
+        {
+            bail!("smoke step {index} scroll requires a non-zero dx or dy");
+        }
+    }
+    if total_wait_ms > 10_000 {
+        bail!("UI smoke specification total waitMs exceeds 10000");
+    }
+    Ok(())
+}
+
+fn call(
+    context: &AppContext,
+    method: &str,
+    plugin_id: Option<&str>,
+    smoke_spec: Option<&str>,
+) -> Result<String> {
     let am = activity_manager_binary();
     if !am.is_file() {
         bail!(
@@ -410,6 +581,9 @@ fn call(context: &AppContext, method: &str, plugin_id: Option<&str>) -> Result<S
         .arg(&request_id);
     if let Some(plugin_id) = plugin_id {
         command.arg("--es").arg("pluginId").arg(plugin_id);
+    }
+    if let Some(smoke_spec) = smoke_spec {
+        command.arg("--es").arg("smokeSpec").arg(smoke_spec);
     }
     let output = command
         .output()
@@ -531,7 +705,8 @@ fn activity_manager_binary() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::request_id;
+    use super::{request_id, validate_smoke_spec};
+    use serde_json::json;
 
     #[test]
     fn request_ids_are_path_safe() {
@@ -541,6 +716,52 @@ mod tests {
             request_id
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        );
+    }
+
+    #[test]
+    fn smoke_spec_is_bounded_and_declarative() {
+        assert!(
+            validate_smoke_spec(&json!({
+                "schemaVersion": 1,
+                "steps": [
+                    {"action": "assertDisplayed", "view": "@id/message_list"},
+                    {"action": "scroll", "view": "message_list", "dy": 300}
+                ]
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate_smoke_spec(&json!({
+                "schemaVersion": 1,
+                "steps": [{"action": "shell", "text": "rm"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_smoke_spec(&json!({
+                "schemaVersion": 1,
+                "steps": [{"action": "wait", "waitMs": 6000}]
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_smoke_spec(&json!({
+                "schemaVersion": 1,
+                "steps": [{"action": "assertText", "view": "title"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_smoke_spec(&json!({
+                "schemaVersion": 1,
+                "steps": [
+                    {"action": "wait", "waitMs": 5000},
+                    {"action": "wait", "waitMs": 5000},
+                    {"action": "wait", "waitMs": 1}
+                ]
+            }))
+            .is_err()
         );
     }
 }

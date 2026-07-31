@@ -1,2 +1,14 @@
 /target/
 /dist/
+**/target/
+**/dist/
+.gradle/
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+.codex/
+.local/
+.idea/
+.vscode/

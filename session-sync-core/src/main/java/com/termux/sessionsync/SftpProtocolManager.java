@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -43,7 +44,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -65,6 +65,7 @@ public final class SftpProtocolManager {
     private static final int MAX_TRANSFER_WORKERS = 3;
     private static final long CHANNEL_IDLE_TTL_MS = 18_000L;
     private static final int PREWARM_MAX_THREADS = 2;
+    private static final int PREWARM_QUEUE_CAPACITY = 16;
     private static final AtomicInteger PREWARM_THREAD_COUNTER = new AtomicInteger(1);
     private static final AtomicInteger TRANSFER_THREAD_COUNTER = new AtomicInteger(1);
     private static final AtomicInteger TRANSFER_TEMP_COUNTER = new AtomicInteger(1);
@@ -108,11 +109,11 @@ public final class SftpProtocolManager {
             return thread;
         };
         ThreadPoolExecutor executor = new ThreadPoolExecutor(
-            0,
+            PREWARM_MAX_THREADS,
             PREWARM_MAX_THREADS,
             20L,
             TimeUnit.SECONDS,
-            new SynchronousQueue<>(),
+            new LinkedBlockingQueue<>(PREWARM_QUEUE_CAPACITY),
             threadFactory
         );
         executor.allowCoreThreadTimeOut(true);
@@ -368,9 +369,11 @@ public final class SftpProtocolManager {
         try {
             mPrewarmExecutor.execute(task);
         } catch (RejectedExecutionException e) {
-            Thread fallback = new Thread(task, "sftp-prewarm-fallback");
-            fallback.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
-            fallback.start();
+            // Prewarming is opportunistic. Never turn a burst of tabs into an unbounded set of
+            // fallback threads; the foreground request will establish the connection on demand.
+            synchronized (mLock) {
+                mPrewarmingClientKeys.remove(clientKey);
+            }
         }
     }
 
@@ -4141,8 +4144,7 @@ public final class SftpProtocolManager {
             addSshIdentities(jsch, homeDir, parsed);
             SshHostTrustStore trustStore = SshHostTrustStore.getInstance();
             trustStore.initialize(context);
-            trustStore.setActiveEndpoint(resolvedEndpoint);
-            jsch.setHostKeyRepository(trustStore);
+            jsch.setHostKeyRepository(trustStore.bindEndpoint(resolvedEndpoint));
 
             com.jcraft.jsch.Session session = jsch.getSession(parsed.user, parsed.host, parsed.port);
             if (!TextUtils.isEmpty(parsed.password)) session.setPassword(parsed.password);
@@ -4163,8 +4165,6 @@ public final class SftpProtocolManager {
                 session.connect(15_000);
             } catch (Exception connectError) {
                 throw decorateTrustFailure(trustStore, resolvedEndpoint, connectError);
-            } finally {
-                trustStore.clearActiveEndpoint();
             }
 
             ClientHolder newHolder = new ClientHolder(clientKey, entry.id, session);
@@ -4211,7 +4211,11 @@ public final class SftpProtocolManager {
     private void clearDirectoryCacheByClientKeyLocked(@Nullable String clientKey) {
         if (TextUtils.isEmpty(clientKey)) return;
         String prefix = clientKey + "|";
-        mDirectoryCache.entrySet().removeIf(item -> item.getKey() != null && item.getKey().startsWith(prefix));
+        Iterator<Map.Entry<String, CachedDirectory>> iterator = mDirectoryCache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            String key = iterator.next().getKey();
+            if (key != null && key.startsWith(prefix)) iterator.remove();
+        }
     }
 
     private void trimDirectoryCacheLocked() {

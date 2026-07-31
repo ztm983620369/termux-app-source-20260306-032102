@@ -23,8 +23,8 @@ sh "$ROOT_DIR/scripts/doctor.sh" --project-only >/dev/null
 sh "$ROOT_DIR/shadow-plugin" help >/dev/null
 
 NOTES_PROJECT=$TERMUX_HOME/termux-shadow-notes
-sh "$ROOT_DIR/scripts/new-plugin.sh" notes "Notes App" \
-    --target "$NOTES_PROJECT" --resource-id 0x6A >/dev/null
+new_output=$(sh "$ROOT_DIR/scripts/new-plugin.sh" notes "Notes App" \
+    --target "$NOTES_PROJECT" --resource-id 0x6A)
 
 [ "$(shadow_property "$NOTES_PROJECT/shadow-plugin.properties" pluginId)" \
     = com.termux.shadow.notes ] || fail "generated pluginId mismatch"
@@ -34,8 +34,22 @@ sh "$ROOT_DIR/scripts/new-plugin.sh" notes "Notes App" \
     = "Notes App" ] || fail "display name with spaces was not preserved"
 [ -f "$NOTES_PROJECT/plugin-app/src/main/java/com/termux/shadow/notes/NotesActivity.java" ] \
     || fail "generated Activity source is missing"
+[ -f "$NOTES_PROJECT/plugin-app/dependencies.gradle" ] \
+    || fail "project-owned dependency surface is missing"
+[ "$(shadow_property "$NOTES_PROJECT/shadow-plugin.properties" schemaVersion)" = 2 ] \
+    || fail "generated config is not schema 2"
 [ ! -e "$NOTES_PROJECT/build" ] || fail "build output was copied into generated project"
 [ ! -e "$NOTES_PROJECT/dist" ] || fail "dist output was copied into generated project"
+printf '%s\n' "$new_output" | grep -Fq 'registration: NOT_REQUESTED' \
+    || fail "new output did not distinguish registration state"
+printf '%s\n' "$new_output" | grep -Fq -- \
+    '--- identity: shadow-plugin.properties' \
+    || fail "new output omitted the exact identity source"
+printf '%s\n' "$new_output" | grep -Fq -- \
+    '--- activity: plugin-app/src/main/java/com/termux/shadow/notes/NotesActivity.java' \
+    || fail "new output omitted the generated Activity source"
+printf '%s\n' "$new_output" | grep -Fq 'public final class NotesActivity' \
+    || fail "new output omitted key source content"
 sh "$NOTES_PROJECT/scripts/doctor.sh" --project-only >/dev/null
 
 if sh "$ROOT_DIR/scripts/new-plugin.sh" tasks "Tasks" \

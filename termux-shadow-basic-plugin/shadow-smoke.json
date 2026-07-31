@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "action": "assertDisplayed",
+      "view": "plugin_title"
+    },
+    {
+      "action": "assertText",
+      "view": "plugin_status",
+      "text": "pluginId",
+      "contains": true
+    }
+  ]
+}

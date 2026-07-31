@@ -11,6 +11,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class TerminalParserDifferentialTest extends TestCase {
 
@@ -82,6 +84,22 @@ public class TerminalParserDifferentialTest extends TestCase {
         reference.appendByteWiseForTesting(input, input.length);
 
         assertEquivalent("complex rows", optimized, reference, optimizedOutput, referenceOutput);
+    }
+
+    public void testWholeChunkAsciiClassifierMatchesByteWiseReference() throws Exception {
+        for (int seed = 0; seed < 24; seed++) {
+            byte[] input = buildInput(seed);
+            CapturingOutput classifiedOutput = new CapturingOutput();
+            CapturingOutput referenceOutput = new CapturingOutput();
+            TerminalEmulator classified = newTerminal(classifiedOutput);
+            TerminalEmulator reference = newTerminal(referenceOutput);
+
+            classified.appendWithScalarAsciiClassifierForTesting(input, input.length);
+            reference.appendByteWiseForTesting(input, input.length);
+
+            assertEquivalent("whole-chunk seed=" + seed, classified, reference,
+                classifiedOutput, referenceOutput);
+        }
     }
 
     public void testParserDoesNotCrashForEveryByteBoundary() throws Exception {
@@ -227,7 +245,7 @@ public class TerminalParserDifferentialTest extends TestCase {
             "mUseLineDrawingUsesG0", "mCurrentDecSetFlags", "mSavedDecSetFlags", "mInsertMode",
             "mTabStop", "mTopMargin", "mBottomMargin", "mLeftMargin", "mRightMargin", "mAboutToAutoWrap",
             "mCursorBlinkingEnabled", "mCursorBlinkState", "mForeColor", "mBackColor", "mUnderlineColor",
-            "mEffect", "mScrollCounter", "mScrollCounterFullScreen", "mFullRedrawRequired",
+            "mEffect", "mScrollSignal", "mFullRedrawRequired",
             "mAutoScrollDisabled", "mUtf8ToFollow", "mUtf8Index", "mUtf8InputBuffer", "mLastEmittedCodePoint"
         };
         for (String field : fields) {
@@ -259,7 +277,10 @@ public class TerminalParserDifferentialTest extends TestCase {
     }
 
     private static Object normalize(Object value) {
-        return value instanceof StringBuilder ? value.toString() : value;
+        if (value instanceof StringBuilder) return value.toString();
+        if (value instanceof AtomicLong) return ((AtomicLong) value).get();
+        if (value instanceof AtomicBoolean) return ((AtomicBoolean) value).get();
+        return value;
     }
 
     private static String valueString(Object value) {

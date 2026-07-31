@@ -11,6 +11,7 @@ public final class SshPendingTrustRecord {
     @NonNull public final String authorityKey;
     @NonNull public final String hostIdentity;
     public final int port;
+    public final boolean usesHostKeyAlias;
     @NonNull public final String algorithm;
     @NonNull public final String observedFingerprintSha256;
     @NonNull public final String existingFingerprintSha256;
@@ -25,12 +26,26 @@ public final class SshPendingTrustRecord {
                                  @Nullable String existingFingerprintSha256,
                                  boolean replacementRequired,
                                  long observedAtMs) {
+        this(authorityKey, hostIdentity, port, false, algorithm, observedFingerprintSha256,
+            existingFingerprintSha256, replacementRequired, observedAtMs);
+    }
+
+    public SshPendingTrustRecord(@NonNull String authorityKey,
+                                 @NonNull String hostIdentity,
+                                 int port,
+                                 boolean usesHostKeyAlias,
+                                 @NonNull String algorithm,
+                                 @NonNull String observedFingerprintSha256,
+                                 @Nullable String existingFingerprintSha256,
+                                 boolean replacementRequired,
+                                 long observedAtMs) {
         this.authorityKey = safe(authorityKey).toLowerCase(Locale.ROOT);
         this.hostIdentity = safe(hostIdentity).toLowerCase(Locale.ROOT);
         this.port = port > 0 && port <= 65535 ? port : 22;
+        this.usesHostKeyAlias = usesHostKeyAlias;
         this.algorithm = safe(algorithm);
-        this.observedFingerprintSha256 = safe(observedFingerprintSha256).toLowerCase(Locale.ROOT);
-        this.existingFingerprintSha256 = safe(existingFingerprintSha256).toLowerCase(Locale.ROOT);
+        this.observedFingerprintSha256 = SshHostKeyFingerprint.normalizeSha256(observedFingerprintSha256);
+        this.existingFingerprintSha256 = SshHostKeyFingerprint.normalizeSha256(existingFingerprintSha256);
         this.replacementRequired = replacementRequired;
         this.observedAtMs = Math.max(0L, observedAtMs);
     }
@@ -41,6 +56,7 @@ public final class SshPendingTrustRecord {
         if (!(other instanceof SshPendingTrustRecord)) return false;
         SshPendingTrustRecord that = (SshPendingTrustRecord) other;
         return port == that.port
+            && usesHostKeyAlias == that.usesHostKeyAlias
             && replacementRequired == that.replacementRequired
             && observedAtMs == that.observedAtMs
             && Objects.equals(authorityKey, that.authorityKey)
@@ -52,7 +68,7 @@ public final class SshPendingTrustRecord {
 
     @Override
     public int hashCode() {
-        return Objects.hash(authorityKey, hostIdentity, port, algorithm,
+        return Objects.hash(authorityKey, hostIdentity, port, usesHostKeyAlias, algorithm,
             observedFingerprintSha256, existingFingerprintSha256, replacementRequired, observedAtMs);
     }
 

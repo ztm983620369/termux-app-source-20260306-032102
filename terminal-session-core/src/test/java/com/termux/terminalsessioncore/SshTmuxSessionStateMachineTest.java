@@ -27,6 +27,19 @@ public class SshTmuxSessionStateMachineTest {
     }
 
     @Test
+    public void targetSeparatorsUseAnOpaqueRemoteName() {
+        SshTmuxSessionStateMachine.Snapshot snapshot =
+            SshTmuxSessionStateMachine.planNewManagedSession(
+                "prod.api", "fallback", "ssh root@example.com", "h1");
+
+        Assert.assertEquals("prod.api", snapshot.displayName);
+        Assert.assertTrue(snapshot.remoteSessionName.startsWith(
+            SshTmuxSessionStateMachine.MANAGED_REMOTE_SESSION_PREFIX));
+        Assert.assertEquals(SshTmuxSessionStateMachine.RemoteState.GENERATED_MANAGED_ID,
+            snapshot.remoteState);
+    }
+
+    @Test
     public void displayNameHexRoundTripSupportsUnicode() {
         String encoded = SshTmuxSessionStateMachine.encodeDisplayNameHex("中文 Name 01");
         Assert.assertFalse(encoded.isEmpty());

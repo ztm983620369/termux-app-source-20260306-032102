@@ -12,7 +12,10 @@ public final class SshTmuxSessionStateMachine {
 
     public static final String TMUX_DISPLAY_NAME_OPTION = "@termux_display_name_hex";
     public static final String MANAGED_REMOTE_SESSION_PREFIX = "termux-persist-v2-";
-    private static final Pattern DIRECT_REMOTE_NAME_PATTERN = Pattern.compile("[A-Za-z0-9._-]{1,64}");
+    // tmux clean_name() rewrites target separators such as '.' and ':' when a
+    // session is created. Limit directly-created names to the byte-stable subset
+    // that is also unambiguous in tmux's target-session grammar.
+    private static final Pattern DIRECT_REMOTE_NAME_PATTERN = Pattern.compile("[A-Za-z0-9_-]{1,64}");
 
     public enum DisplayState {
         EXPLICIT_INPUT,

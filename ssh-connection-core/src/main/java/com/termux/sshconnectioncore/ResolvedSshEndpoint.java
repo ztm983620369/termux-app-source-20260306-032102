@@ -21,6 +21,7 @@ public final class ResolvedSshEndpoint {
     @NonNull public final String hostIdentity;
     @NonNull public final String host;
     public final int port;
+    public final boolean usesHostKeyAlias;
     @NonNull public final String user;
     @NonNull public final String identityPath;
     @NonNull public final String canonicalSshCommand;
@@ -33,6 +34,7 @@ public final class ResolvedSshEndpoint {
         this.hostIdentity = normalizeHostIdentity(builder.hostIdentity, builder.host);
         this.host = safe(builder.host);
         this.port = normalizePort(builder.port);
+        this.usesHostKeyAlias = builder.usesHostKeyAlias;
         this.user = safe(builder.user);
         this.identityPath = safe(builder.identityPath);
         this.canonicalSshCommand = safe(builder.canonicalSshCommand);
@@ -44,7 +46,8 @@ public final class ResolvedSshEndpoint {
         this.authorityKey = buildAuthorityKey(
             safe(builder.authorityKey),
             this.hostIdentity,
-            this.port
+            this.port,
+            this.usesHostKeyAlias
         );
     }
 
@@ -56,6 +59,7 @@ public final class ResolvedSshEndpoint {
             .setHostIdentity(hostIdentity)
             .setHost(host)
             .setPort(port)
+            .setUsesHostKeyAlias(usesHostKeyAlias)
             .setUser(user)
             .setIdentityPath(identityPath)
             .setCanonicalSshCommand(canonicalSshCommand)
@@ -70,6 +74,7 @@ public final class ResolvedSshEndpoint {
         if (!(other instanceof ResolvedSshEndpoint)) return false;
         ResolvedSshEndpoint that = (ResolvedSshEndpoint) other;
         return port == that.port
+            && usesHostKeyAlias == that.usesHostKeyAlias
             && Objects.equals(profileId, that.profileId)
             && Objects.equals(authorityKey, that.authorityKey)
             && Objects.equals(hostIdentity, that.hostIdentity)
@@ -84,7 +89,7 @@ public final class ResolvedSshEndpoint {
 
     @Override
     public int hashCode() {
-        return Objects.hash(profileId, authorityKey, hostIdentity, host, port, user,
+        return Objects.hash(profileId, authorityKey, hostIdentity, host, port, usesHostKeyAlias, user,
             identityPath, canonicalSshCommand, rawSshCommand, userKnownHostsPath,
             hostKeyVerificationMode);
     }
@@ -95,6 +100,7 @@ public final class ResolvedSshEndpoint {
         @Nullable private String hostIdentity;
         @Nullable private String host;
         private int port = 22;
+        private boolean usesHostKeyAlias;
         @Nullable private String user;
         @Nullable private String identityPath;
         @Nullable private String canonicalSshCommand;
@@ -129,6 +135,12 @@ public final class ResolvedSshEndpoint {
         @NonNull
         public Builder setPort(int port) {
             this.port = port;
+            return this;
+        }
+
+        @NonNull
+        public Builder setUsesHostKeyAlias(boolean usesHostKeyAlias) {
+            this.usesHostKeyAlias = usesHostKeyAlias;
             return this;
         }
 
@@ -175,8 +187,12 @@ public final class ResolvedSshEndpoint {
     }
 
     @NonNull
-    private static String buildAuthorityKey(@NonNull String explicitKey, @NonNull String hostIdentity, int port) {
+    private static String buildAuthorityKey(@NonNull String explicitKey, @NonNull String hostIdentity,
+                                            int port, boolean usesHostKeyAlias) {
         if (!explicitKey.isEmpty()) return explicitKey;
+        // OpenSSH deliberately uses HostKeyAlias verbatim and does not append the destination
+        // port. Mirror that trust namespace instead of presenting false per-port isolation.
+        if (usesHostKeyAlias) return "ssh-hostkeyalias://" + hostIdentity;
         return "ssh://" + hostIdentity + ":" + normalizePort(port);
     }
 

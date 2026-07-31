@@ -112,6 +112,11 @@ public class PluginLoadActivity extends Activity {
                             Constant.KEY_HEALTH_STABILITY_WINDOW_MS,
                             launchPlan.stabilityWindowMs
                     );
+                    String smokeSpec = getIntent().getStringExtra(Constant.KEY_SMOKE_SPEC);
+                    if (smokeSpec != null) {
+                        bundle.putString(Constant.KEY_SMOKE_SPEC, smokeSpec);
+                        bundle.putBoolean(Constant.KEY_SMOKE_REQUESTED, true);
+                    }
                     bundle.putParcelable(Constant.KEY_RESULT_RECEIVER, createResultReceiver());
 
                     pluginManager.enter(
@@ -322,7 +327,12 @@ public class PluginLoadActivity extends Activity {
                 firstFrameElapsedMs,
                 stableElapsedMs,
                 data.getInt(Constant.KEY_PLUGIN_PROCESS_PID, 0),
-                data.getString(Constant.KEY_PLUGIN_PROCESS_NAME)
+                data.getString(Constant.KEY_PLUGIN_PROCESS_NAME),
+                data.getBoolean(Constant.KEY_SMOKE_REQUESTED, false),
+                data.getBoolean(Constant.KEY_SMOKE_PASSED, false),
+                data.getInt(Constant.KEY_SMOKE_STEP_COUNT, 0),
+                data.getLong(Constant.KEY_SMOKE_DURATION_MS, 0L),
+                data.getString(Constant.KEY_SMOKE_ERROR)
         );
     }
 

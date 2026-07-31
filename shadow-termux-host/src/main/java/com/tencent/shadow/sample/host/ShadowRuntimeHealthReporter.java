@@ -63,7 +63,7 @@ final class ShadowRuntimeHealthReporter implements Application.ActivityLifecycle
                         Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
                             @Override
                             public void doFrame(long frameTimeNanos) {
-                                reportReadyAndArmStability(probe);
+                                reportReadyAndArmStability(activity, probe);
                             }
                         });
                     }
@@ -74,16 +74,65 @@ final class ShadowRuntimeHealthReporter implements Application.ActivityLifecycle
         decorView.postInvalidateOnAnimation();
     }
 
-    private void reportReadyAndArmStability(final Probe probe) {
+    private void reportReadyAndArmStability(final Activity activity, final Probe probe) {
         final long firstFrameElapsedMs = SystemClock.elapsedRealtime();
-        probe.send(Constant.RESULT_CODE_RUNTIME_READY, firstFrameElapsedMs, 0L);
+        if (probe.smokeSpec != null) {
+            ShadowUiSmokeRunner.run(activity, probe.smokeSpec, new ShadowUiSmokeRunner.Callback() {
+                @Override
+                public void onSuccess(int stepCount, long durationMs) {
+                    probe.send(
+                            Constant.RESULT_CODE_RUNTIME_READY,
+                            firstFrameElapsedMs,
+                            0L,
+                            true,
+                            true,
+                            stepCount,
+                            durationMs,
+                            null
+                    );
+                    armStable(probe, firstFrameElapsedMs, true, stepCount, durationMs, null);
+                }
+
+                @Override
+                public void onFailure(String message, int step, long durationMs) {
+                    probe.sendFailure(message, step, durationMs);
+                }
+            });
+            return;
+        }
+        probe.send(
+                Constant.RESULT_CODE_RUNTIME_READY,
+                firstFrameElapsedMs,
+                0L,
+                false,
+                false,
+                0,
+                0L,
+                null
+        );
+        armStable(probe, firstFrameElapsedMs, false, 0, 0L, null);
+    }
+
+    private void armStable(
+            final Probe probe,
+            final long firstFrameElapsedMs,
+            final boolean smokePassed,
+            final int stepCount,
+            final long durationMs,
+            final String smokeError
+    ) {
         mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
                 probe.send(
                         Constant.RESULT_CODE_RUNTIME_STABLE,
                         firstFrameElapsedMs,
-                        SystemClock.elapsedRealtime()
+                        SystemClock.elapsedRealtime(),
+                        probe.smokeSpec != null,
+                        smokePassed,
+                        stepCount,
+                        durationMs,
+                        smokeError
                 );
             }
         }, probe.stabilityWindowMs);
@@ -130,19 +179,22 @@ final class ShadowRuntimeHealthReporter implements Application.ActivityLifecycle
         final String generation;
         final String operationId;
         final long stabilityWindowMs;
+        final String smokeSpec;
 
         Probe(
                 ResultReceiver receiver,
                 String pluginId,
                 String generation,
                 String operationId,
-                long stabilityWindowMs
+                long stabilityWindowMs,
+                String smokeSpec
         ) {
             this.receiver = receiver;
             this.pluginId = pluginId;
             this.generation = generation;
             this.operationId = operationId;
             this.stabilityWindowMs = stabilityWindowMs;
+            this.smokeSpec = smokeSpec;
         }
 
         static Probe from(Intent intent) {
@@ -179,6 +231,10 @@ final class ShadowRuntimeHealthReporter implements Application.ActivityLifecycle
                         Constant.KEY_HEALTH_STABILITY_WINDOW_MS,
                         1_500L
                 );
+                String smokeSpec = correlation.getString(Constant.KEY_SMOKE_SPEC);
+                if (smokeSpec != null && smokeSpec.length() > 32 * 1024) {
+                    throw new IllegalArgumentException("UI smoke specification exceeds 32 KiB");
+                }
                 Log.i(TAG, "Armed first-frame health probe: " + pluginId + "/" + generation
                         + " operationId=" + operationId);
                 return new Probe(
@@ -186,7 +242,8 @@ final class ShadowRuntimeHealthReporter implements Application.ActivityLifecycle
                         pluginId,
                         generation,
                         operationId,
-                        Math.max(500L, Math.min(stabilityWindowMs, 10_000L))
+                        Math.max(500L, Math.min(stabilityWindowMs, 10_000L)),
+                        smokeSpec
                 );
             } catch (Throwable throwable) {
                 Log.e(TAG, "Failed to decode runtime health correlation", throwable);
@@ -194,7 +251,16 @@ final class ShadowRuntimeHealthReporter implements Application.ActivityLifecycle
             }
         }
 
-        void send(int resultCode, long firstFrameElapsedMs, long stableElapsedMs) {
+        void send(
+                int resultCode,
+                long firstFrameElapsedMs,
+                long stableElapsedMs,
+                boolean smokeRequested,
+                boolean smokePassed,
+                int smokeStepCount,
+                long smokeDurationMs,
+                String smokeError
+        ) {
             Bundle proof = new Bundle();
             proof.putString(Constant.KEY_PLUGIN_ID, pluginId);
             proof.putString(Constant.KEY_PLUGIN_GENERATION, generation);
@@ -211,10 +277,37 @@ final class ShadowRuntimeHealthReporter implements Application.ActivityLifecycle
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 proof.putString(Constant.KEY_PLUGIN_PROCESS_NAME, Application.getProcessName());
             }
+            proof.putBoolean(Constant.KEY_SMOKE_REQUESTED, smokeRequested);
+            proof.putBoolean(Constant.KEY_SMOKE_PASSED, smokePassed);
+            proof.putInt(Constant.KEY_SMOKE_STEP_COUNT, smokeStepCount);
+            proof.putLong(Constant.KEY_SMOKE_DURATION_MS, smokeDurationMs);
+            if (smokeError != null) {
+                proof.putString(Constant.KEY_SMOKE_ERROR, smokeError);
+            }
             try {
                 receiver.send(resultCode, proof);
             } catch (Throwable throwable) {
                 Log.e(TAG, "Failed to deliver runtime health proof", throwable);
+            }
+        }
+
+        void sendFailure(String message, int step, long durationMs) {
+            Bundle failure = new Bundle();
+            failure.putString(Constant.KEY_PLUGIN_ID, pluginId);
+            failure.putString(Constant.KEY_PLUGIN_GENERATION, generation);
+            failure.putString(Constant.KEY_OPERATION_ID, operationId);
+            failure.putString(Constant.KEY_ERROR_TYPE, "UI_SMOKE_FAILED");
+            failure.putString(
+                    Constant.KEY_ERROR_MESSAGE,
+                    "step " + step + ": " + message
+            );
+            failure.putString(Constant.KEY_SMOKE_ERROR, message);
+            failure.putInt(Constant.KEY_SMOKE_STEP_COUNT, step);
+            failure.putLong(Constant.KEY_SMOKE_DURATION_MS, durationMs);
+            try {
+                receiver.send(Constant.RESULT_CODE_START_ERROR, failure);
+            } catch (Throwable throwable) {
+                Log.e(TAG, "Failed to deliver UI smoke failure", throwable);
             }
         }
 

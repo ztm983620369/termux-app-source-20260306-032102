@@ -14,14 +14,16 @@ import com.termux.terminalsessioncore.SshTmuxSessionStateMachine;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -40,12 +42,14 @@ public final class SshTmuxRuntimeEngine {
 
     private static final String LOG_TAG = "SshTmuxRuntimeEngine";
     private static final int SSH_BG_MAX_THREADS = 4;
+    private static final int SSH_BG_QUEUE_CAPACITY = 32;
     private static final long SSH_BG_KEEP_ALIVE_SECONDS = 30L;
     private static final int MAX_SESSIONS = 8;
     private static final int SSH_PERSIST_TMUX_PRELOAD_LINES = 50000;
+    private static final int REMOTE_TMUX_SESSION_GONE_EXIT_STATUS = 43;
     private static final String SSH_PERSIST_SHELL_NAME_PREFIX = "ssh-persistent-";
     private static final AtomicInteger SSH_BG_THREAD_COUNTER = new AtomicInteger(1);
-    private static final ExecutorService SSH_BG_EXECUTOR = createBackgroundExecutor();
+    private static final ThreadPoolExecutor SSH_BG_EXECUTOR = createBackgroundExecutor();
 
     private final SshTmuxRuntimeBridge bridge;
     private final SshTmuxRuntimeStateMachine stateMachine = new SshTmuxRuntimeStateMachine();
@@ -57,6 +61,9 @@ public final class SshTmuxRuntimeEngine {
     private final AtomicBoolean ensureRetryScheduled = new AtomicBoolean(false);
     private final AtomicBoolean ensurePending = new AtomicBoolean(false);
     private final AtomicBoolean ensurePendingSwitchToAny = new AtomicBoolean(false);
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final Set<FutureTask<Void>> backgroundTasks = Collections.newSetFromMap(
+        new ConcurrentHashMap<FutureTask<Void>, Boolean>());
 
     private static final class RuntimeOperation {
         @NonNull final String id;
@@ -73,16 +80,39 @@ public final class SshTmuxRuntimeEngine {
         this.persistenceStore = new SshTmuxPersistenceStore(bridge.getApplicationContext(), commandFactory);
     }
 
+    public void close() {
+        if (!closed.compareAndSet(false, true)) return;
+        ensuringPinnedSessions.set(false);
+        ensureRetryScheduled.set(false);
+        ensurePending.set(false);
+        ensurePendingSwitchToAny.set(false);
+        synchronized (sshBootstrapByHandle) {
+            sshBootstrapByHandle.clear();
+        }
+        for (FutureTask<Void> task : backgroundTasks) {
+            // Do not interrupt a running AppShell: its synchronous wait path does not kill the
+            // child process on InterruptedException. Cancelling without interruption safely drops
+            // queued work while already-running commands finish with all callbacks gated by closed.
+            task.cancel(false);
+        }
+        backgroundTasks.clear();
+        SSH_BG_EXECUTOR.purge();
+    }
+
+    private boolean isClosed() {
+        return closed.get();
+    }
+
     @NonNull
-    private static ExecutorService createBackgroundExecutor() {
+    private static ThreadPoolExecutor createBackgroundExecutor() {
         ThreadFactory threadFactory = runnable -> {
             Thread thread = new Thread(runnable, "termux-runtime-bg-" + SSH_BG_THREAD_COUNTER.getAndIncrement());
             thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
             return thread;
         };
         ThreadPoolExecutor executor = new ThreadPoolExecutor(
-            0, SSH_BG_MAX_THREADS, SSH_BG_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
-            new SynchronousQueue<>(), threadFactory);
+            SSH_BG_MAX_THREADS, SSH_BG_MAX_THREADS, SSH_BG_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(SSH_BG_QUEUE_CAPACITY), threadFactory);
         executor.allowCoreThreadTimeOut(true);
         return executor;
     }
@@ -97,6 +127,7 @@ public final class SshTmuxRuntimeEngine {
                             @NonNull SshTmuxRuntimeStateMachine.Phase phase,
                             @Nullable String tmuxSession, @Nullable String displayName,
                             int attempt, @Nullable String detail) {
+        if (isClosed()) return;
         bridge.onRuntimeStateChanged(stateMachine.next(
             phase, tmuxSession, displayName, attempt, detail,
             operation == null ? null : operation.id,
@@ -125,12 +156,18 @@ public final class SshTmuxRuntimeEngine {
     }
 
     private void runBackgroundTask(@NonNull String taskName, @NonNull Runnable task) {
-        runBackgroundTask(taskName, null, task);
+        runBackgroundTask(taskName, null, task, null);
     }
 
     private void runBackgroundTask(@NonNull String taskName, @Nullable RuntimeOperation operation,
                                    @NonNull Runnable task) {
+        runBackgroundTask(taskName, operation, task, null);
+    }
+
+    private void runBackgroundTask(@NonNull String taskName, @Nullable RuntimeOperation operation,
+                                   @NonNull Runnable task, @Nullable Runnable onRejected) {
         Runnable guarded = () -> {
+            if (isClosed()) return;
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
             } catch (Throwable ignored) {
@@ -138,19 +175,37 @@ public final class SshTmuxRuntimeEngine {
             try {
                 task.run();
             } catch (Throwable e) {
+                if (isClosed()) return;
                 Logger.logStackTraceWithMessage(LOG_TAG, "Runtime task failed: " + taskName, e);
                 transition(operation, SshTmuxRuntimeStateMachine.Phase.FAILED,
                     null, null, 0, taskName + ": " + e.getMessage());
             }
         };
+        if (isClosed()) return;
+        FutureTask<Void> future = new FutureTask<Void>(guarded, null) {
+            @Override
+            protected void done() {
+                backgroundTasks.remove(this);
+            }
+        };
+        backgroundTasks.add(future);
         try {
-            SSH_BG_EXECUTOR.execute(guarded);
+            SSH_BG_EXECUTOR.execute(future);
         } catch (RejectedExecutionException e) {
-            Logger.logWarn(LOG_TAG, "Runtime executor saturated, fallback thread for " + taskName);
-            Thread fallback = new Thread(guarded, "termux-runtime-fallback-" + taskName);
-            fallback.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
-            fallback.start();
+            backgroundTasks.remove(future);
+            future.cancel(false);
+            Logger.logWarn(LOG_TAG, "Runtime executor saturated; rejecting " + taskName);
+            transition(operation, SshTmuxRuntimeStateMachine.Phase.FAILED,
+                null, null, 0, taskName + ": runtime busy");
+            if (onRejected != null) runOnUiThread(onRejected);
         }
+    }
+
+    private void runOnUiThread(@NonNull Runnable runnable) {
+        if (isClosed()) return;
+        bridge.runOnUiThread(() -> {
+            if (!isClosed()) runnable.run();
+        });
     }
 
     public void rememberSshBootstrapCommand(@Nullable TerminalSession session, @Nullable String sshCommand) {
@@ -177,8 +232,14 @@ public final class SshTmuxRuntimeEngine {
     }
 
     public void onTerminalSessionFinished(@Nullable TerminalSession session) {
-        if (session == null) return;
+        if (isClosed() || session == null) return;
         forgetSshBootstrapCommand(session);
+        if (session.getExitStatus() == REMOTE_TMUX_SESSION_GONE_EXIT_STATUS) {
+            if (removeRecordForSession(session) != null) {
+                bridge.onTermuxSessionListUpdated();
+            }
+            return;
+        }
         if (clearLockedHandleForSessionHandle(session.mHandle)) {
             scheduleEnsurePinnedSessionsRetry(false);
         }
@@ -212,36 +273,39 @@ public final class SshTmuxRuntimeEngine {
 
     public void loadRemoteTmuxSessions(@NonNull String sshCommand, @NonNull RemoteTmuxListCallback callback) {
         transition(SshTmuxRuntimeStateMachine.Phase.LISTING_REMOTE, null, null, 0, null);
-        runBackgroundTask("tmux-list-sessions", () -> {
+        runBackgroundTask("tmux-list-sessions", null, () -> {
             ShellCommandResult result = shellExecutor.execute(
                 bridge.getApplicationContext(), commandFactory.buildTmuxListSessionsCommand(sshCommand));
             String combined = combinedOutput(result);
             boolean tmuxMissing = combined.contains("__TMUX_MISSING__");
             boolean listDone = combined.contains(SshTmuxCommandFactory.TMUX_LIST_DONE);
             ArrayList<RemoteTmuxSessionInfo> sessions = parseTmuxSessionList(combined);
-            bridge.runOnUiThread(() -> {
+            runOnUiThread(() -> {
                 transition(SshTmuxRuntimeStateMachine.Phase.IDLE, null, null, 0, null);
                 callback.onComplete(new RemoteTmuxListResult(tmuxMissing, listDone, sessions, result));
             });
-        });
+        }, () -> callback.onComplete(new RemoteTmuxListResult(
+            false, false, new ArrayList<>(), runtimeBusyResult("tmux-list-sessions"))));
     }
 
     public void installTmux(@NonNull String sshCommand, @NonNull OperationCallback callback) {
         transition(SshTmuxRuntimeStateMachine.Phase.INSTALLING_REMOTE, null, null, 0, null);
-        runBackgroundTask("tmux-install", () -> {
+        runBackgroundTask("tmux-install", null, () -> {
             ShellCommandResult installResult = shellExecutor.execute(
                 bridge.getApplicationContext(), commandFactory.buildTmuxInstallCommand(sshCommand));
             ShellCommandResult verifyResult = shellExecutor.execute(
                 bridge.getApplicationContext(), commandFactory.buildTmuxCheckCommand(sshCommand));
             boolean hasTmux = verifyResult.stdout.contains("__TMUX_OK__");
-            bridge.runOnUiThread(() -> {
+            runOnUiThread(() -> {
                 transition(hasTmux ? SshTmuxRuntimeStateMachine.Phase.IDLE : SshTmuxRuntimeStateMachine.Phase.FAILED,
                     null, null, 0, hasTmux ? null : summarize(verifyResult));
                 callback.onComplete(new SshTmuxOperationResult(
                     hasTmux ? SshTmuxOperationResult.Code.SUCCESS : SshTmuxOperationResult.Code.FAILED,
                     "", "", null, hasTmux ? verifyResult : installResult));
             });
-        });
+        }, () -> callback.onComplete(new SshTmuxOperationResult(
+            SshTmuxOperationResult.Code.FAILED, "", "", null,
+            runtimeBusyResult("tmux-install"))));
     }
 
     public void createRemoteTmuxSessionAndConnect(@Nullable TerminalSession anchorSession,
@@ -272,7 +336,7 @@ public final class SshTmuxRuntimeEngine {
             boolean created = combined.contains(SshTmuxCommandFactory.TMUX_SESSION_CREATED);
             boolean exists = combined.contains(SshTmuxCommandFactory.TMUX_SESSION_EXISTS);
 
-            bridge.runOnUiThread(() -> {
+            runOnUiThread(() -> {
                 if (tmuxMissing) {
                     transition(operation, SshTmuxRuntimeStateMachine.Phase.FAILED,
                         tmuxSession, displayName, 0, "tmux missing");
@@ -292,7 +356,9 @@ public final class SshTmuxRuntimeEngine {
                 callback.onComplete(new SshTmuxOperationResult(
                     SshTmuxOperationResult.Code.FAILED, tmuxSession, displayName, null, createResult));
             });
-        });
+        }, () -> callback.onComplete(new SshTmuxOperationResult(
+            SshTmuxOperationResult.Code.FAILED, tmuxSession, displayName, null,
+            runtimeBusyResult("tmux-create-session"))));
     }
 
     public void destroyRemoteTmuxSession(@NonNull String sshCommand, @NonNull String tmuxSession,
@@ -318,7 +384,7 @@ public final class SshTmuxRuntimeEngine {
                 combined.contains(SshTmuxCommandFactory.TMUX_SESSION_NOT_FOUND);
             if (destroyed) cleanupRecordsForRemote(sshCommand, normalizedTmux);
 
-            bridge.runOnUiThread(() -> {
+            runOnUiThread(() -> {
                 if (tmuxMissing) {
                     transition(operation, SshTmuxRuntimeStateMachine.Phase.FAILED,
                         normalizedTmux, normalizedDisplay, 0, "tmux missing");
@@ -333,7 +399,9 @@ public final class SshTmuxRuntimeEngine {
                     destroyed ? SshTmuxOperationResult.Code.SUCCESS : SshTmuxOperationResult.Code.FAILED,
                     normalizedTmux, normalizedDisplay, null, destroyResult));
             });
-        });
+        }, () -> callback.onComplete(new SshTmuxOperationResult(
+            SshTmuxOperationResult.Code.FAILED, normalizedTmux, normalizedDisplay, null,
+            runtimeBusyResult("tmux-destroy-session"))));
     }
 
     public void connectToPersistentTmuxSession(@Nullable TerminalSession anchorSession,
@@ -362,7 +430,8 @@ public final class SshTmuxRuntimeEngine {
             normalizedTmux, normalizedDisplay, 0, null);
         transition(operation, SshTmuxRuntimeStateMachine.Phase.ENSURING_LOCAL_BINDING,
             normalizedTmux, normalizedDisplay, 0, null);
-        SshPersistenceRecord record = enableSshPersistence(anchorSession, sshCommand, normalizedTmux, normalizedDisplay, false);
+        SshPersistenceRecord record = enableSshPersistence(
+            anchorSession, sshCommand, normalizedTmux, normalizedDisplay, false, false);
         bindOperationToSession(operation, record == null ? null : record.lockedHandle);
         transition(operation,
             record == null ? SshTmuxRuntimeStateMachine.Phase.FAILED : SshTmuxRuntimeStateMachine.Phase.IDLE,
@@ -396,12 +465,13 @@ public final class SshTmuxRuntimeEngine {
                 bridge.getApplicationContext(), commandFactory.buildTmuxCheckCommand(sshCommand));
             boolean hasTmux = check.stdout.contains("__TMUX_OK__");
             boolean missingTmux = check.stdout.contains("__TMUX_MISSING__");
-            bridge.runOnUiThread(() -> {
+            runOnUiThread(() -> {
                 if (hasTmux) {
                     transition(operation, SshTmuxRuntimeStateMachine.Phase.ENSURING_LOCAL_BINDING,
                         snapshot.remoteSessionName, snapshot.displayName, 0, null);
                     SshPersistenceRecord record = enableSshPersistence(
-                        targetSession, sshCommand, snapshot.remoteSessionName, snapshot.displayName, attachCurrentSessionToTmux);
+                        targetSession, sshCommand, snapshot.remoteSessionName, snapshot.displayName,
+                        attachCurrentSessionToTmux, true);
                     bindOperationToSession(operation, record == null ? null : record.lockedHandle);
                     transition(operation,
                         record == null ? SshTmuxRuntimeStateMachine.Phase.FAILED : SshTmuxRuntimeStateMachine.Phase.IDLE,
@@ -425,7 +495,9 @@ public final class SshTmuxRuntimeEngine {
                         null, check));
                 }
             });
-        });
+        }, () -> callback.onComplete(new SshTmuxOperationResult(
+            SshTmuxOperationResult.Code.FAILED, snapshot.remoteSessionName, snapshot.displayName,
+            null, runtimeBusyResult("tmux-check-before-lock"))));
     }
 
     public void installTmuxAndEnable(@NonNull TerminalSession targetSession, @NonNull String sshCommand,
@@ -440,12 +512,12 @@ public final class SshTmuxRuntimeEngine {
             ShellCommandResult verify = shellExecutor.execute(
                 bridge.getApplicationContext(), commandFactory.buildTmuxCheckCommand(sshCommand));
             boolean hasTmux = verify.stdout.contains("__TMUX_OK__");
-            bridge.runOnUiThread(() -> {
+            runOnUiThread(() -> {
                 if (installResult.isSuccess() && hasTmux) {
                     transition(operation, SshTmuxRuntimeStateMachine.Phase.ENSURING_LOCAL_BINDING,
                         tmuxSession, displayName, 0, null);
                     SshPersistenceRecord record = enableSshPersistence(targetSession, sshCommand, tmuxSession,
-                        displayName, attachCurrentSessionToTmux);
+                        displayName, attachCurrentSessionToTmux, true);
                     bindOperationToSession(operation, record == null ? null : record.lockedHandle);
                     transition(operation,
                         record == null ? SshTmuxRuntimeStateMachine.Phase.FAILED : SshTmuxRuntimeStateMachine.Phase.IDLE,
@@ -461,7 +533,9 @@ public final class SshTmuxRuntimeEngine {
                         SshTmuxOperationResult.Code.FAILED, tmuxSession, displayName, null, installResult));
                 }
             });
-        });
+        }, () -> callback.onComplete(new SshTmuxOperationResult(
+            SshTmuxOperationResult.Code.FAILED, tmuxSession, displayName, null,
+            runtimeBusyResult("tmux-install-before-lock"))));
     }
 
     public void maybeAutoRestorePinnedSshSessions() {
@@ -473,6 +547,7 @@ public final class SshTmuxRuntimeEngine {
     }
 
     public int ensurePinnedSshSessions(boolean switchToAny) {
+        if (isClosed()) return 0;
         if (!ensuringPinnedSessions.compareAndSet(false, true)) {
             ensurePending.set(true);
             if (switchToAny) ensurePendingSwitchToAny.set(true);
@@ -488,7 +563,8 @@ public final class SshTmuxRuntimeEngine {
             boolean switched = false;
             int ensured = 0;
             for (SshPersistenceRecord record : records) {
-                SshPersistenceRecord ensuredRecord = ensurePinnedSessionRecord(record, switchToAny && !switched);
+                SshPersistenceRecord ensuredRecord = ensurePinnedSessionRecord(
+                    record, switchToAny && !switched, false);
                 if (ensuredRecord == null) continue;
                 updated.add(ensuredRecord);
                 ensured++;
@@ -565,7 +641,8 @@ public final class SshTmuxRuntimeEngine {
 
     private SshPersistenceRecord enableSshPersistence(@NonNull TerminalSession targetSession, @NonNull String sshCommand,
                                                       @NonNull String tmuxSession, @NonNull String displayName,
-                                                      boolean attachCurrentSessionToTmux) {
+                                                      boolean attachCurrentSessionToTmux,
+                                                      boolean createIfMissing) {
         sshCommand = commandFactory.sanitizeSshBootstrapCommand(sshCommand);
         String safeTmuxSession = commandFactory.normalizeTmuxSessionName(tmuxSession);
         String normalizedDisplayName = commandFactory.normalizeDisplayName(displayName, safeTmuxSession);
@@ -593,7 +670,7 @@ public final class SshTmuxRuntimeEngine {
         }
 
         if (!lockCurrentSession) {
-            SshPersistenceRecord ensured = ensurePinnedSessionRecord(record, true);
+            SshPersistenceRecord ensured = ensurePinnedSessionRecord(record, true, createIfMissing);
             if (ensured == null || TextUtils.isEmpty(ensured.lockedHandle)) {
                 removeRecordById(record.id);
                 bridge.onTermuxSessionListUpdated();
@@ -620,7 +697,7 @@ public final class SshTmuxRuntimeEngine {
         runBackgroundTask("tmux-sync-display-name", operation, () -> {
             shellExecutor.execute(bridge.getApplicationContext(),
                 commandFactory.buildTmuxDisplaySyncRemoteExecCommand(record.sshCommand, record.tmuxSession, record.displayName));
-            bridge.runOnUiThread(() -> transition(operation, SshTmuxRuntimeStateMachine.Phase.IDLE,
+            runOnUiThread(() -> transition(operation, SshTmuxRuntimeStateMachine.Phase.IDLE,
                 record.tmuxSession, record.displayName, 0, null));
         });
     }
@@ -694,7 +771,15 @@ public final class SshTmuxRuntimeEngine {
     }
 
     @Nullable
-    private SshPersistenceRecord ensurePinnedSessionRecord(@NonNull SshPersistenceRecord record, boolean switchToSession) {
+    public SshPersistenceRecord ensurePinnedSessionRecord(@NonNull SshPersistenceRecord record,
+                                                           boolean switchToSession) {
+        return ensurePinnedSessionRecord(record, switchToSession, false);
+    }
+
+    @Nullable
+    private SshPersistenceRecord ensurePinnedSessionRecord(@NonNull SshPersistenceRecord record,
+                                                            boolean switchToSession,
+                                                            boolean createIfMissing) {
         SshPersistenceRecord normalized = persistenceStore.normalize(record);
         if (TextUtils.isEmpty(normalized.sshCommand)) return null;
         String safeTmuxSession = commandFactory.normalizeTmuxSessionName(normalized.tmuxSession);
@@ -703,7 +788,8 @@ public final class SshTmuxRuntimeEngine {
             TerminalSession existingByHandle = bridge.getTerminalSessionForHandle(normalized.lockedHandle);
             if (existingByHandle != null) {
                 TermuxSession existingTermux = bridge.getTermuxSessionForTerminalSession(existingByHandle);
-                if (shouldRecreateStalePinnedReconnectSession(existingTermux, safeTmuxSession)) {
+                if (shouldRecreateStalePinnedReconnectSession(
+                    existingTermux, safeTmuxSession, normalized.sshCommand, normalized.id)) {
                     bridge.removeTermuxSession(existingByHandle);
                     scheduleEnsurePinnedSessionsRetry(switchToSession);
                     return new SshPersistenceRecord(normalized.id, normalized.sshCommand,
@@ -720,7 +806,8 @@ public final class SshTmuxRuntimeEngine {
         TermuxSession existing = bridge.getTermuxSessionForShellName(normalized.shellName);
         if (existing != null && existing.getTerminalSession() != null) {
             TerminalSession existingSession = existing.getTerminalSession();
-            if (shouldRecreateStalePinnedReconnectSession(existing, safeTmuxSession)) {
+            if (shouldRecreateStalePinnedReconnectSession(
+                existing, safeTmuxSession, normalized.sshCommand, normalized.id)) {
                 bridge.removeTermuxSession(existingSession);
                 scheduleEnsurePinnedSessionsRetry(switchToSession);
                 return new SshPersistenceRecord(normalized.id, normalized.sshCommand,
@@ -737,7 +824,8 @@ public final class SshTmuxRuntimeEngine {
         if (bridge.getTermuxSessionsSize() >= MAX_SESSIONS) return normalized;
 
         String reconnectLoopScript = commandFactory.buildReconnectLoopCommand(
-            normalized.sshCommand, normalized.tmuxSession, normalized.displayName, SSH_PERSIST_TMUX_PRELOAD_LINES);
+            normalized.sshCommand, normalized.tmuxSession, normalized.displayName,
+            SSH_PERSIST_TMUX_PRELOAD_LINES, normalized.id, createIfMissing);
         String bash = TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/bash";
         if (!new File(bash).exists()) return normalized;
 
@@ -833,25 +921,31 @@ public final class SshTmuxRuntimeEngine {
     }
 
     private void scheduleEnsurePinnedSessionsRetry(boolean switchToAny) {
+        if (isClosed()) return;
         if (!ensureRetryScheduled.compareAndSet(false, true)) return;
         transition(SshTmuxRuntimeStateMachine.Phase.RETRY_SCHEDULED, null, null, 0, switchToAny ? "switch" : null);
         bridge.postDelayedOnUi(() -> {
+            if (isClosed()) return;
             ensureRetryScheduled.set(false);
             ensurePinnedSshSessions(switchToAny);
         }, 260);
     }
 
     private boolean shouldRecreateStalePinnedReconnectSession(@Nullable TermuxSession termuxSession,
-                                                              @NonNull String safeTmuxSession) {
+                                                              @NonNull String safeTmuxSession,
+                                                              @NonNull String sshCommand,
+                                                              @NonNull String transportScope) {
         if (termuxSession == null || termuxSession.getExecutionCommand() == null) return false;
         String loopScript = extractShellScriptFromExecutionArgs(termuxSession.getExecutionCommand().arguments);
         if (TextUtils.isEmpty(loopScript)) return false;
         if (!loopScript.contains("while true; do") || !loopScript.contains("[ssh-persist]")) return false;
 
         String target = commandFactory.buildTmuxTargetArg(safeTmuxSession);
+        String sessionName = commandFactory.buildTmuxSessionNameArg(safeTmuxSession);
+        if (!commandFactory.isReconnectTransportIdentity(loopScript, sshCommand, transportScope)) return true;
         if (!loopScript.contains("tmux attach-session -t " + target)) return true;
         if (countMatches(loopScript, "while true; do") > 1) return true;
-        if (loopScript.contains("tmux has-session -t " + target + " 2>/dev/null || tmux new-session -d -s " + target +
+        if (loopScript.contains("tmux has-session -t " + target + " 2>/dev/null || tmux new-session -d -s " + sessionName +
             "; tmux set-option -t " + target)) return true;
         return loopScript.contains("capture-pane -p -t \"\"") ||
             loopScript.contains("pane=;") ||
@@ -980,5 +1074,10 @@ public final class SshTmuxRuntimeEngine {
         String combined = combinedOutput(result);
         if (TextUtils.isEmpty(combined)) return "exit " + result.exitCode;
         return combined.length() <= 160 ? combined : combined.substring(0, 160) + "\n...(已截断)";
+    }
+
+    @NonNull
+    private static ShellCommandResult runtimeBusyResult(@NonNull String taskName) {
+        return new ShellCommandResult(75, "", taskName + ": runtime busy");
     }
 }

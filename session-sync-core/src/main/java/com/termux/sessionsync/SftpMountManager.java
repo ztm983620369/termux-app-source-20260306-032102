@@ -1,6 +1,8 @@
 package com.termux.sessionsync;
 
 import android.content.Context;
+import android.os.Build;
+import android.os.SystemClock;
 import android.text.TextUtils;
 
 import androidx.annotation.NonNull;
@@ -23,7 +25,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Centralized SFTP mount orchestration.
@@ -316,11 +317,13 @@ public final class SftpMountManager {
             outThread.start();
             errThread.start();
 
-            boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
+            boolean finished = waitForProcess(process, timeoutMs);
             if (!finished) {
                 process.destroy();
-                process.waitFor(1, TimeUnit.SECONDS);
-                if (process.isAlive()) process.destroyForcibly();
+                if (!waitForProcess(process, 1_000L) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    process.destroyForcibly();
+                    waitForProcess(process, 1_000L);
+                }
                 outThread.join(500);
                 errThread.join(500);
                 return new CommandResult(-1, out.getOutput(), err.getOutput(), true);
@@ -330,6 +333,7 @@ public final class SftpMountManager {
             errThread.join(2_000);
             return new CommandResult(process.exitValue(), out.getOutput(), err.getOutput(), false);
         } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             return new CommandResult(-1, "", msg, false);
         } finally {
@@ -338,6 +342,27 @@ public final class SftpMountManager {
                     process.destroy();
                 } catch (Throwable ignored) {
                 }
+            }
+        }
+    }
+
+    /**
+     * API-23-compatible timed process wait. Android only exposes the timed
+     * {@link Process#waitFor(long, java.util.concurrent.TimeUnit)} overload
+     * from API 26, while {@link Process#exitValue()} is available on every
+     * supported API level.
+     */
+    private static boolean waitForProcess(@NonNull Process process, long timeoutMs)
+        throws InterruptedException {
+        long deadlineMs = SystemClock.uptimeMillis() + Math.max(0L, timeoutMs);
+        while (true) {
+            try {
+                process.exitValue();
+                return true;
+            } catch (IllegalThreadStateException stillRunning) {
+                long remainingMs = deadlineMs - SystemClock.uptimeMillis();
+                if (remainingMs <= 0L) return false;
+                Thread.sleep(Math.min(remainingMs, 50L));
             }
         }
     }

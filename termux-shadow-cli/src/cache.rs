@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::context::BuildEnvironment;
+use crate::context::{BuildEnvironment, normalize_termux_path_identity};
 use crate::fsutil::{set_private_permissions, sha256_file, write_atomic};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
@@ -75,6 +75,16 @@ pub fn source_fingerprint(project: &Path, environment: &BuildEnvironment) -> Res
         digest.update(b"signing-key-content\0");
         hash_file_contents(Path::new(&key_path), &mut digest)?;
     }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Fingerprints only project-owned build inputs. Unlike `source_fingerprint`, this remains
+/// available when an Android toolchain is not installed, so context cursors cannot silently miss
+/// local edits.
+pub fn project_content_fingerprint(project: &Path) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"termux-shadow-project-content-v1\0");
+    hash_project_inputs(project, &mut digest)?;
     Ok(format!("{:x}", digest.finalize()))
 }
 
@@ -196,7 +206,8 @@ fn hash_project_inputs(project: &Path, digest: &mut Sha256) -> Result<()> {
         .filter(|entry| entry.file_type().is_file() || entry.file_type().is_symlink())
         .filter_map(|entry| {
             let relative = entry.path().strip_prefix(project).ok()?;
-            is_build_input(relative).then(|| (relative.to_path_buf(), entry.path().to_path_buf()))
+            is_project_build_input(relative)
+                .then(|| (relative.to_path_buf(), entry.path().to_path_buf()))
         })
         .collect::<Vec<_>>();
     paths.sort_by(|left, right| left.0.cmp(&right.0));
@@ -214,7 +225,7 @@ fn hash_project_inputs(project: &Path, digest: &mut Sha256) -> Result<()> {
     Ok(())
 }
 
-fn is_build_input(relative: &Path) -> bool {
+pub(crate) fn is_project_build_input(relative: &Path) -> bool {
     let file_name = relative.file_name().and_then(|name| name.to_str());
     let in_build_tree = relative.components().any(|component| {
         let Component::Normal(component) = component else {
@@ -235,6 +246,8 @@ fn is_build_input(relative: &Path) -> bool {
                     | "settings.gradle"
                     | "settings.gradle.kts"
                     | "gradle.properties"
+                    | "gradle.lockfile"
+                    | "shadow-dependencies.lock.json"
                     | "gradlew"
                     | "gradlew.bat"
                     | "proguard-rules.pro"
@@ -243,7 +256,7 @@ fn is_build_input(relative: &Path) -> bool {
         || file_name.is_some_and(|name| name.ends_with(".gradle") || name.ends_with(".gradle.kts"))
 }
 
-fn generated_entry(entry: &DirEntry, root: &Path) -> bool {
+pub(crate) fn generated_entry(entry: &DirEntry, root: &Path) -> bool {
     let Ok(relative) = entry.path().strip_prefix(root) else {
         return false;
     };
@@ -298,12 +311,9 @@ fn hash_file_metadata(path: &Path, digest: &mut Sha256) -> Result<()> {
 }
 
 fn stable_toolchain_path(path: &Path) -> String {
-    const LEGACY_APP_DATA: &str = "/data/data/com.termux/files";
-    const USER_ZERO_APP_DATA: &str = "/data/user/0/com.termux/files";
-    let text = path.to_string_lossy();
-    text.strip_prefix(LEGACY_APP_DATA)
-        .map(|relative| format!("{USER_ZERO_APP_DATA}{relative}"))
-        .unwrap_or_else(|| text.into_owned())
+    normalize_termux_path_identity(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn hash_file_contents(path: &Path, digest: &mut Sha256) -> Result<()> {
